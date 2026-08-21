@@ -1,0 +1,13 @@
+# Tu entorno virtual (en tu caso la carpeta se llama envs)
+envs/
+
+# Base de datos local
+*.sqlite3
+
+# Archivos de caché de Python
+__pycache__/
+*.pyc
+
+# Configuración del editor y variables
+.vscode/
+.env
