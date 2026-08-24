@@ -1,8 +1,7 @@
 from django.urls import path
-from .views import LoginView, RegisterView
+from .views import RegistroView, LoginView
 
-# EL PORQUÉ: Registramos las URLs específicas de la API de usuarios que el enrutador principal de Django expondrá.
 urlpatterns = [
+    path('registro/', RegistroView.as_view(), name='registro'),
     path('login/', LoginView.as_view(), name='login'),
-    path('register/', RegisterView.as_view(), name='register'),
 ]
