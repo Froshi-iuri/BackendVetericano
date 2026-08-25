@@ -9,7 +9,7 @@ schema_view = get_schema_view(
     openapi.Info(
         title="Vetericano API",
         default_version='v1',
-        description="API para la aplicación móvil Vetericano (Registro e inicio de sesión con JWT)",
+        description="API para la aplicación Vetericano",
     ),
     public=True,
     permission_classes=(permissions.AllowAny,),
