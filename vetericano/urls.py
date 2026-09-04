@@ -9,7 +9,7 @@ schema_view = get_schema_view(
         default_version="v1",
         description="API del sistema Vetericano"
     ),
-    public=True
+    public= True
 )
 
 urlpatterns = [
