@@ -19,7 +19,11 @@ SECRET_KEY = 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    'backendvetericano-2-0.onrender.com', 
+    'localhost', 
+    '127.0.0.1'
+]
 
 
 # Application definition
@@ -122,4 +126,25 @@ MAILERS = {
     'default': {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
+}
+
+
+# Configuración base de Django REST Framework para exigir tokens por defecto
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+}
+
+# Configuración específica de los tiempos de vida del token
+from datetime import timedelta
+
+SIMPLE_JWT = {
+    # El token de acceso dura 60 minutos. Si expira, el frontend debe usar el token de refresco.
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    # El token de refresco dura 1 día. Sirve para obtener nuevos tokens de acceso sin volver a loguearse.
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    # Le indicamos a la librería cuál es el campo de tu llave primaria personalizada
+    'USER_ID_FIELD': 'id_usuario',
+    'USER_ID_CLAIM': 'user_id',
 }
