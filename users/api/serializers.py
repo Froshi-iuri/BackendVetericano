@@ -6,29 +6,24 @@ from django.contrib.auth.hashers import make_password, check_password
 from users.models import Usuarios, Rol
 
 class RegisterCustomSerializer(serializers.ModelSerializer):
-    """
-    Serializador encargado de tomar los datos de Swagger, validarlos
-    y crear un nuevo registro en la tabla 'usuarios'.
-    """
-    # PrimaryKeyRelatedField le dice a Swagger que id_rol es un número que debe apuntar a un Rol existente.
-    # queryset=Rol.objects.all() asegura que si el usuario envía un id_rol=99 (y no existe), devuelva error antes de tocar la BD.
-    id_rol = serializers.PrimaryKeyRelatedField(queryset=Rol.objects.all())
+    # Ya no declaramos id_rol aquí arriba. 
+    # Dejamos que DRF use exclusivamente lo definido en Meta.fields.
 
     class Meta:
         model = Usuarios
-        # Declaramos TODOS los campos que tu script SQL exige que no sean nulos.
-        fields = ('email', 'password', 'nombre', 'apellido', 'id_rol')
-        # write_only impide que la contraseña vuelva a Swagger en la respuesta de éxito.
+        fields = ('email', 'password', 'nombre', 'apellido')
         extra_kwargs = {'password': {'write_only': True}}
 
     def create(self, validated_data):
-        # make_password encripta la contraseña usando el algoritmo PBKDF2 de Django.
-        # Si omites esto, tu sistema quedará vulnerable y el inicio de sesión no funcionará después.
         validated_data['password'] = make_password(validated_data['password'])
         
-        # Insertamos el nuevo registro directamente en la tabla Usuarios de PostgreSQL.
+        # Obtenemos o creamos el rol por defecto
+        rol_peticionario, _ = Rol.objects.get_or_create(nombre_rol='Peticionario')
+        
+        # Inyectamos el rol directamente en los datos validados antes de guardar
+        validated_data['id_rol'] = rol_peticionario
+        
         return super().create(validated_data)
-
 class LoginCustomSerializer(serializers.Serializer):
     """
     Serializador que genera el formulario de Login en Swagger y

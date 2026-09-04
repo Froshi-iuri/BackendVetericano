@@ -440,11 +440,25 @@ class Usuarios(models.Model):
     nombre = models.CharField(max_length=100)
     apellido = models.CharField(max_length=100)
     id_rol = models.ForeignKey(Rol, models.DO_NOTHING, db_column='id_rol')
-    activo = models.BooleanField()
+    activo = models.BooleanField(default=True)
 
     class Meta:
         managed = False
         db_table = 'usuarios'
+
+    def save(self, *args, **kwargs):
+        # Normalizamos el nombre del rol a minúsculas para evitar errores (Ej: 'Administrador' vs 'administrador')
+        nombre_rol_actual = self.id_rol.nombre_rol.lower()
+
+        # Si el rol es crítico, verificamos si ya existe otro usuario con ese mismo rol
+        if nombre_rol_actual in ['administrador', 'juridico']:
+            # Buscamos si existe alguien con este rol, excluyendo al usuario actual (por si estamos actualizando sus datos)
+            existe = Usuarios.objects.filter(id_rol=self.id_rol).exclude(id_usuario=self.id_usuario).exists()
+            
+            if existe:
+                raise ValidationError(f"Ya existe un usuario registrado con el rol de {self.id_rol.nombre_rol}. Solo se permite uno.")
+        
+        super().save(*args, **kwargs)
 
 
 class Veterinarios(models.Model):
