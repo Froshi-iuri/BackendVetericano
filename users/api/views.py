@@ -1,6 +1,7 @@
 # views.py
 from rest_framework import generics, status
 from rest_framework.response import Response
+from rest_framework_simplejwt.tokens import RefreshToken
 from .serializers import RegisterCustomSerializer, LoginCustomSerializer
 
 class RegisterView(generics.GenericAPIView):
@@ -27,15 +28,23 @@ class LoginView(generics.GenericAPIView):
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
-        
-        # Ejecuta la función validate() del serializador (verificando hash y email).
         serializer.is_valid(raise_exception=True)
-        
-        # Recuperamos el objeto Usuarios validado.
         user = serializer.validated_data
         
+        # Generamos el par de tokens (acceso y refresco) para este usuario
+        refresh = RefreshToken.for_user(user)
+        
+        # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
+        # Esto guarda el rol directamente dentro del código encriptado del token
+        refresh['id_rol'] = user.id_rol.id_rol
+        refresh['nombre_rol'] = user.id_rol.nombre_rol
+
         return Response({
             "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
             "email": user.email,
-            "id_rol": user.id_rol.id_rol
+            "id_rol": user.id_rol.id_rol,
+            "tokens": {
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
+            }
         }, status=status.HTTP_200_OK)
