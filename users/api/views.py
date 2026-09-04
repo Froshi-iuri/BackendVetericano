@@ -1,60 +1,41 @@
-from rest_framework.views import APIView
+# views.py
+from rest_framework import generics, status
 from rest_framework.response import Response
-from rest_framework import status
-from django.contrib.auth import authenticate
-from django.contrib.auth.models import User
-from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import RegisterSerializer
+from .serializers import RegisterCustomSerializer, LoginCustomSerializer
 
-class LoginView(APIView):
-    # EL PORQUÉ: El login procesa credenciales privadas, por lo que debe responder exclusivamente a solicitudes POST.
-    def post(self, request):
-        email = request.data.get('email')
-        password = request.data.get('password')
+class RegisterView(generics.GenericAPIView):
+    # Esto es lo que le dice a Swagger: "Usa este serializador para dibujar los campos".
+    serializer_class = RegisterCustomSerializer
 
-        if not email or not password:
-            return Response({'error': 'El correo y la contraseña son obligatorios'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # EL PORQUÉ: Buscamos al usuario por su correo para obtener su 'username' interno (su cédula) y hacer la autenticación oficial.
-        try:
-            user_obj = User.objects.get(email=email)
-        except User.DoesNotExist:
-            return Response({'error': 'Su correo electrónico y su contraseña no coinciden. Inténtelo de nuevo'}, status=status.HTTP_401_UNAUTHORIZED)
-
-        user = authenticate(username=user_obj.username, password=password)
-
-        if user is not None:
-            # EL PORQUÉ: Generamos las llaves encriptadas JWT para que el teléfono mantenga la sesión iniciada sin guardar contraseñas locales.
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-                'user_id': user.id,
-                'email': user.email,
-                'first_name': user.first_name,
-                'is_staff': user.is_staff
-            }, status=status.HTTP_200_OK)
-        else:
-            return Response({'error': 'Su correo electrónico y su contraseña no coinciden. Inténtelo de nuevo'}, status=status.HTTP_401_UNAUTHORIZED)
-
-
-class RegisterView(APIView):
-    # EL PORQUÉ: Recibe el formulario de registro desde la app móvil para crear el nuevo perfil cliente.
-    def post(self, request):
-        serializer = RegisterSerializer(data=request.data)
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
         
-        if serializer.is_valid():
-            user = serializer.save()
-            
-            # EL PORQUÉ: Le devolvemos el token JWT al momento de crear la cuenta para que no tenga que ir a loguearse manualmente.
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-                'user_id': user.id,
-                'email': user.email,
-                'first_name': user.first_name,
-                'is_staff': user.is_staff
-            }, status=status.HTTP_201_CREATED)
+        # Verifica duplicados de email, que los campos obligatorios existan, y que id_rol sea válido.
+        serializer.is_valid(raise_exception=True)
         
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        # Guarda en la BD (invocando nuestro método create con la contraseña encriptada).
+        serializer.save()
+        
+        return Response({
+            "mensaje": "Usuario creado exitosamente.",
+            "datos": serializer.data
+        }, status=status.HTTP_201_CREATED)
+
+class LoginView(generics.GenericAPIView):
+    # Configura los campos 'email' y 'password' en Swagger.
+    serializer_class = LoginCustomSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        
+        # Ejecuta la función validate() del serializador (verificando hash y email).
+        serializer.is_valid(raise_exception=True)
+        
+        # Recuperamos el objeto Usuarios validado.
+        user = serializer.validated_data
+        
+        return Response({
+            "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
+            "email": user.email,
+            "id_rol": user.id_rol.id_rol
+        }, status=status.HTTP_200_OK)
