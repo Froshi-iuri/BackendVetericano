@@ -165,3 +165,5 @@ SIMPLE_JWT = {
     'USER_ID_FIELD': 'id_usuario',
     'USER_ID_CLAIM': 'user_id',
 }
+
+
