@@ -16,4 +16,4 @@ PyYAML==6.0.3
 sqlparse==0.6.0
 tzdata==2026.3
 uritemplate==4.2.0
-whitenoise==6.12.0 #librerias
+whitenoise==6.12.0
