@@ -25,8 +25,8 @@ DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
 
 ALLOWED_HOSTS = [
-    'backendvetericano-fo3o.onrender.com', 
-    'localhost', 
+    '.onrender.com',
+    'localhost',
     '127.0.0.1'
 ]
 
