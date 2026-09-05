@@ -1,96 +1,73 @@
-from django.contrib.auth import authenticate
-from rest_framework.views import APIView
+# views.py
+
+from rest_framework import generics, status, viewsets
 from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.authtoken.models import Token
-from drf_yasg.utils import swagger_auto_schema
-
-from users.models import Usuario, Rol
-from .serializers import RegistroSerializer, LoginSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
+from .serializers import RegisterCustomSerializer, LoginCustomSerializer,UsuariosSerializer,RolSerializer
+from users.models import Usuarios,Rol
 
 
-class RegistroView(APIView):
+class RegisterView(generics.GenericAPIView):
 
-    @swagger_auto_schema(request_body=RegistroSerializer)
-    def post(self, request):
-        serializer = RegistroSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    # Esto es lo que le dice a Swagger:
+    # "Usa este serializador para dibujar los campos".
+    serializer_class = RegisterCustomSerializer
 
-        username = serializer.validated_data.get("username")
-        email = serializer.validated_data.get("email")
-        password = serializer.validated_data.get("password")
-        nombre = serializer.validated_data.get("nombre", "")
-        apellido = serializer.validated_data.get("apellido", "")
-        telefono = serializer.validated_data.get("telefono", None)  # <-- Obtenemos el teléfono
-        rol_id = serializer.validated_data.get("rol_id")
+    def post(self, request, *args, **kwargs):
 
-        if Usuario.objects.filter(username=username).exists():
-            return Response({"mensaje": "El nombre de usuario ya existe"}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(data=request.data)
 
-        if Usuario.objects.filter(email=email).exists():
-            return Response({"mensaje": "El correo ya está registrado"}, status=status.HTTP_400_BAD_REQUEST)
+        # Verifica duplicados de email, que los campos obligatorios existan,
+        # y que id_rol sea válido.
+        serializer.is_valid(raise_exception=True)
 
-        rol_obj = None
-        if rol_id:
-            rol_obj = Rol.objects.filter(id=rol_id).first()
-        else:
-            rol_obj, _ = Rol.objects.get_or_create(nombre_rol="Cliente")
-
-        # Guardamos el usuario con el teléfono
-        usuario = Usuario.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            first_name=nombre,
-            last_name=apellido,
-            telefono=telefono,  # <-- Se asigna aquí
-            rol=rol_obj
-        )
-
-        token = Token.objects.create(user=usuario)
+        # Guarda en la BD (invocando nuestro método create
+        # con la contraseña encriptada).
+        serializer.save()
 
         return Response({
-            "mensaje": "Usuario registrado correctamente",
-            "usuario": {
-                "id": usuario.id,
-                "username": usuario.username,
-                "email": usuario.email,
-                "telefono": usuario.telefono,  # <-- Se devuelve en el JSON
-                "rol": usuario.rol.nombre_rol if usuario.rol else None
-            },
-            "token": token.key
+            "mensaje": "Usuario creado exitosamente.",
+            "datos": serializer.data
         }, status=status.HTTP_201_CREATED)
 
 
-class LoginView(APIView):
+class LoginView(generics.GenericAPIView):
 
-    @swagger_auto_schema(request_body=LoginSerializer)
-    def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    # Configura los campos 'email' y 'password' en Swagger.
+    serializer_class = LoginCustomSerializer
 
-        username = serializer.validated_data.get("username")
-        password = serializer.validated_data.get("password")
+    def post(self, request, *args, **kwargs):
 
-        usuario = authenticate(username=username, password=password)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data
+        
+        # Generamos el par de tokens (acceso y refresco) para este usuario
+        refresh = RefreshToken.for_user(user)
+        
+        # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
+        # Esto guarda el rol directamente dentro del código encriptado del token
+        refresh['id_rol'] = user.id_rol.id_rol
+        refresh['nombre_rol'] = user.id_rol.nombre_rol
 
-        if usuario:
-            if not usuario.activo:
-                return Response({"mensaje": "Este usuario está desactivado"}, status=status.HTTP_403_FORBIDDEN)
+        return Response({
+            "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
+            "email": user.email,
+            "id_rol": user.id_rol.id_rol,
+            "tokens": {
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
+            }
+        }, status=status.HTTP_200_OK)
 
-            token, _ = Token.objects.get_or_create(user=usuario)
-            return Response({
-                "mensaje": "Login correcto",
-                "usuario": {
-                    "id": usuario.id,
-                    "username": usuario.username,
-                    "email": usuario.email,
-                    "telefono": usuario.telefono,  # <-- Se devuelve en el JSON
-                    "rol": usuario.rol.nombre_rol if usuario.rol else None
-                },
-                "token": token.key
-            }, status=status.HTTP_200_OK)
 
-        return Response({"mensaje": "Usuario o contraseña incorrectos"}, status=status.HTTP_401_UNAUTHORIZED)
+class UsuariosViewSet(viewsets.ModelViewSet):
+
+    queryset = Usuarios.objects.all()
+    serializer_class = UsuariosSerializer
+
+
+class RolViewSet(viewsets.ReadOnlyModelViewSet):
+
+    queryset = Rol.objects.all()
+    serializer_class = RolSerializer

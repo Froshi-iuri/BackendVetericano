@@ -6,8 +6,8 @@ from drf_yasg import openapi
 schema_view = get_schema_view(
     openapi.Info(
         title="Vetericano API",
-        default_version="v1",
-        description="API del sistema Vetericano"
+        default_version='v1',
+        description="API para la aplicación Vetericano",
     ),
     public=True
 )

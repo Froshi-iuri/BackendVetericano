@@ -2,27 +2,37 @@ from pathlib import Path
 import os
 import dj_database_url
 from dotenv import load_dotenv
+from datetime import timedelta
 
+# carga las variables del archivo .env
 load_dotenv()
+
 
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m'
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = ['*']
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
 
-# Application definition
+ALLOWED_HOSTS = [
+    '.onrender.com',
+    'localhost',
+    '127.0.0.1'
+]
+
+
+
+# los mas papis
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -34,13 +44,15 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',  # <-- AGREGAR ESTA LÍNEA (Obligatorio para Tokens)
     'drf_yasg',
+    'corsheaders',
     'users',
     'corsheaders'
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
-    'django.middleware.security.SecurityMiddleware',
+    'django.middleware.security.SecurityMiddleware',#esto lo subi JAJAJAJJA
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -76,7 +88,8 @@ WSGI_APPLICATION = 'vetericano.wsgi.application'
 DATABASES = {
     'default': dj_database_url.config(
         default=os.getenv('DATABASE_URL'),
-        conn_max_age=600
+        conn_max_age=600,
+        ssl_require=True,
     )
 }
 
@@ -116,6 +129,8 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
 
 
 # Email
@@ -124,24 +139,35 @@ STATIC_URL = 'static/'
 MAILERS = {
     'default': {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        
     },
 }
 
-AUTH_USER_MODEL = 'users.Usuario'
 
-# AGREGAR ESTE BLOQUE AL FINAL DE TODO
+# Configuración base de Django REST Framework para exigir tokens por defecto
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.TokenAuthentication',  # <-- Sin la palabra .authtoken en el medio
-    ],
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',
-    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
 }
+
+CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:4200",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:4200",     
     "http://127.0.0.1:4200",
 ]
 
-STATIC_URL = 'static/'
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+SIMPLE_JWT = {
+    # El token de acceso dura 60 minutos. Si expira, el frontend debe usar el token de refresco.
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    # El token de refresco dura 1 día. Sirve para obtener nuevos tokens de acceso sin volver a loguearse.
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    # Le indicamos a la librería cuál es el campo de tu llave primaria personalizada
+    'USER_ID_FIELD': 'id_usuario',
+    'USER_ID_CLAIM': 'user_id',
+}
+
+
