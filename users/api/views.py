@@ -3,7 +3,9 @@
 from rest_framework import generics, status, viewsets
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import RegisterCustomSerializer, LoginCustomSerializer
+from .serializers import RegisterCustomSerializer, LoginCustomSerializer,UsuariosSerializer,RolSerializer
+from users.models import Usuarios,Rol
+
 
 class RegisterView(generics.GenericAPIView):
 
