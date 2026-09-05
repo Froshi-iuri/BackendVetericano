@@ -54,3 +54,32 @@ class LoginCustomSerializer(serializers.Serializer):
         
         # Si algo de arriba falla, rechazamos el login.
         raise serializers.ValidationError("Credenciales incorrectas.")
+
+class UsuariosSerializer(serializers.ModelSerializer):
+
+    nombre_rol = serializers.CharField(
+        source='id_rol.nombre_rol',
+        read_only=True
+    )
+
+    class Meta:
+        model = Usuarios
+        fields = (
+            'id_usuario',
+            'email',
+            'nombre',
+            'apellido',
+            'id_rol',
+            'nombre_rol',
+            'activo',
+        )
+
+
+class RolSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Rol
+        fields = (
+            'id_rol',
+            'nombre_rol',
+        )

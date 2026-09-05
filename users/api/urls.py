@@ -1,8 +1,23 @@
-from django.urls import path
-from .views import LoginView, RegisterView
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 
-# EL PORQUÉ: Registramos las URLs específicas de la API de usuarios que el enrutador principal de Django expondrá.
+from .views import (
+    LoginView,
+    RegisterView,
+    UsuariosViewSet,
+    RolViewSet
+)
+
+
+router = DefaultRouter()
+
+router.register(r'usuarios', UsuariosViewSet, basename='usuarios')
+router.register(r'roles', RolViewSet, basename='roles')
+
+
 urlpatterns = [
     path('login/', LoginView.as_view(), name='login'),
     path('register/', RegisterView.as_view(), name='register'),
+
+    path('', include(router.urls)),
 ]
