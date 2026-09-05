@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import dj_database_url
 from dotenv import load_dotenv
+from datetime import timedelta
 
 # carga las variables del archivo .env
 load_dotenv()
@@ -141,8 +142,10 @@ REST_FRAMEWORK = {
     ),
 }
 
-# Configuración específica de los tiempos de vida del token
-from datetime import timedelta
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 SIMPLE_JWT = {
     # El token de acceso dura 60 minutos. Si expira, el frontend debe usar el token de refresco.
