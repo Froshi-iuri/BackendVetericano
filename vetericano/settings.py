@@ -21,7 +21,7 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 SECRET_KEY = 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 ALLOWED_HOSTS = [
     'backendvetericano-2-0.onrender.com', 
@@ -131,6 +131,7 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MAILERS = {
     'default': {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        
     },
 }
 
@@ -156,3 +157,4 @@ SIMPLE_JWT = {
     'USER_ID_FIELD': 'id_usuario',
     'USER_ID_CLAIM': 'user_id',
 }
+
