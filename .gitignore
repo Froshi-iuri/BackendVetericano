@@ -11,3 +11,6 @@ __pycache__/
 # Configuración del editor y variables
 .vscode/
 .env
+
+# Archivos estáticos generados
+staticfiles/
