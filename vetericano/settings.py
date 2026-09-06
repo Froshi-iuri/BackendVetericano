@@ -24,11 +24,12 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$
 DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
 
-ALLOWED_HOSTS = [
-    '.onrender.com',
-    'localhost',
-    '127.0.0.1'
-]
+# ALLOWED_HOSTS = [
+#     '.onrender.com',
+#     'localhost',
+#     '127.0.0.1'
+# ]
+ALLOWED_HOSTS = ['*']
 
 
 
@@ -41,10 +42,12 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    "rest_framework",
+    'rest_framework',
+    'rest_framework.authtoken',  # <-- AGREGAR ESTA LÍNEA (Obligatorio para Tokens)
     'drf_yasg',
     'corsheaders',
     'users',
+    'corsheaders'
 ]
 
 MIDDLEWARE = [
@@ -52,6 +55,7 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',#esto lo subi JAJAJAJJA
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',

@@ -18,6 +18,7 @@ router.register(r'usuarios', UsuariosViewSet, basename='usuarios')
 router.register(r'roles', RolViewSet, basename='roles')
 
 urlpatterns = [
+    path('registro/', RegistroView.as_view(), name='registro'),
     path('login/', LoginView.as_view(), name='login'),
     path('register/', RegisterView.as_view(), name='register'),
 
