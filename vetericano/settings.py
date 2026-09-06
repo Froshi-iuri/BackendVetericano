@@ -21,7 +21,7 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
 
 # ALLOWED_HOSTS = [
@@ -47,6 +47,8 @@ INSTALLED_APPS = [
     'drf_yasg',
     'corsheaders',
     'users',
+    'especies',
+    
 ]
 
 MIDDLEWARE = [
