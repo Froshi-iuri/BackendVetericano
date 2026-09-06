@@ -436,8 +436,9 @@ class Ubicaciones(models.Model):
 
 
 class Usuarios(models.Model):
-    id_usuario = models.AutoField(primary_key=True)
-    email = models.CharField(unique=True, max_length=150)
+    id_usuario = models.AutoField(primary_key=True) 
+    email = models.EmailField(unique=True, max_length=150) # AnaC
+    identificacion = models.CharField(unique=True, max_length=20 ) # AnaC
     password = models.CharField(max_length=255)
     nombre = models.CharField(max_length=100)
     apellido = models.CharField(max_length=100)
@@ -445,7 +446,7 @@ class Usuarios(models.Model):
     activo = models.BooleanField(default=True)
 
     class Meta:
-        managed = False
+        managed = True # AnaC
         db_table = 'usuarios'
 
     def save(self, *args, **kwargs):
