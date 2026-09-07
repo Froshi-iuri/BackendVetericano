@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'drf_yasg',
     'corsheaders',
     'users',
+    'examnes_clinicos'
 
 
     'medicamentos',
