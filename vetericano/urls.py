@@ -26,6 +26,9 @@ urlpatterns = [
     ),
     path('api/especies/', include('especies.apiespecies.urls')),
 
+    # Endpoints de Exámenes Clínicos
+    path('api/examenes-clinicos/', include('examenes_clinicos.api.urls')),
+
 
 
 
