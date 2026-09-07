@@ -26,4 +26,5 @@ urlpatterns = [
     # AnaC
     path('recuperar-password/', solicitar_recuperacion, name='solicitar_recuperacion'),
     path('confirmar-password/', confirmar_recuperacion, name='confirmar_recuperacion'),
+   
 ]
