@@ -1,3 +1,5 @@
 from django.shortcuts import render
+from .apiespecies.views import EspecieViewSet, RazaViewSet
 
-# Create your views here.
+__all__ = ['EspecieViewSet', 'RazaViewSet']
+

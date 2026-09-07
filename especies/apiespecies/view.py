@@ -1,8 +1,4 @@
-from rest_framework import viewsets
-from especies.models import Especie
-from especies.serializers import EspecieSerializer
+# Re-exportar para compatibilidad con importaciones a view.py
+from .views import EspecieViewSet, RazaViewSet
 
-
-class EspecieViewSet(viewsets.ModelViewSet):
-    queryset = Especie.objects.all()
-    serializer_class = EspecieSerializer
+__all__ = ['EspecieViewSet', 'RazaViewSet']

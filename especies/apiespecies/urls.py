@@ -1,12 +1,11 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from ..views import EspecieViewSet
-
+from .views import EspecieViewSet, RazaViewSet
 
 router = DefaultRouter()
+router.register(r'especies', EspecieViewSet, basename='especies')
+router.register(r'razas', RazaViewSet, basename='razas')
 
 urlpatterns = [
-    path('api/', include(router.urls)),
-    path('especies/', EspeciesView.as_view(), name='especies')
-     
+    path('', include(router.urls)),
 ]
