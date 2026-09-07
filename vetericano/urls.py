@@ -24,4 +24,17 @@ urlpatterns = [
         schema_view.with_ui('swagger', cache_timeout=0),
         name='schema-swagger-ui'
     ),
+
+
+
+
+
+
+
+
+    # AnaC
+    path(
+        'api/', include('medicamentos.urls')),
+
+
 ]

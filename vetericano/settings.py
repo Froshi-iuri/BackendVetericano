@@ -47,6 +47,9 @@ INSTALLED_APPS = [
     'drf_yasg',
     'corsheaders',
     'users',
+
+
+    'medicamentos',
 ]
 
 MIDDLEWARE = [
