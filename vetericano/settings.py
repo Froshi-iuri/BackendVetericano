@@ -48,7 +48,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'users',
     'especies',
-    
+    'medicamentos',
 ]
 
 MIDDLEWARE = [

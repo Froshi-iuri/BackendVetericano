@@ -25,4 +25,17 @@ urlpatterns = [
         name='schema-swagger-ui'
     ),
     path('api/especies/', include('especies.apiespecies.urls')),
+
+
+
+
+
+
+
+
+    # AnaC
+    path(
+        'api/', include('medicamentos.urls')),
+
+
 ]
