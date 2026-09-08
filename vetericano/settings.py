@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     'examenes_clinicos',
     'especies',
     'medicamentos',
+    'patologias'
 ]
 
 MIDDLEWARE = [

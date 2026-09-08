@@ -30,7 +30,8 @@ urlpatterns = [
     path('api/examenes-clinicos/', include('examenes_clinicos.api.urls')),
 
 
-
+    #  rutas de patologías 
+    path('api/patologias/', include('patologias.apipatologias.urls')),
 
 
 
