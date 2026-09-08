@@ -271,25 +271,6 @@ class Procedencias(models.Model):
         db_table = 'procedencias'
 
 
-class ProcedimientosCatalogo(models.Model):
-    id_procedimiento_catalogo = models.AutoField(primary_key=True)
-    nombre_tipo = models.CharField(max_length=150)
-
-    class Meta:
-        managed = False
-        db_table = 'procedimientos_catalogo'
-
-
-class ProcedimientosRealizados(models.Model):
-    id_procedimiento_realizado = models.AutoField(primary_key=True)
-    id_consulta = models.ForeignKey(Consultas, models.DO_NOTHING, db_column='id_consulta')
-    id_procedimiento_catalogo = models.ForeignKey(ProcedimientosCatalogo, models.DO_NOTHING, db_column='id_procedimiento_catalogo')
-    resultado_anexo_url = models.CharField(max_length=255, blank=True, null=True)
-
-    class Meta:
-        managed = False
-        db_table = 'procedimientos_realizados'
-
 
 class Proveedores(models.Model):
     id_proveedor = models.AutoField(primary_key=True)
@@ -436,8 +417,9 @@ class Ubicaciones(models.Model):
 
 
 class Usuarios(models.Model):
-    id_usuario = models.AutoField(primary_key=True)
-    email = models.CharField(unique=True, max_length=150)
+    id_usuario = models.AutoField(primary_key=True) 
+    email = models.EmailField(unique=True, max_length=150) # AnaC
+    identificacion = models.CharField(unique=True, max_length=20 ) # AnaC
     password = models.CharField(max_length=255)
     nombre = models.CharField(max_length=100)
     apellido = models.CharField(max_length=100)
@@ -445,7 +427,7 @@ class Usuarios(models.Model):
     activo = models.BooleanField(default=True)
 
     class Meta:
-        managed = False
+        managed = True # AnaC
         db_table = 'usuarios'
 
     def save(self, *args, **kwargs):

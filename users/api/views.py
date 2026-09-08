@@ -7,6 +7,7 @@ from .serializers import RegisterCustomSerializer, LoginCustomSerializer,Usuario
 from users.models import Usuarios,Rol
 
 
+
 class RegisterView(generics.GenericAPIView):
 
     # Esto es lo que le dice a Swagger:
@@ -67,7 +68,7 @@ class UsuariosViewSet(viewsets.ModelViewSet):
     serializer_class = UsuariosSerializer
 
 
-class RolViewSet(viewsets.ReadOnlyModelViewSet):
-
+class RolViewSet(viewsets.ModelViewSet):
     queryset = Rol.objects.all()
+
     serializer_class = RolSerializer

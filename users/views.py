@@ -48,9 +48,9 @@ def solicitar_recuperacion(request):
         mensaje['To'] = email
         mensaje['Subject'] = asunto
         mensaje.attach(MIMEText(cuerpo, 'plain'))
-        
-        servidor = smtplib.SMTP('smtp.gmail.com', 587)
-        servidor.starttls()
+
+        # AnaC
+        servidor = smtplib.SMTP_SSL('smtp.gmail.com', 465)
         servidor.login(remitente, password_app)
         servidor.sendmail(remitente, email, mensaje.as_string())
         servidor.quit()

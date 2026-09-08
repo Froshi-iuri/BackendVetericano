@@ -1,4 +1,5 @@
 # serializers.py
+import re # AnaC
 from rest_framework import serializers
 # Importamos el hash de contraseñas de Django. 
 # Esto es CRÍTICO: nunca guardes contraseñas en texto plano.
@@ -11,8 +12,20 @@ class RegisterCustomSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Usuarios
-        fields = ('email', 'password', 'nombre', 'apellido')
+        fields = ('email', 'identificacion','password', 'nombre', 'apellido')
         extra_kwargs = {'password': {'write_only': True}}
+
+    # AnaC
+    def validate_password(self, value):
+        """Valida que la contraseña cumpla con las reglas de negocio de seguridad."""
+        if len(value) < 8:
+            raise serializers.ValidationError("La contraseña debe tener al menos 8 caracteres.")
+        
+        if not re.search(r'[A-Z]', value):
+            raise serializers.ValidationError("La contraseña debe incluir al menos una letra mayúscula.")
+            
+        return value
+    # AnaC
 
     def create(self, validated_data):
         validated_data['password'] = make_password(validated_data['password'])
@@ -62,6 +75,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
         fields = (
             'id_usuario',
             'email',
+            'identificacion',
             'nombre',
             'apellido',
             'id_rol',

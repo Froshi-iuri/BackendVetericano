@@ -24,4 +24,21 @@ urlpatterns = [
         schema_view.with_ui('swagger', cache_timeout=0),
         name='schema-swagger-ui'
     ),
+    path('api/especies/', include('especies.apiespecies.urls')),
+
+    # Endpoints de Exámenes Clínicos
+    path('api/examenes-clinicos/', include('examenes_clinicos.api.urls')),
+
+
+
+
+
+
+
+
+    # AnaC
+    path(
+        'api/', include('medicamentos.urls')),
+
+
 ]

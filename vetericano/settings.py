@@ -47,6 +47,9 @@ INSTALLED_APPS = [
     'drf_yasg',
     'corsheaders',
     'users',
+    'examenes_clinicos',
+    'especies',
+    'medicamentos',
 ]
 
 MIDDLEWARE = [
@@ -135,12 +138,14 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-        
-    },
-}
+# Configuración oficial de Correo en Django
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 465))
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'True') == 'True'
 
 
 # Configuración base de Django REST Framework para exigir tokens por defecto
