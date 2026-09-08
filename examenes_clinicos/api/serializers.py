@@ -8,7 +8,6 @@ class ProcedimientosCatalogoSerializer(serializers.ModelSerializer):
         fields = (
             'id_procedimiento_catalogo',
             'nombre_tipo',
-            'tipo',
             'descripcion',
             'observaciones', 
             'estado')
