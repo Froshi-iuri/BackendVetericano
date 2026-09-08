@@ -1,6 +1,7 @@
 from django.contrib import admin
 from .models import ProcedimientosCatalogo, ProcedimientosRealizados
 
+# Register your models here.
 
 @admin.register(ProcedimientosCatalogo)
 class ProcedimientosCatalogoAdmin(admin.ModelAdmin):

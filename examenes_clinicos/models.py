@@ -4,7 +4,8 @@ from django.db import models
 class ProcedimientosCatalogo(models.Model):
     id_procedimiento_catalogo = models.AutoField(primary_key=True)
     nombre_tipo = models.CharField(max_length=150)
-
+    descripcion = models.TextField(blank=True, null=True)
+    
     class Meta:
         managed = False
         db_table = 'procedimientos_catalogo'
