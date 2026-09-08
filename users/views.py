@@ -39,7 +39,7 @@ def solicitar_recuperacion(request):
     cuerpo = f'Hola, tu código para recuperar la contraseña es: {codigo}'
     
     try:
-        # Configuración SMTP directa con Python (Bypasa completamente el sistema MAILERS de Django)
+        
         remitente = 'vetericano@gmail.com'
         password_app = 'vfug poqj pzjv ssae'
         
