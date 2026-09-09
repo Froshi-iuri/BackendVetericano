@@ -36,10 +36,8 @@ urlpatterns = [
 
 
 
-
-    # AnaC
-    path(
-        'api/', include('medicamentos.urls')),
+   # AnaC
+    path('api/', include('medicamentos.apimedicamentos.urls')),
 
 
 ]
