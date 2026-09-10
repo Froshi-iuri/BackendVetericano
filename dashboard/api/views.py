@@ -6,7 +6,7 @@ from .serializers import DashboardSerializer
 
 
 class DashboardView(generics.RetrieveAPIView):
-
+    
     permission_classes = [IsAuthenticated]
     serializer_class = DashboardSerializer
 
