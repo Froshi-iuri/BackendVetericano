@@ -50,7 +50,9 @@ INSTALLED_APPS = [
     'examenes_clinicos',
     'especies',
     'medicamentos',
-    'patologias'
+    'patologias',
+    'adopciones',
+    'voluntariado'
 ]
 
 MIDDLEWARE = [
