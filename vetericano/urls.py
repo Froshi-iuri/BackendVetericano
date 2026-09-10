@@ -42,6 +42,9 @@ urlpatterns = [
 
     # AnaC
 
+    #Jube 
+    path('api/dashboard/', include('dashboard.api.urls')),
+
 
 
 
