@@ -6,9 +6,9 @@ class TiposPeticionSerializer(serializers.ModelSerializer):
         model = TiposPeticion
         fields = ['id_tipo', 'nombre', 'descripcion']
 
-# Se corrigió "Inicar" por "Iniciar"
 class IniciarPeticionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Peticiones
-        # Nota adicional: verifica si 'id_pericion' no tiene también un typo por 'id_peticion'
-        fields = ['id_pericion', 'nombre', 'descripcion']
+        fields = ['id_peticion', 'id_tipo']
+        read_only_fields = ['id_peticion']
+        
