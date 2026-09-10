@@ -52,7 +52,8 @@ INSTALLED_APPS = [
     'medicamentos',
     'patologias',
     'adopciones',
-    'voluntariado'
+    'voluntariado',
+    'peticiones'
 ]
 
 MIDDLEWARE = [
