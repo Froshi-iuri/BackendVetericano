@@ -45,7 +45,8 @@ urlpatterns = [
     #Jube 
     path('api/dashboard/', include('dashboard.api.urls')),
 
-
+    #jdqa
+    path('api/peticiones/', include('peticiones.urls')),
 
 
 ]
