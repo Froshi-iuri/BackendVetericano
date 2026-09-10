@@ -154,7 +154,7 @@ EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'True') == 'True'
 # Configuración base de Django REST Framework para exigir tokens por defecto
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'users.authentication.CustomJWTAuthentication',
     ),
 }
 
