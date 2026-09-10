@@ -51,8 +51,8 @@ INSTALLED_APPS = [
     'especies',
     'medicamentos',
     'patologias',
-
-    'dashboard',
+    'adopciones',
+    'voluntariado'
 ]
 
 MIDDLEWARE = [
@@ -188,5 +188,22 @@ csrf_env = os.getenv('CSRF_TRUSTED_ORIGINS')
 if csrf_env:
     CSRF_TRUSTED_ORIGINS.extend([origin.strip() for origin in csrf_env.split(',') if origin.strip()])
 
-
-
+# esto es para la configuración de almacenamiento de caché
+# Verificamos si existe la variable que inyecta Railway en producción
+if os.environ.get('REDIS_URL'):
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': os.environ.get('REDIS_URL'),
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            }
+        }
+    }
+else:
+    # Si la variable no existe, asumimos que estamos en desarrollo local
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        }
+    }

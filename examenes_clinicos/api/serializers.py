@@ -5,7 +5,12 @@ from examenes_clinicos.models import ProcedimientosCatalogo, ProcedimientosReali
 class ProcedimientosCatalogoSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProcedimientosCatalogo
-        fields = '__all__'
+        fields = (
+            'id_procedimiento_catalogo',
+            'nombre_tipo',
+            'descripcion',
+            'observaciones', 
+            'estado')
         read_only_fields = ('id_procedimiento_catalogo',)
 
 

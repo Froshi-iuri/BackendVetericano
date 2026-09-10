@@ -33,13 +33,16 @@ urlpatterns = [
     #  rutas de patologías 
     path('api/patologias/', include('patologias.apipatologias.urls')),
 
+    # AnaC
+    path('api/', include('medicamentos.apimedicamentos.urls')),
 
+    path('api/', include('adopciones.apiadopciones.urls')),
 
-
+    path('api/', include('voluntariado.apivoluntariado.urls')),
 
     # AnaC
-    path(
-        'api/', include('medicamentos.urls')),
+
+
 
 
 ]

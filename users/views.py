@@ -3,22 +3,21 @@ from django.shortcuts import render
 # AnaC
 
 import random
-import hashlib
-import secrets
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from .services.email_service import enviar_correo_transaccional_brevo
 from django.core.cache import cache
+from django.contrib.auth.hashers import make_password
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Usuarios
+import os
+from dotenv import load_dotenv
 
-def encriptar_password(password):
-    """Genera un hash seguro compatible con la verificación estándar."""
-    salt = secrets.token_hex(16)
-    pwdhash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('ascii'), 100000)
-    return f"pbkdf2_sha256$100000${salt}${pwdhash.hex()}"
+load_dotenv()
+
 
 @api_view(['POST'])
 def solicitar_recuperacion(request):
@@ -39,25 +38,25 @@ def solicitar_recuperacion(request):
     cuerpo = f'Hola, tu código para recuperar la contraseña es: {codigo}'
     
     try:
-        # Configuración SMTP directa con Python (Bypasa completamente el sistema MAILERS de Django)
-        remitente = 'vetericano@gmail.com'
-        password_app = 'vfug poqj pzjv ssae'
-        
-        mensaje = MIMEMultipart()
-        mensaje['From'] = remitente
-        mensaje['To'] = email
-        mensaje['Subject'] = asunto
-        mensaje.attach(MIMEText(cuerpo, 'plain'))
+        # ---------- Envío usando Brevo (puerto 443) ----------
+        html_content = f"""<html><body>
+        <p>Hola,</p>
+        <p>Tu código de recuperación es: <strong>{codigo}</strong></p>
+        <p>Este código es válido por 15 minutos.</p>
+        </body></html>"""
+        resultado = enviar_correo_transaccional_brevo(
+            destinatario_email=email,
+            destinatario_nombre='Usuario',
+            asunto=asunto,
+            contenido_html=html_content,
+        )
+        if resultado["exito"]:
+            return Response({'mensaje': 'Correo de recuperación enviado exitosamente.'}, status=status.HTTP_200_OK)
+        else:
+            return Response({'error': 'Falló la verificación del resultado.', 'detalle': resultado["error"]}, status=status.HTTP_502_BAD_GATEWAY)
 
-        # AnaC
-        servidor = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-        servidor.login(remitente, password_app)
-        servidor.sendmail(remitente, email, mensaje.as_string())
-        servidor.quit()
-        
-        return Response({'mensaje': 'Correo enviado exitosamente.'}, status=status.HTTP_200_OK)
     except Exception as e:
-        return Response({'error': f'Error técnico: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'error': f'Error técnico al enviar el correo: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['POST'])
@@ -80,7 +79,7 @@ def confirmar_recuperacion(request):
         return Response({'error': 'El código de recuperación es incorrecto o ha expirado.'}, status=status.HTTP_400_BAD_REQUEST)
     
     # Actualizar la contraseña con el hash seguro
-    user.password = encriptar_password(nueva_password)
+    user.password = make_password(nueva_password)
     user.save(update_fields=['password'])
     
     cache.delete(f'recuperacion_{email}')
