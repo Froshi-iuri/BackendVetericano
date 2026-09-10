@@ -1,5 +1,4 @@
 from rest_framework import serializers
-from ..models import Patologia 
 from patologias.models import Patologia 
 
 class PatologiaSerializer(serializers.ModelSerializer):

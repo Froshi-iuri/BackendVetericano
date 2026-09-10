@@ -444,6 +444,15 @@ class Usuarios(models.Model):
         
         super().save(*args, **kwargs)
 
+    @property
+    def is_authenticated(self):
+        return True
+
+    @property
+    def is_anonymous(self):
+        return False
+
+
 
 class Veterinarios(models.Model):
     id_veterinario = models.AutoField(primary_key=True)
