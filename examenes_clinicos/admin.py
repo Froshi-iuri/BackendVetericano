@@ -1,17 +1,15 @@
 from django.contrib import admin
-from .models import ProcedimientosCatalogo, ProcedimientosRealizados
+from .models import Examen, ProcedimientoRealizado
 
 # Register your models here.
 
-@admin.register(ProcedimientosCatalogo)
-class ProcedimientosCatalogoAdmin(admin.ModelAdmin):
-    list_display = ('id_procedimiento_catalogo', 'nombre_tipo')
-    search_fields = ('nombre_tipo',)
+@admin.register(Examen)
+class ExamenAdmin(admin.ModelAdmin):
+    list_display = ('id_examen', 'id_consulta', 'resultado')
+    search_fields = ('resultado',)
 
 
-@admin.register(ProcedimientosRealizados)
-class ProcedimientosRealizadosAdmin(admin.ModelAdmin):
-    list_display = ('id_procedimiento_realizado', 'id_consulta', 'id_procedimiento_catalogo', 'resultado_anexo_url')
-    list_filter = ('id_procedimiento_catalogo',)
-    search_fields = ('resultado_anexo_url',)
-
+@admin.register(ProcedimientoRealizado)
+class ProcedimientoRealizadoAdmin(admin.ModelAdmin):
+    list_display = ('id_procedimiento', 'id_hospitalizacion', 'descripcion')
+    search_fields = ('descripcion',)
