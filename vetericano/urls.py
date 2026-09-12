@@ -33,6 +33,7 @@ urlpatterns = [
     #  rutas de patologías 
     path('api/patologias/', include('patologias.apipatologias.urls')),
 
+
     # AnaC
     path('api/', include('medicamentos.apimedicamentos.urls')),
 
@@ -40,7 +41,6 @@ urlpatterns = [
 
     path('api/', include('voluntariado.apivoluntariado.urls')),
 
-    # AnaC
 
     #Jube 
     path('api/dashboard/', include('dashboard.api.urls')),
