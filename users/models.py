@@ -610,16 +610,3 @@ class VoluntarioEvento(models.Model):
 
     def __str__(self):
         return f"Voluntario #{self.id_usuario_id} - Evento #{self.id_evento_id}"
-
-
-# ==========================================
-# ALIASES DE COMPATIBILIDAD HACIA ATRÁS
-# ==========================================
-Especie = Especies
-TiposPeticion = TipoPeticion
-EstadosPeticion = EstadoPeticiones
-EstadoDePeticiones = EstadoPeticiones
-Consultas = Consulta
-Patologias = Patologia
-Inventario = Inventarios
-SeguimientoPeticiones = SeguimientoPeticionesVisita

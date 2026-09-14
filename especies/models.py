@@ -9,7 +9,7 @@ class Especie(models.Model):
 
     class Meta:
         managed = False
-        db_table = 'especie'
+        db_table = 'especies'
 
     def __str__(self):
         return self.nombre

@@ -1,12 +1,12 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from users.models import TiposPeticion, Peticiones, EstadosPeticion
+from users.models import TipoPeticion, Peticiones, EstadoPeticiones
 from users.api.serializers import UsuariosSerializer
 from .serializers import TiposPeticionSerializer, IniciarPeticionSerializer
 
 class ListarTiposPeticionView(generics.ListAPIView):
-    queryset = TiposPeticion.objects.filter(activo=True)
+    queryset = TipoPeticion.objects.filter(activo=True)
     serializer_class = TiposPeticionSerializer
     permission_classes = [IsAuthenticated]
 
@@ -17,8 +17,8 @@ class IniciarPeticionView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         try:
-            estado_inicial = EstadosPeticion.objects.get(nombre__iexact='Borrador')
-        except EstadosPeticion.DoesNotExist:
+            estado_inicial = EstadoPeticiones.objects.get(nombre__iexact='Borrador')
+        except EstadoPeticiones.DoesNotExist:
             return Response(
                 {"error": "El estado 'Borrador' no existe en la base de datos."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
