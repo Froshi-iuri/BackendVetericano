@@ -68,7 +68,7 @@ class Ubicaciones(models.Model):
     direccion = models.CharField(max_length=255, blank=True, null=True)
     barrio = models.CharField(max_length=100, blank=True, null=True)
     ciudad = models.CharField(max_length=100, blank=True, null=True)
-    municipio = models.CharField(max_length=100, blank=True, null=True)
+    vereda = models.CharField(max_length=100, blank=True, null=True)
     latitud = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
     longitud = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
 
@@ -113,7 +113,7 @@ class Proveedores(models.Model):
     id_proveedor = models.AutoField(primary_key=True)
     nombre = models.CharField(max_length=150)
     telefono = models.CharField(max_length=30, blank=True, null=True)
-    contacto = models.CharField(max_length=150, blank=True, null=True)
+    email = models.CharField(max_length=150, blank=True, null=True)
     direccion = models.CharField(max_length=255, blank=True, null=True)
     activo = models.BooleanField(default=True)
 
@@ -128,7 +128,6 @@ class Proveedores(models.Model):
 class Patologia(models.Model):
     id_patologia = models.AutoField(primary_key=True)
     nombre = models.CharField(max_length=150)
-    codigo_cie = models.CharField(max_length=20, blank=True, null=True)
     descripcion = models.TextField(blank=True, null=True)
     activo = models.BooleanField(default=True)
 
@@ -164,10 +163,14 @@ class Animal(models.Model):
     id_raza = models.ForeignKey(Raza, models.DO_NOTHING, db_column='id_raza')
     nombre = models.CharField(max_length=100)
     sexo = models.CharField(max_length=10, blank=True, null=True)
+    color = models.CharField(max_length=50, blank=True, null=True)
+    fecha_nacimiento = models.DateField(blank=True, null=True)
     fecha_ingreso = models.DateField(blank=True, null=True)
+    peso = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+    esterilizado = models.BooleanField(default=False)
     caracteristicas = models.TextField(blank=True, null=True)
-    observacion = models.TextField(blank=True, null=True)
-    foto = models.CharField(max_length=255, blank=True, null=True)
+    observaciones = models.TextField(blank=True, null=True)
+    foto_url = models.CharField(max_length=255, blank=True, null=True)
     activo = models.BooleanField(default=True)
 
     class Meta:
@@ -218,6 +221,7 @@ class Usuarios(models.Model):
     identificacion = models.CharField(unique=True, max_length=20, blank=True, null=True)
     email = models.EmailField(unique=True, max_length=150)
     password = models.CharField(max_length=255)
+    telefono = models.CharField(max_length=30, blank=True, null=True)
     activo = models.BooleanField(default=True)
 
     class Meta:
@@ -251,8 +255,19 @@ class Usuarios(models.Model):
 class HistoriaClinica(models.Model):
     id_historia = models.AutoField(primary_key=True)
     id_animal = models.OneToOneField(Animal, models.DO_NOTHING, db_column='id_animal', unique=True)
+    numero_historia = models.CharField(max_length=50, blank=True, null=True)
     fecha_apertura = models.DateTimeField(auto_now_add=True)
     estado_general = models.CharField(max_length=50, blank=True, null=True)
+    fecha_ultima_desparasitacion = models.DateField(blank=True, null=True)
+    producto_desparasitacion = models.CharField(max_length=150, blank=True, null=True)
+    vacunas = models.TextField(blank=True, null=True)
+    enfermedades_anteriores = models.TextField(blank=True, null=True)
+    tratamientos_anteriores = models.TextField(blank=True, null=True)
+    evolucion_previa = models.TextField(blank=True, null=True)
+    alimentacion = models.CharField(max_length=255, blank=True, null=True)
+    estado_reproductivo = models.CharField(max_length=30, blank=True, null=True)
+    fecha_ultimo_celo = models.DateField(blank=True, null=True)
+    fecha_ultimo_parto = models.DateField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -271,6 +286,18 @@ class Consulta(models.Model):
     anamnesis = models.TextField(blank=True, null=True)
     hallazgos_examen = models.TextField(blank=True, null=True)
     resultado_estado = models.CharField(max_length=100, blank=True, null=True)
+    frecuencia_respiratoria = models.IntegerField(blank=True, null=True)
+    frecuencia_cardiaca = models.IntegerField(blank=True, null=True)
+    temperatura = models.DecimalField(max_digits=4, decimal_places=1, blank=True, null=True)
+    pulso = models.CharField(max_length=50, blank=True, null=True)
+    tllc = models.CharField(max_length=50, blank=True, null=True)
+    ganglios_linfaticos = models.CharField(max_length=100, blank=True, null=True)
+    mucosas = models.CharField(max_length=100, blank=True, null=True)
+    actitud_temperamento = models.CharField(max_length=50, blank=True, null=True)
+    evaluacion_sistemas = models.JSONField(blank=True, null=True)
+    observaciones_examen = models.TextField(blank=True, null=True)
+    materiales_utilizados = models.TextField(blank=True, null=True)
+    ingresa_cba = models.BooleanField(default=False)
 
     class Meta:
         managed = False
@@ -285,6 +312,9 @@ class HospitalizacionSeresSintientes(models.Model):
     id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
     descripcion_estado = models.TextField(blank=True, null=True)
     fecha_ingreso = models.DateTimeField(auto_now_add=True)
+    diagnostico_presuntivo = models.TextField(blank=True, null=True)
+    responsable_clinico = models.CharField(max_length=150, blank=True, null=True)
+    hoja_numero = models.IntegerField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -298,6 +328,12 @@ class Tratamientos(models.Model):
     id_tratamiento = models.AutoField(primary_key=True)
     id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
     descripcion = models.CharField(max_length=255, blank=True, null=True)
+    producto_base = models.CharField(max_length=150, blank=True, null=True)
+    dosis_basica = models.CharField(max_length=100, blank=True, null=True)
+    presentacion = models.CharField(max_length=100, blank=True, null=True)
+    via_administracion = models.CharField(max_length=100, blank=True, null=True)
+    frecuencia_duracion = models.CharField(max_length=100, blank=True, null=True)
+    materiales_utilizados = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -311,6 +347,8 @@ class Diagnostico(models.Model):
     id_diagnostico = models.AutoField(primary_key=True)
     id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
     descripcion = models.TextField(blank=True, null=True)
+    tipo_diagnostico = models.CharField(max_length=50, blank=True, null=True)
+    lista_problemas = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -323,7 +361,12 @@ class Diagnostico(models.Model):
 class Examen(models.Model):
     id_examen = models.AutoField(primary_key=True)
     id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
+    nombre_tipo_examen = models.CharField(max_length=100, blank=True, null=True)
+    solicitado = models.BooleanField(default=True)
+    descripcion_hallazgos = models.TextField(blank=True, null=True)
     resultado = models.TextField(blank=True, null=True)
+    ruta_archivo_resultado = models.CharField(max_length=500, blank=True, null=True)
+    fecha_realizacion = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         managed = False
@@ -338,6 +381,11 @@ class SeguimientosClinicos(models.Model):
     id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
     evolucion = models.TextField(blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
+    temperatura = models.DecimalField(max_digits=4, decimal_places=1, blank=True, null=True)
+    frecuencia_cardiaca = models.IntegerField(blank=True, null=True)
+    frecuencia_respiratoria = models.IntegerField(blank=True, null=True)
+    peso = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+    plan_tratamiento = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -351,6 +399,7 @@ class DiagnosticoPatologia(models.Model):
     id_diagnostico_patologia = models.AutoField(primary_key=True)
     id_diagnostico = models.ForeignKey(Diagnostico, models.DO_NOTHING, db_column='id_diagnostico')
     id_patologia = models.ForeignKey(Patologia, models.DO_NOTHING, db_column='id_patologia')
+    hallazgos_pruebas = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -364,6 +413,10 @@ class ProcedimientoRealizado(models.Model):
     id_procedimiento = models.AutoField(primary_key=True)
     id_hospitalizacion = models.ForeignKey(HospitalizacionSeresSintientes, models.DO_NOTHING, db_column='id_hospitalizacion')
     descripcion = models.TextField(blank=True, null=True)
+    fecha_procedimiento = models.DateField(blank=True, null=True)
+    hora_procedimiento = models.TimeField(blank=True, null=True)
+    medico_responsable = models.CharField(max_length=150, blank=True, null=True)
+    tipo_procedimiento = models.CharField(max_length=100, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -425,6 +478,8 @@ class Medicamentos(models.Model):
     presentacion = models.CharField(max_length=100, blank=True, null=True)
     concentracion = models.CharField(max_length=50, blank=True, null=True)
     descripcion = models.TextField(blank=True, null=True)
+    cantidad_ml = models.CharField(max_length=50, blank=True, null=True)
+    tipo = models.CharField(max_length=50, blank=True, null=True)
     activo = models.BooleanField(default=True)
 
     class Meta:
@@ -484,6 +539,8 @@ class Inventarios(models.Model):
     id_detalle_salida = models.ForeignKey(DetalleSalida, models.DO_NOTHING, db_column='id_detalle_salida', blank=True, null=True)
     id_detalle_compra = models.ForeignKey(DetalleCompra, models.DO_NOTHING, db_column='id_detalle_compra', blank=True, null=True)
     cantidad_actual = models.IntegerField(default=0)
+    fecha_vencimiento = models.DateField(blank=True, null=True)
+    estado = models.CharField(max_length=50, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -498,6 +555,11 @@ class TratamientoMedicamentos(models.Model):
     id_tratamiento = models.ForeignKey(Tratamientos, models.DO_NOTHING, db_column='id_tratamiento')
     id_medicamento = models.ForeignKey(Medicamentos, models.DO_NOTHING, db_column='id_medicamento')
     dosis = models.CharField(max_length=100, blank=True, null=True)
+    fecha_aplicacion = models.DateField(blank=True, null=True)
+    via = models.CharField(max_length=50, blank=True, null=True)
+    hora_administrada = models.TimeField(blank=True, null=True)
+    responsable_admin = models.CharField(max_length=150, blank=True, null=True)
+    reaccion_comentarios = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -540,6 +602,7 @@ class EvidenciaPeticiones(models.Model):
     id_evidencia = models.AutoField(primary_key=True)
     id_peticion = models.ForeignKey(Peticiones, models.DO_NOTHING, db_column='id_peticion')
     ruta_archivo = models.CharField(max_length=500, blank=True, null=True)
+    descripcion = models.CharField(max_length=255, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -554,8 +617,41 @@ class SeguimientoPeticionesVisita(models.Model):
     id_peticion = models.ForeignKey(Peticiones, models.DO_NOTHING, db_column='id_peticion')
     id_veterinario = models.ForeignKey(Usuarios, models.DO_NOTHING, db_column='id_veterinario')
     id_animal = models.ForeignKey(Animal, models.DO_NOTHING, db_column='id_animal', blank=True, null=True)
+    id_ubicacion = models.ForeignKey(Ubicaciones, models.DO_NOTHING, db_column='id_ubicacion', blank=True, null=True)
     observacion = models.TextField(blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
+    numero_radicado = models.CharField(max_length=100, blank=True, null=True)
+    fecha_atencion = models.DateField(blank=True, null=True)
+    quien_reporta = models.CharField(max_length=30, blank=True, null=True)
+    quien_reporta_otro = models.CharField(max_length=255, blank=True, null=True)
+    solicitud_atencion_por = models.CharField(max_length=255, blank=True, null=True)
+    propietario_nombre = models.CharField(max_length=150, blank=True, null=True)
+    propietario_cedula = models.CharField(max_length=20, blank=True, null=True)
+    propietario_telefono = models.CharField(max_length=20, blank=True, null=True)
+    propietario_email = models.CharField(max_length=100, blank=True, null=True)
+    nro_animales_atendidos = models.IntegerField(blank=True, null=True)
+    nombre_paciente = models.CharField(max_length=150, blank=True, null=True)
+    paciente_especie = models.CharField(max_length=50, blank=True, null=True)
+    paciente_sexo = models.CharField(max_length=10, blank=True, null=True)
+    paciente_color = models.CharField(max_length=50, blank=True, null=True)
+    paciente_raza = models.CharField(max_length=50, blank=True, null=True)
+    paciente_edad = models.CharField(max_length=50, blank=True, null=True)
+    peso_paciente = models.DecimalField(max_digits=6, decimal_places=2, blank=True, null=True)
+    esterilizacion_paciente = models.BooleanField(blank=True, null=True)
+    descripcion_paciente = models.TextField(blank=True, null=True)
+    desparasitacion = models.BooleanField(blank=True, null=True)
+    anamnesis_descripcion_queja = models.TextField(blank=True, null=True)
+    tratamiento_realizado = models.TextField(blank=True, null=True)
+    pruebas_complementarias = models.TextField(blank=True, null=True)
+    resultado_pruebas = models.TextField(blank=True, null=True)
+    compromisos = models.TextField(blank=True, null=True)
+    fundamento_legal = models.TextField(blank=True, null=True)
+    plazo_dias_cumplimiento = models.IntegerField(blank=True, null=True)
+    nombre_funcionario = models.CharField(max_length=150, blank=True, null=True)
+    funcionario_cargo = models.CharField(max_length=150, blank=True, null=True)
+    fecha_notificacion = models.DateField(blank=True, null=True)
+    notificado_nombre = models.CharField(max_length=150, blank=True, null=True)
+    notificaciones_identificacion = models.CharField(max_length=50, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -570,6 +666,18 @@ class VisitaAnimal(models.Model):
     id_animal = models.ForeignKey(Animal, models.DO_NOTHING, db_column='id_animal')
     id_seguimiento = models.ForeignKey(SeguimientoPeticionesVisita, models.DO_NOTHING, db_column='id_seguimiento', blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
+    nro_radicado_atencion = models.CharField(max_length=100, blank=True, null=True)
+    quien_reporta = models.CharField(max_length=255, blank=True, null=True)
+    lugar_atencion_direccion = models.CharField(max_length=255, blank=True, null=True)
+    anamnesis_queja = models.TextField(blank=True, null=True)
+    atencion_tratamiento_campo = models.TextField(blank=True, null=True)
+    desparasitacion_campo = models.CharField(max_length=255, blank=True, null=True)
+    pruebas_rapidas_resultado = models.TextField(blank=True, null=True)
+    compromisos = models.TextField(blank=True, null=True)
+    plazo_dias = models.IntegerField(blank=True, null=True)
+    nombre_notificado = models.CharField(max_length=150, blank=True, null=True)
+    documento_notificado = models.CharField(max_length=50, blank=True, null=True)
+    fecha_notificacion = models.DateField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -588,6 +696,7 @@ class Eventos(models.Model):
     id_tipo_evento = models.ForeignKey(TiposEventos, models.DO_NOTHING, db_column='id_tipo_evento')
     nombre = models.CharField(max_length=150, blank=True, null=True)
     fecha = models.DateTimeField(blank=True, null=True)
+    descripcion = models.CharField(max_length=500, blank=True, null=True)
 
     class Meta:
         managed = False
