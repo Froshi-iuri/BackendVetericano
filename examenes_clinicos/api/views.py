@@ -1,16 +1,16 @@
-﻿from rest_framework import viewsets
-from examenes_clinicos.models import ProcedimientosCatalogo, ProcedimientosRealizados
+from rest_framework import viewsets
+from examenes_clinicos.models import Examen, ProcedimientoRealizado
 from .serializers import (
-    ProcedimientosCatalogoSerializer,
-    ProcedimientosRealizadosSerializer,
+    ExamenSerializer,
+    ProcedimientoRealizadoSerializer,
 )
 
 
-class ProcedimientosCatalogoViewSet(viewsets.ModelViewSet):
-    queryset = ProcedimientosCatalogo.objects.all()
-    serializer_class = ProcedimientosCatalogoSerializer
+class ExamenViewSet(viewsets.ModelViewSet):
+    queryset = Examen.objects.all()
+    serializer_class = ExamenSerializer
 
 
-class ProcedimientosRealizadosViewSet(viewsets.ModelViewSet):
-    queryset = ProcedimientosRealizados.objects.all()
-    serializer_class = ProcedimientosRealizadosSerializer
+class ProcedimientoRealizadoViewSet(viewsets.ModelViewSet):
+    queryset = ProcedimientoRealizado.objects.all()
+    serializer_class = ProcedimientoRealizadoSerializer
