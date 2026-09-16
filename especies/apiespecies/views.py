@@ -1,6 +1,6 @@
 from rest_framework import viewsets
-from especies.models import Especie, Raza
-from .serializers import EspecieSerializer, RazaSerializer
+from especies.models import Especie, Raza, Animal
+from .serializers import EspecieSerializer, RazaSerializer, AnimalSerializer
 
 
 class EspecieViewSet(viewsets.ModelViewSet):
@@ -12,3 +12,6 @@ class RazaViewSet(viewsets.ModelViewSet):
     queryset = Raza.objects.all()
     serializer_class = RazaSerializer
 
+class AnimalViewSet(viewsets.ModelViewSet):
+    queryset = Animal.objects.all()
+    serializer_class = AnimalSerializer
