@@ -9,6 +9,8 @@ class ExamenSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True
     )
+    nombre_tipo = serializers.CharField(source='nombre_tipo_examen', required=False, allow_blank=True, allow_null=True)
+    descripcion = serializers.CharField(source='descripcion_hallazgos', required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = Examen
@@ -16,12 +18,13 @@ class ExamenSerializer(serializers.ModelSerializer):
             'id_examen',
             'id_consulta',
             'nombre_tipo_examen',
+            'nombre_tipo',
             'solicitado',
             'descripcion_hallazgos',
+            'descripcion',
             'resultado',
             'ruta_archivo_resultado',
             'fecha_realizacion',
-
         )
         read_only_fields = ('id_examen',)
 
