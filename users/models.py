@@ -579,15 +579,9 @@ class Peticiones(models.Model):
     id_ubicacion = models.ForeignKey(Ubicaciones, models.DO_NOTHING, db_column='id_ubicacion', blank=True, null=True)
     id_estado = models.ForeignKey(EstadoPeticiones, models.DO_NOTHING, db_column='id_estado')
     responsable = models.ForeignKey(Usuarios, models.DO_NOTHING, db_column='responsable_id', blank=True, null=True)
-    ciudadano_id = models.IntegerField(blank=True, null=True)
     descripcion = models.TextField(blank=True, null=True)
-    direccion = models.CharField(max_length=255, blank=True, null=True)
     prioridad = models.CharField(max_length=20, blank=True, null=True)
-    fecha_creacion = models.DateTimeField(blank=True, null=True)
     fecha_asignacion = models.DateTimeField(blank=True, null=True)
-    fecha_respuesta = models.DateTimeField(blank=True, null=True)
-    fecha_cierre = models.DateTimeField(blank=True, null=True)
-    respuesta = models.TextField(blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
 
     class Meta:

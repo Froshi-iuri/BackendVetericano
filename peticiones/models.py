@@ -1,3 +1,4 @@
-from django.db import models
+from django.db import models  # noqa: F401
+from users.models import Peticiones, TipoPeticion, EstadoPeticiones
 
-# Create your models here.
+__all__ = ['Peticiones', 'TipoPeticion', 'EstadoPeticiones']
