@@ -360,7 +360,7 @@ class Diagnostico(models.Model):
 
 class Examen(models.Model):
     id_examen = models.AutoField(primary_key=True)
-    id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta')
+    id_consulta = models.ForeignKey(Consulta, models.DO_NOTHING, db_column='id_consulta', blank=True, null=True)
     nombre_tipo_examen = models.CharField(max_length=100, blank=True, null=True)
     solicitado = models.BooleanField(default=True)
     descripcion_hallazgos = models.TextField(blank=True, null=True)
