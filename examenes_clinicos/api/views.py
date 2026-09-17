@@ -1,23 +1,22 @@
 from rest_framework import viewsets
-from django.db import connection
 from examenes_clinicos.models import Examen, ProcedimientoRealizado
-from .serializers import (
-    ExamenSerializer,
-    ProcedimientoRealizadoSerializer,
-)
-
+from .serializers import ExamenSerializer, ProcedimientoRealizadoSerializer
 
 class ExamenViewSet(viewsets.ModelViewSet):
-    queryset = Examen.objects.all()
+    queryset = Examen.objects.all().order_by('-id_examen')
     serializer_class = ExamenSerializer
 
     def perform_create(self, serializer):
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute("ALTER TABLE examen ALTER COLUMN id_consulta DROP NOT NULL;")
-        except Exception:
-            pass
-        serializer.save()
+        print("--- CREANDO EXAMEN ---")
+        print("Datos validados recibidos:", serializer.validated_data)
+        instance = serializer.save()
+        print("Estado guardado en BD:", instance.estado)
+
+    def perform_update(self, serializer):
+        print("--- ACTUALIZANDO EXAMEN ---")
+        print("Datos validados a actualizar:", serializer.validated_data)
+        instance = serializer.save()
+        print("Estado actualizado en BD:", instance.estado)
 
 
 class ProcedimientoRealizadoViewSet(viewsets.ModelViewSet):

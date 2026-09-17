@@ -8,6 +8,7 @@ from .views import (
 router = DefaultRouter()
 router.register(r'examenes', ExamenViewSet, basename='examen')
 router.register(r'procedimientos', ProcedimientoRealizadoViewSet, basename='procedimiento')
+router.register(r'catalogo', ExamenViewSet, basename='catalogo') # Apunta a ExamenViewSet
 
 urlpatterns = [
     path('', include(router.urls)),
