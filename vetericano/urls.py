@@ -35,7 +35,7 @@ urlpatterns = [
 
 
     # AnaC
-    path('api/', include('medicamentos.apimedicamentos.urls')),
+    path('api/medicamentos/', include('medicamentos.apimedicamentos.urls')),
 
     path('api/', include('adopciones.apiadopciones.urls')),
 
