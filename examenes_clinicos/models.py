@@ -10,6 +10,7 @@ class Examen(models.Model):
     resultado = models.TextField(blank=True, null=True)
     ruta_archivo_resultado = models.CharField(max_length=500, blank=True, null=True)
     fecha_realizacion = models.DateTimeField(auto_now_add=True)
+    estado = models.CharField(max_length=50, default='activo', blank=True, null=True)
 
     class Meta:
         managed = False
