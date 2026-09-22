@@ -15,38 +15,46 @@ schema_view = get_schema_view(
 urlpatterns = [
     path('admin/', admin.site.urls),
 
-    # Endpoints de Usuarios
-    path('api/usuarios/', include('users.api.urls')),
-
     # Swagger Documentation
     path(
         'swagger/',
         schema_view.with_ui('swagger', cache_timeout=0),
         name='schema-swagger-ui'
     ),
-    path('api/especies/', include('especies.apiespecies.urls')),
 
-    # Endpoints de Exámenes Clínicos
+    # Endpoints de Usuarios
+    path('api/usuarios/', include('users.api.urls')),
+
+    # Endpoints de Especies y Razas
+    path('api/especies/', include('especies.api.urls')),
+
+    # Endpoints de Exámenes Clínicos y Procedimientos
     path('api/examenes-clinicos/', include('examenes_clinicos.api.urls')),
 
+    # Endpoints de Patologías
+    path('api/patologias/', include('patologias.api.urls')),
 
-    #  rutas de patologías 
-    path('api/patologias/', include('patologias.apipatologias.urls')),
+    # Endpoints de Medicamentos
+    path('api/', include('medicamentos.api.urls')),
 
+    # Endpoints de Adopciones
+    path('api/', include('adopciones.api.urls')),
 
-    # AnaC
-    path('api/', include('medicamentos.apimedicamentos.urls')),
+    # Endpoints de Voluntariado
+    path('api/', include('voluntariado.api.urls')),
 
-    path('api/', include('adopciones.apiadopciones.urls')),
-
-    path('api/', include('voluntariado.apivoluntariado.urls')),
-
-
-    #Jube 
+    # Endpoints de Dashboard
     path('api/dashboard/', include('dashboard.api.urls')),
 
-    #jdqa
-    path('api/peticiones/', include('peticiones.urls')),
+    # Endpoints de Peticiones
+    path('api/peticiones/', include('peticiones.api.urls')),
 
+    # Endpoints de Animales
+    path('api/animales/', include('animales.api.urls')),
 
+    # Endpoints de Clínica e Historias Clínicas
+    path('api/clinica/', include('clinica.api.urls')),
+
+    # Endpoints de Inventario y Compras
+    path('api/inventario/', include('inventario.api.urls')),
 ]
