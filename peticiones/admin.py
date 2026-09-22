@@ -24,8 +24,8 @@ class EstadoPeticionesAdmin(admin.ModelAdmin):
 
 @admin.register(Ubicaciones)
 class UbicacionesAdmin(admin.ModelAdmin):
-    list_display = ('id_ubicacion', 'direccion', 'barrio', 'ciudad')
-    search_fields = ('direccion', 'barrio', 'ciudad')
+    list_display = ('id_ubicacion', 'direccion', 'latitud', 'longitud')
+    search_fields = ('direccion',)
 
 
 @admin.register(Peticiones)

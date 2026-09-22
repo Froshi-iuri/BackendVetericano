@@ -18,7 +18,7 @@ class IniciarPeticionView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         try:
-            estado_inicial = EstadoPeticiones.objects.get(nombre__iexact='Borrador')
+            estado_inicial = EstadoPeticiones.objects.get(nombre__iexact='Pendiente')
         except EstadoPeticiones.DoesNotExist:
             return Response(
                 {"error": "El estado 'Borrador' no existe en la base de datos."},
@@ -29,14 +29,15 @@ class IniciarPeticionView(generics.CreateAPIView):
         serializer.is_valid(raise_exception=True)
 
         peticion = serializer.save(
-            ciudadano_id=request.user.id_usuario,
+            responsable=request.user,
             id_estado=estado_inicial
         )
 
         return Response({
             "mensaje": "Petición iniciada con éxito",
             "id_peticion": peticion.id_peticion,
-            "id_tipo": peticion.id_tipo.id_tipo
+            "id_tipo": peticion.id_tipo.id_tipo,
+            "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None
         }, status=status.HTTP_201_CREATED)
 
 

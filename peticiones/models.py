@@ -33,9 +33,6 @@ class EstadoPeticiones(models.Model):
 class Ubicaciones(models.Model):
     id_ubicacion = models.AutoField(primary_key=True)
     direccion = models.CharField(max_length=255, blank=True, null=True)
-    barrio = models.CharField(max_length=100, blank=True, null=True)
-    ciudad = models.CharField(max_length=100, blank=True, null=True)
-    vereda = models.CharField(max_length=100, blank=True, null=True)
     latitud = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
     longitud = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
 
@@ -44,7 +41,7 @@ class Ubicaciones(models.Model):
         db_table = 'ubicaciones'
 
     def __str__(self):
-        return f"{self.direccion or 'Sin dirección'} - {self.ciudad or 'Sin ciudad'}"
+        return self.direccion or f"Ubicación #{self.id_ubicacion}"
 
 
 class Peticiones(models.Model):
@@ -85,7 +82,6 @@ class SeguimientoPeticionesVisita(models.Model):
     id_peticion = models.ForeignKey(Peticiones, models.DO_NOTHING, db_column='id_peticion')
     id_veterinario = models.ForeignKey('users.Usuarios', models.DO_NOTHING, db_column='id_veterinario')
     id_animal = models.ForeignKey('animales.Animal', models.DO_NOTHING, db_column='id_animal', blank=True, null=True)
-    id_ubicacion = models.ForeignKey(Ubicaciones, models.DO_NOTHING, db_column='id_ubicacion', blank=True, null=True)
     observacion = models.TextField(blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
     numero_radicado = models.CharField(max_length=100, blank=True, null=True)
