@@ -713,3 +713,16 @@ class VoluntarioEvento(models.Model):
 
     def __str__(self):
         return f"Voluntario #{self.id_usuario_id} - Evento #{self.id_evento_id}"
+
+    from rest_framework import serializers
+from .models import Usuarios
+
+# class UsuarioPerfilSerializer(serializers.ModelSerializer):
+#     class Meta:
+#         model = Usuarios
+#         # Campos que expondremos en el JSON
+#         fields = ['id_usuario', 'nombre', 'apellido', 'identificacion', 'email', 'telefono', 'activo']
+        
+#         # Hacemos que email e identificacion sean de solo lectura para que 
+#         # no se puedan cambiar en la edición básica del perfil
+#         read_only_fields = ['id_usuario', 'email', 'identificacion', 'activo']    
