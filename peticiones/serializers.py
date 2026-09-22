@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from rest_framework import serializers
 from users.models import TipoPeticion, Peticiones, EstadoPeticiones, Ubicaciones, Usuarios
 
@@ -73,3 +74,9 @@ class PeticionSerializer(serializers.ModelSerializer):
 
 # Alias para retrocompatibilidad
 IniciarPeticionSerializer = PeticionSerializer
+=======
+from peticiones.api.serializers import (  # noqa: F401
+    TiposPeticionSerializer,
+    IniciarPeticionSerializer,
+)
+>>>>>>> 3f804f8 (Organizacion general)
