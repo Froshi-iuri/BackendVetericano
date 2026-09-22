@@ -28,3 +28,7 @@ class Raza(models.Model):
 
     def __str__(self):
         return self.nombre
+
+
+# Alias para compatibilidad con código que use Especies en plural
+Especies = Especie

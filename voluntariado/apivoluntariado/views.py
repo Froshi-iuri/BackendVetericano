@@ -9,3 +9,5 @@ class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
 class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
     queryset = PostulacionVoluntariado.objects.all()
     serializer_class = PostulacionVoluntariadoSerializer
+
+    
