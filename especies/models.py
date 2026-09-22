@@ -30,25 +30,5 @@ class Raza(models.Model):
         return self.nombre
 
 
-class Animal(models.Model):
-    id_animal = models.AutoField(primary_key=True)
-    id_raza = models.ForeignKey(Raza, models.DO_NOTHING, db_column='id_raza')
-    nombre = models.CharField(max_length=100)
-    sexo = models.CharField(max_length=10, blank=True, null=True)
-    color = models.CharField(max_length=50, blank=True, null=True)
-    fecha_nacimiento = models.DateField(blank=True, null=True)
-    fecha_ingreso = models.DateField(blank=True, null=True)
-    peso = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
-    esterilizado = models.BooleanField(default=False)
-    caracteristicas = models.TextField(blank=True, null=True)
-    observaciones = models.TextField(blank=True, null=True)
-    foto_url = models.CharField(max_length=255, blank=True, null=True)
-    activo = models.BooleanField(default=True)
-
-    # --- AGREGA ESTO ---
-    class Meta:
-        managed = False
-        db_table = 'animal'
-
-    def __str__(self):
-        return self.nombre
+# Alias para compatibilidad con código que use Especies en plural
+Especies = Especie

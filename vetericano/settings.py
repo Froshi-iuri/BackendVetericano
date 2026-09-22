@@ -53,7 +53,11 @@ INSTALLED_APPS = [
     'patologias',
     'adopciones',
     'voluntariado',
-    'peticiones'
+    'peticiones',
+    'animales',
+    'clinica',
+    'inventario',
+    'dashboard',
 ]
 
 MIDDLEWARE = [
