@@ -30,9 +30,9 @@ class UbicacionesAdmin(admin.ModelAdmin):
 
 @admin.register(Peticiones)
 class PeticionesAdmin(admin.ModelAdmin):
-    list_display = ('id_peticion', 'id_tipo', 'id_estado', 'responsable', 'prioridad', 'fecha')
+    list_display = ('id_peticion', 'id_tipo', 'id_estado', 'responsable', 'prioridad', 'fecha', 'foto')
     list_filter = ('id_tipo', 'id_estado', 'prioridad')
-    search_fields = ('descripcion', 'direccion')
+    search_fields = ('descripcion', 'id_ubicacion__direccion', 'foto')
 
 
 @admin.register(EvidenciaPeticiones)
