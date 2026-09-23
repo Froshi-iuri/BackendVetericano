@@ -54,6 +54,7 @@ class Peticiones(models.Model):
     fecha = models.DateTimeField(auto_now_add=True)
     prioridad = models.CharField(max_length=20, blank=True, null=True)
     fecha_asignacion = models.DateTimeField(blank=True, null=True)
+    foto = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
