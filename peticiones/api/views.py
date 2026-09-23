@@ -1,6 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from peticiones.models import TipoPeticion, Peticiones, EstadoPeticiones
 from users.api.serializers import UsuariosSerializer
 from .serializers import TiposPeticionSerializer, IniciarPeticionSerializer
@@ -15,13 +16,19 @@ class ListarTiposPeticionView(generics.ListAPIView):
 class IniciarPeticionView(generics.CreateAPIView):
     serializer_class = IniciarPeticionSerializer
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def create(self, request, *args, **kwargs):
-        try:
-            estado_inicial = EstadoPeticiones.objects.get(nombre__iexact='Pendiente')
-        except EstadoPeticiones.DoesNotExist:
+        # Búsqueda robusta del estado inicial ('Pendiente', 'Borrador', o primer estado disponible)
+        estado_inicial = (
+            EstadoPeticiones.objects.filter(nombre__iexact='Pendiente').first()
+            or EstadoPeticiones.objects.filter(nombre__iexact='Borrador').first()
+            or EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado').first()
+            or EstadoPeticiones.objects.first()
+        )
+        if not estado_inicial:
             return Response(
-                {"error": "El estado 'Borrador' no existe en la base de datos."},
+                {"error": "No existe ningún estado configurado en la base de datos (estado_peticiones)."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -36,8 +43,9 @@ class IniciarPeticionView(generics.CreateAPIView):
         return Response({
             "mensaje": "Petición iniciada con éxito",
             "id_peticion": peticion.id_peticion,
-            "id_tipo": peticion.id_tipo.id_tipo,
-            "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None
+            "id_tipo": peticion.id_tipo.id_tipo if peticion.id_tipo else None,
+            "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None,
+            "foto": peticion.foto
         }, status=status.HTTP_201_CREATED)
 
 

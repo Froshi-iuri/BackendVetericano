@@ -14,6 +14,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
     direccion = serializers.CharField(max_length=255, required=False, allow_blank=True, allow_null=True)
     latitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
     longitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
+    foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = Peticiones
@@ -22,6 +23,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             'id_tipo',
             'descripcion',
             'prioridad',
+            'foto',
             'direccion',
             'latitud',
             'longitud',
