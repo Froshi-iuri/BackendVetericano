@@ -54,6 +54,7 @@ class LoginView(generics.GenericAPIView):
         return Response({
             "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
             "email": user.email,
+            "id_usuario": user.id_usuario,
             "id_rol": user.id_rol.id_rol,
             "tokens": {
                 "refresh": str(refresh),

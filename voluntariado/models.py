@@ -65,7 +65,6 @@ class VoluntarioEvento(models.Model):
     id_voluntario_evento = models.AutoField(primary_key=True)
     id_usuario = models.ForeignKey('users.Usuarios', models.DO_NOTHING, db_column='id_usuario')
     id_evento = models.ForeignKey(Eventos, models.DO_NOTHING, db_column='id_evento')
-    id_animal = models.ForeignKey('animales.Animal', models.DO_NOTHING, db_column='id_animal', blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
 
     class Meta:
