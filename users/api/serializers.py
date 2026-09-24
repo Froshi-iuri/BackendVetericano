@@ -12,7 +12,7 @@ class RegisterCustomSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Usuarios
-        fields = ('email', 'identificacion','password', 'nombre', 'apellido')
+        fields = ('email', 'identificacion', 'password', 'nombre', 'apellido', 'telefono')
         extra_kwargs = {'password': {'write_only': True}}
 
     # AnaC
