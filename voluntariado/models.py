@@ -16,12 +16,14 @@ class EventoVoluntariado(models.Model):
 
 
 class PostulacionVoluntariado(models.Model):
-    evento = models.ForeignKey(EventoVoluntariado, on_delete=models.CASCADE, null=True, blank=True)
+    evento = models.ForeignKey(EventoVoluntariado, on_delete=models.CASCADE, null=True, blank=True, related_name='postulaciones')
+    usuario = models.ForeignKey('users.Usuarios', on_delete=models.SET_NULL, null=True, blank=True, related_name='postulaciones_voluntariado')
     correo = models.EmailField()
-    identificacion = models.CharField(max_length=50)
+    identificacion = models.CharField(max_length=50, blank=True, default='')
     nombre_completo = models.CharField(max_length=150)
-    edad = models.IntegerField()
-    telefono = models.CharField(max_length=20)
+    edad = models.IntegerField(null=True, blank=True, default=0)
+    telefono = models.CharField(max_length=20, blank=True, default='')
+    estado = models.CharField(max_length=20, default='PENDIENTE')
     fecha_postulacion = models.DateTimeField(auto_now_add=True)
 
     class Meta:
