@@ -4,7 +4,10 @@ class AdopcionAnimal(models.Model):
     nombre = models.CharField(max_length=100)
     raza = models.CharField(max_length=100)
     descripcion = models.TextField()
-    imagen = models.ImageField(upload_to='adopciones/')
+    # URL pública de la imagen (por ejemplo, Cloudinary). Antes era un
+    # ImageField que guardaba el archivo en el contenedor (efímero) y la
+    # URL devuelta quedaba rota (404).
+    imagen = models.URLField(max_length=500, blank=True, null=True)
     disponible = models.BooleanField(default=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
 
