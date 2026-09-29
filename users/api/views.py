@@ -1,10 +1,10 @@
-# views.py
-
+from django.db.models import Q
 from rest_framework import generics, status, viewsets
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import RegisterCustomSerializer, LoginCustomSerializer,UsuariosSerializer,RolSerializer
-from users.models import Usuarios,Rol
+from .serializers import RegisterCustomSerializer, LoginCustomSerializer, UsuariosSerializer, RolSerializer
+from .permissions import EsAdministradorOReadOnly
+from users.models import Usuarios, Rol
 
 
 
@@ -66,12 +66,46 @@ class LoginView(generics.GenericAPIView):
 
 
 class UsuariosViewSet(viewsets.ModelViewSet):
-
     queryset = Usuarios.objects.all()
     serializer_class = UsuariosSerializer
+    permission_classes = [EsAdministradorOReadOnly]
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        # 1. Anti Auto-Eliminación
+        if request.user and request.user.id_usuario == instance.id_usuario:
+            return Response(
+                {"detail": "Por seguridad del sistema, no puedes eliminar tu propia cuenta de Administrador."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 2. Quórum Mínimo: No eliminar al último administrador activo
+        rol = getattr(instance, 'id_rol', None)
+        nombre_rol = getattr(rol, 'nombre_rol', '').strip().lower() if rol else ''
+        id_rol = getattr(rol, 'id_rol', None) if rol else None
+        es_admin = (nombre_rol in ['administrador', 'admin'] or id_rol == 1)
+
+        if es_admin and instance.activo:
+            otros_admins = Usuarios.objects.filter(
+                activo=True
+            ).filter(
+                Q(id_rol__nombre_rol__iexact='administrador') |
+                Q(id_rol__nombre_rol__iexact='admin') |
+                Q(id_rol=1)
+            ).exclude(id_usuario=instance.id_usuario).count()
+
+            if otros_admins == 0:
+                return Response(
+                    {"detail": "Operación denegada: Este usuario es el único Administrador activo del sistema. No es posible eliminarlo sin antes designar a otro Administrador."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        return super().destroy(request, *args, **kwargs)
+
 
 
 class RolViewSet(viewsets.ModelViewSet):
     queryset = Rol.objects.all()
-
     serializer_class = RolSerializer
+    permission_classes = [EsAdministradorOReadOnly]
