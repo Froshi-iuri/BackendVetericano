@@ -1,5 +1,6 @@
 # serializers.py
 import re # AnaC
+from django.db.models import Q
 from rest_framework import serializers
 # Importamos el hash de contraseñas de Django. 
 # Esto es CRÍTICO: nunca guardes contraseñas en texto plano.
@@ -82,6 +83,67 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'nombre_rol',
             'activo',
         )
+
+    def validate(self, data):
+        request = self.context.get('request')
+        instance = getattr(self, 'instance', None)
+
+        # Solo aplicamos estas restricciones cuando se está actualizando un usuario existente
+        if instance and request and request.user and request.user.is_authenticated:
+            # -------------------------------------------------------------
+            # REGLA 1: Anti Auto-Bloqueo
+            # Un administrador no puede quitarse su propio rol ni auto-desactivarse
+            # -------------------------------------------------------------
+            if request.user.id_usuario == instance.id_usuario:
+                if 'id_rol' in data:
+                    nuevo_rol_id = getattr(data['id_rol'], 'pk', None)
+                    rol_actual_id = getattr(instance, 'id_rol_id', None)
+                    if nuevo_rol_id != rol_actual_id:
+                        raise serializers.ValidationError({
+                            "id_rol": "Por seguridad del sistema, no puedes modificar tu propio rol de Administrador. Esta acción debe ser realizada por otro Administrador."
+                        })
+
+                if data.get('activo') is False and instance.activo is True:
+                    raise serializers.ValidationError({
+                        "activo": "Por seguridad del sistema, no puedes desactivar tu propia cuenta mientras tu sesión esté activa."
+                    })
+
+            # -------------------------------------------------------------
+            # REGLA 2: Quórum Mínimo / El Último Administrador
+            # No se puede degradar ni desactivar al único Administrador activo
+            # -------------------------------------------------------------
+            rol_actual = getattr(instance, 'id_rol', None)
+            nombre_rol_actual = getattr(rol_actual, 'nombre_rol', '').strip().lower() if rol_actual else ''
+            id_rol_actual = getattr(rol_actual, 'id_rol', None) if rol_actual else None
+            es_admin_actualmente = (nombre_rol_actual in ['administrador', 'admin'] or id_rol_actual == 1)
+
+            if es_admin_actualmente and instance.activo:
+                cambia_a_no_admin = False
+                if 'id_rol' in data:
+                    nuevo_rol = data.get('id_rol')
+                    nuevo_nombre = getattr(nuevo_rol, 'nombre_rol', '').strip().lower() if nuevo_rol else ''
+                    nuevo_id = getattr(nuevo_rol, 'pk', None)
+                    if nuevo_nombre not in ['administrador', 'admin'] and nuevo_id != 1:
+                        cambia_a_no_admin = True
+
+                inactiva_cuenta = (data.get('activo') is False)
+
+                if cambia_a_no_admin or inactiva_cuenta:
+                    otros_admins = Usuarios.objects.filter(
+                        activo=True
+                    ).filter(
+                        Q(id_rol__nombre_rol__iexact='administrador') |
+                        Q(id_rol__nombre_rol__iexact='admin') |
+                        Q(id_rol=1)
+                    ).exclude(id_usuario=instance.id_usuario).count()
+
+                    if otros_admins == 0:
+                        raise serializers.ValidationError(
+                            "Operación denegada: Este usuario es el único Administrador activo del sistema. "
+                            "No se puede cambiar su rol ni desactivar su cuenta sin antes designar a otro Administrador."
+                        )
+
+        return data
 
 
 class RolSerializer(serializers.ModelSerializer):
