@@ -34,11 +34,6 @@ class Usuarios(models.Model):
         db_table = 'usuarios'
 
     def save(self, *args, **kwargs):
-        nombre_rol_actual = self.id_rol.nombre_rol.lower()
-        if nombre_rol_actual in ['administrador', 'juridico']:
-            existe = Usuarios.objects.filter(id_rol=self.id_rol).exclude(id_usuario=self.id_usuario).exists()
-            if existe:
-                raise ValidationError(f"Ya existe un usuario registrado con el rol de {self.id_rol.nombre_rol}. Solo se permite uno.")
         super().save(*args, **kwargs)
 
     @property
@@ -72,6 +67,7 @@ from peticiones.models import (  # noqa: F401, E402
     EvidenciaPeticiones,
     SeguimientoPeticionesVisita,
     VisitaAnimal,
+    SeguimientoVisitaFuncionarios,
 )
 from patologias.models import Patologia  # noqa: F401, E402
 from clinica.models import (  # noqa: F401, E402

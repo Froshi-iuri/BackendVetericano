@@ -117,6 +117,18 @@ class SeguimientoPeticionesVisita(models.Model):
     fecha_notificacion = models.DateField(blank=True, null=True)
     notificado_nombre = models.CharField(max_length=150, blank=True, null=True)
     notificaciones_identificacion = models.CharField(max_length=50, blank=True, null=True)
+    # Lugar de atención como ubicación editable (puede diferir de la ubicación de la petición original)
+    id_ubicacion_visita = models.ForeignKey(Ubicaciones, models.SET_NULL, db_column='id_ubicacion_visita', blank=True, null=True, related_name='visitas')
+    # Campos adicionales del propietario/tutor/responsable en campo
+    propietario_barrio = models.CharField(max_length=100, blank=True, null=True)
+    propietario_direccion = models.CharField(max_length=255, blank=True, null=True)
+    # Campos del notificador (funcionario que entrega el acta)
+    notificador_nombre = models.CharField(max_length=150, blank=True, null=True)
+    notificador_identificacion = models.CharField(max_length=50, blank=True, null=True)
+    notificador_cargo = models.CharField(max_length=100, blank=True, null=True)
+    # Firmas digitales (URL o base64 del trazo capturado en móvil)
+    firma_notificador = models.TextField(blank=True, null=True)
+    firma_notificado = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
@@ -150,3 +162,39 @@ class VisitaAnimal(models.Model):
 
     def __str__(self):
         return f"Visita #{self.id_visita} (Animal #{self.id_animal_id})"
+
+
+class SeguimientoVisitaFuncionarios(models.Model):
+    """
+    Funcionarios que participaron en la visita de campo.
+    Permite múltiples funcionarios (veterinarios, jurídicos, administradores)
+    y también el registro de externos/pasantes con sus datos básicos.
+    """
+    id_seguimiento = models.ForeignKey(
+        SeguimientoPeticionesVisita,
+        on_delete=models.CASCADE,
+        db_column='id_seguimiento',
+        related_name='funcionarios'
+    )
+    # id_usuario es null cuando es externo/pasante no registrado en el sistema
+    id_usuario = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        db_column='id_usuario',
+        blank=True,
+        null=True,
+        related_name='visitas_como_funcionario'
+    )
+    nombre = models.CharField(max_length=150)
+    cargo = models.CharField(max_length=100, blank=True, null=True)
+    es_externo = models.BooleanField(default=False)
+    es_principal = models.BooleanField(default=False)
+    institucion = models.CharField(max_length=200, blank=True, null=True)
+    documento_identidad = models.CharField(max_length=50, blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = 'seguimiento_visita_funcionarios'
+
+    def __str__(self):
+        return f"{self.nombre} ({self.cargo}) - Seguimiento #{self.id_seguimiento_id}"
