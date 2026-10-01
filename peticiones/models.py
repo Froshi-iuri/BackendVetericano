@@ -46,10 +46,13 @@ class Ubicaciones(models.Model):
 
 class Peticiones(models.Model):
     id_peticion = models.AutoField(primary_key=True)
+    numero_radicado = models.CharField(max_length=50, unique=True, blank=True, null=True)
     id_tipo = models.ForeignKey(TipoPeticion, models.DO_NOTHING, db_column='id_tipo')
     id_ubicacion = models.ForeignKey(Ubicaciones, models.DO_NOTHING, db_column='id_ubicacion', blank=True, null=True)
     id_estado = models.ForeignKey(EstadoPeticiones, models.DO_NOTHING, db_column='id_estado')
     responsable = models.ForeignKey('users.Usuarios', models.DO_NOTHING, db_column='responsable_id', blank=True, null=True)
+    asignado_a = models.ForeignKey('users.Usuarios', models.DO_NOTHING, db_column='asignado_a_id', blank=True, null=True, related_name='peticiones_asignadas')
+    asignado_por = models.ForeignKey('users.Usuarios', models.DO_NOTHING, db_column='asignado_por_id', blank=True, null=True, related_name='peticiones_que_asigno')
     descripcion = models.TextField(blank=True, null=True)
     fecha = models.DateTimeField(auto_now_add=True)
     prioridad = models.CharField(max_length=20, blank=True, null=True)

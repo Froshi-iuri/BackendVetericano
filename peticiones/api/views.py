@@ -6,9 +6,11 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from peticiones.models import TipoPeticion, Peticiones, EstadoPeticiones, SeguimientoPeticionesVisita
 from users.models import Usuarios
 from users.api.serializers import UsuariosSerializer
+from django.utils import timezone
 from .serializers import (
     TiposPeticionSerializer, IniciarPeticionSerializer,
-    SeguimientoPeticionesVisitaSerializer,
+    SeguimientoPeticionesVisitaSerializer, AsignarPeticionSerializer,
+    ListarPeticionesSerializer
 )
 
 
@@ -17,6 +19,30 @@ class ListarTiposPeticionView(generics.ListAPIView):
     serializer_class = TiposPeticionSerializer
     permission_classes = [IsAuthenticated]
 
+
+class ListarPeticionesView(generics.ListAPIView):
+    """
+    GET /api/peticiones/listar/
+    Lista todas las peticiones para Admin y Juridico.
+    Para Veterinarios, solo las que tienen asignadas.
+    Para Peticionarios, solo las creadas por ellos.
+    """
+    serializer_class = ListarPeticionesSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'asignado_a').all()
+        
+        # 1 = Administrador, 2 = Jurídico, 3 = Veterinario, 4 = Peticionario
+        if user.id_rol_id == 3:
+            # Veterinario: solo ve lo asignado
+            queryset = queryset.filter(asignado_a=user)
+        elif user.id_rol_id == 4:
+            # Peticionario: solo ve lo que creó
+            queryset = queryset.filter(responsable=user)
+            
+        return queryset.order_by('-fecha')
 
 class IniciarPeticionView(generics.CreateAPIView):
     serializer_class = IniciarPeticionSerializer
@@ -187,4 +213,41 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
     def update(self, request, *args, **kwargs):
         kwargs['partial'] = True  # Siempre parcial (PATCH)
         return super().update(request, *args, **kwargs)
+
+
+class AsignarPeticionView(generics.UpdateAPIView):
+    """
+    PATCH /api/peticiones/<id_peticion>/asignar/
+    Permite a un administrador asignar la petición a un veterinario.
+    """
+    queryset = Peticiones.objects.all()
+    serializer_class = AsignarPeticionSerializer
+    permission_classes = [IsAuthenticated]
+    lookup_field = 'id_peticion'
+
+    def update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        peticion = self.get_object()
+        
+        # Obtenemos los IDs y verificamos
+        asignado_a_id = request.data.get('asignado_a')
+        if not asignado_a_id:
+            return Response({'error': 'Debe proveer el id del usuario asignado (asignado_a).'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Validar que el usuario a asignar sea un veterinario (rol 3)
+        veterinario = Usuarios.objects.filter(id_usuario=asignado_a_id).first()
+        if not veterinario or veterinario.id_rol_id != 3:
+            return Response({'error': 'El usuario asignado no es un veterinario válido.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Actualizar datos de asignación
+        serializer = self.get_serializer(peticion, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        
+        # Modificamos manualmente los campos que no vienen en el request
+        serializer.save(
+            asignado_por=request.user,
+            fecha_asignacion=timezone.now()
+        )
+        
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
