@@ -67,6 +67,7 @@ from peticiones.models import (  # noqa: F401, E402
     EvidenciaPeticiones,
     SeguimientoPeticionesVisita,
     VisitaAnimal,
+    SeguimientoVisitaFuncionarios,
 )
 from patologias.models import Patologia  # noqa: F401, E402
 from clinica.models import (  # noqa: F401, E402
