@@ -25,6 +25,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         model = Peticiones
         fields = [
             'id_peticion',
+            'numero_radicado',
             'id_tipo',
             'descripcion',
             'prioridad',
@@ -33,7 +34,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             'latitud',
             'longitud',
         ]
-        read_only_fields = ['id_peticion']
+        read_only_fields = ['id_peticion', 'numero_radicado']
 
     @transaction.atomic
     def create(self, validated_data):
@@ -55,7 +56,49 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             id_ubicacion=ubicacion,
             **validated_data
         )
+        
+        # 3. Generar radicado único basado en el ID recién creado
+        # Se rellena con ceros a la izquierda (ej. PET-2026-00055)
+        peticion.numero_radicado = f"PET-2026-{str(peticion.id_peticion).zfill(5)}"
+        peticion.save(update_fields=['numero_radicado'])
+        
         return peticion
+
+
+class ListarPeticionesSerializer(serializers.ModelSerializer):
+    tipo = serializers.CharField(source='id_tipo.nombre', read_only=True)
+    estado = serializers.CharField(source='id_estado.nombre', read_only=True)
+    asignado_a_nombre = serializers.CharField(source='asignado_a.nombre', read_only=True)
+    asignado_a_apellido = serializers.CharField(source='asignado_a.apellido', read_only=True)
+    ubicacion_direccion = serializers.CharField(source='id_ubicacion.direccion', read_only=True)
+    ubicacion_latitud = serializers.DecimalField(source='id_ubicacion.latitud', max_digits=10, decimal_places=7, read_only=True)
+    ubicacion_longitud = serializers.DecimalField(source='id_ubicacion.longitud', max_digits=10, decimal_places=7, read_only=True)
+
+    class Meta:
+        model = Peticiones
+        fields = [
+            'id_peticion',
+            'numero_radicado',
+            'tipo',
+            'estado',
+            'descripcion',
+            'prioridad',
+            'fecha',
+            'fecha_asignacion',
+            'asignado_a_nombre',
+            'asignado_a_apellido',
+            'ubicacion_direccion',
+            'ubicacion_latitud',
+            'ubicacion_longitud',
+            'foto'
+        ]
+
+class AsignarPeticionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Peticiones
+        fields = ['asignado_a', 'asignado_por', 'fecha_asignacion', 'id_estado']
+        read_only_fields = ['asignado_por', 'fecha_asignacion']
+
 
 
 # ============================================================
