@@ -100,6 +100,54 @@ class AsignarPeticionSerializer(serializers.ModelSerializer):
         read_only_fields = ['asignado_por', 'fecha_asignacion']
 
 
+class DetallePeticionSerializer(serializers.ModelSerializer):
+    codigo = serializers.SerializerMethodField()
+    estado = serializers.CharField(source='id_estado.nombre', default='Pendiente')
+    tipoEstado = serializers.CharField(source='id_estado.nombre', default='Pendiente')
+    solicitanteNombre = serializers.SerializerMethodField()
+    solicitanteTelefono = serializers.CharField(source='responsable.telefono', default='')
+    solicitanteDireccion = serializers.CharField(source='id_ubicacion.direccion', default='')
+    solicitanteComuna = serializers.SerializerMethodField()
+    especie = serializers.CharField(source='id_tipo.nombre', default='')
+    motivo = serializers.CharField(source='descripcion', default='')
+    fechaAsignada = serializers.SerializerMethodField()
+    observaciones = serializers.CharField(source='descripcion', default='')
+
+    class Meta:
+        model = Peticiones
+        fields = [
+            'id_peticion',
+            'codigo',
+            'estado',
+            'tipoEstado',
+            'solicitanteNombre',
+            'solicitanteTelefono',
+            'solicitanteDireccion',
+            'solicitanteComuna',
+            'especie',
+            'motivo',
+            'fechaAsignada',
+            'observaciones'
+        ]
+
+    def get_codigo(self, obj):
+        return obj.numero_radicado or f"#INC-2026-{obj.id_peticion:06d}"
+
+    def get_solicitanteNombre(self, obj):
+        if obj.responsable:
+            return f"{obj.responsable.nombre or ''} {obj.responsable.apellido or ''}".strip() or "Anónimo"
+        return "Anónimo"
+
+    def get_solicitanteComuna(self, obj):
+        return ""
+
+    def get_fechaAsignada(self, obj):
+        fecha = obj.fecha_asignacion or obj.fecha
+        if fecha:
+            return fecha.strftime("%d %b %Y, %H:%M")
+        return ""
+
+
 
 # ============================================================
 # SERIALIZERS DEL ACTA DE VISITA (seguimiento_peticiones_visita)

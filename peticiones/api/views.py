@@ -10,7 +10,7 @@ from django.utils import timezone
 from .serializers import (
     TiposPeticionSerializer, IniciarPeticionSerializer,
     SeguimientoPeticionesVisitaSerializer, AsignarPeticionSerializer,
-    ListarPeticionesSerializer
+    ListarPeticionesSerializer, DetallePeticionSerializer
 )
 
 
@@ -250,4 +250,65 @@ class AsignarPeticionView(generics.UpdateAPIView):
         )
         
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class DetallePeticionView(generics.RetrieveAPIView):
+    """
+    GET /api/peticiones/<id_peticion>/
+    Retorna el detalle completo de la petición para visualización móvil y web.
+    """
+    queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable', 'asignado_a').all()
+    serializer_class = DetallePeticionSerializer
+    permission_classes = [IsAuthenticated]
+    lookup_field = 'id_peticion'
+
+
+class ActualizarEstadoPeticionView(APIView):
+    """
+    PATCH /api/peticiones/<id_peticion>/estado/
+    Actualiza el estado de una petición por parte del veterinario o personal a cargo.
+    Body:
+    {
+        "estado": "En tratamiento",
+        "observacion": "Motivo opcional del cambio"
+    }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, id_peticion):
+        try:
+            peticion = Peticiones.objects.get(pk=id_peticion)
+        except Peticiones.DoesNotExist:
+            return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        nuevo_estado_nombre = request.data.get('estado')
+        if not nuevo_estado_nombre:
+            return Response({"error": "Debe especificar el nuevo estado."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Buscar estado existente por nombre (case-insensitive) o crear uno dinámicamente
+        estado_obj = EstadoPeticiones.objects.filter(nombre__iexact=nuevo_estado_nombre).first()
+        if not estado_obj:
+            estado_obj = EstadoPeticiones.objects.create(
+                nombre=nuevo_estado_nombre,
+                activo=True
+            )
+
+        peticion.id_estado = estado_obj
+
+        observacion = request.data.get('observacion')
+        if observacion:
+            # Guardamos trazabilidad en seguimiento si se provee observación
+            SeguimientoPeticionesVisita.objects.create(
+                id_peticion=peticion,
+                id_veterinario=request.user,
+                observacion=f"Cambio de estado a '{estado_obj.nombre}': {observacion}"
+            )
+
+        peticion.save(update_fields=['id_estado'])
+
+        return Response({
+            "mensaje": f"Estado actualizado a '{estado_obj.nombre}' exitosamente.",
+            "id_peticion": peticion.id_peticion,
+            "estado": estado_obj.nombre
+        }, status=status.HTTP_200_OK)
 
