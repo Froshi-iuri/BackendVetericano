@@ -72,6 +72,9 @@ class UsuariosSerializer(serializers.ModelSerializer):
         source='id_rol.nombre_rol',
         read_only=True
     )
+    telefono = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True
+    )
 
     class Meta:
         model = Usuarios
@@ -81,7 +84,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'identificacion',
             'nombre',
             'apellido',
-            'telefono',   # <-- AÑADIDO: Es necesario para que lo puedan ver y editar
+            'telefono',
             'id_rol',
             'nombre_rol',
             'activo',
