@@ -10,7 +10,8 @@ from django.utils import timezone
 from .serializers import (
     TiposPeticionSerializer, IniciarPeticionSerializer,
     SeguimientoPeticionesVisitaSerializer, AsignarPeticionSerializer,
-    ListarPeticionesSerializer, DetallePeticionSerializer
+    ListarPeticionesSerializer, DetallePeticionSerializer,
+    ListarSeguimientoPeticionesVisitaSerializer,
 )
 
 
@@ -213,6 +214,80 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
     def update(self, request, *args, **kwargs):
         kwargs['partial'] = True  # Siempre parcial (PATCH)
         return super().update(request, *args, **kwargs)
+
+
+class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
+    """
+    GET /api/peticiones/seguimiento/
+    Lista paginada de actas de visita de campo.
+
+    Filtros opcionales (query params):
+      ?id_peticion=5            -> solo actas de esa petición
+      ?id_veterinario=3         -> solo actas creadas por ese veterinario
+      ?numero_radicado=RAD-...  -> búsqueda parcial por radicado del acta
+      ?fecha_desde=2024-01-01   -> fecha de creación >= (YYYY-MM-DD)
+      ?fecha_hasta=2024-12-31   -> fecha de creación <= (YYYY-MM-DD)
+
+    Permisos por rol (igual criterio que ListarPeticionesView):
+      1 Administrador / 2 Jurídico: ven todo.
+      3 Veterinario: solo sus propias actas.
+      4 Peticionario: solo actas de peticiones que creó (responsable).
+    """
+    serializer_class = ListarSeguimientoPeticionesVisitaSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = (
+            SeguimientoPeticionesVisita.objects
+            .select_related(
+                'id_peticion', 'id_peticion__id_estado',
+                'id_veterinario', 'id_animal', 'id_ubicacion_visita',
+            )
+            .prefetch_related('funcionarios')
+        )
+
+        # 1 = Administrador, 2 = Jurídico, 3 = Veterinario, 4 = Peticionario
+        if user.id_rol_id == 3:
+            queryset = queryset.filter(id_veterinario=user)
+        elif user.id_rol_id == 4:
+            queryset = queryset.filter(id_peticion__responsable=user)
+
+        params = self.request.query_params
+        id_peticion = params.get('id_peticion')
+        if id_peticion:
+            queryset = queryset.filter(id_peticion_id=id_peticion)
+
+        # Solo admin/jurídico pueden filtrar por otro veterinario;
+        # un veterinario siempre ve lo suyo y un peticionario lo de sus peticiones.
+        id_veterinario = params.get('id_veterinario')
+        if id_veterinario and user.id_rol_id in (1, 2):
+            queryset = queryset.filter(id_veterinario_id=id_veterinario)
+
+        numero_radicado = params.get('numero_radicado')
+        if numero_radicado:
+            queryset = queryset.filter(numero_radicado__icontains=numero_radicado)
+
+        fecha_desde = params.get('fecha_desde')
+        if fecha_desde:
+            queryset = queryset.filter(fecha__date__gte=fecha_desde)
+
+        fecha_hasta = params.get('fecha_hasta')
+        if fecha_hasta:
+            queryset = queryset.filter(fecha__date__lte=fecha_hasta)
+
+        return queryset.order_by('-fecha', '-id_seguimiento')
+
+
+class ListarSeguimientosPorPeticionView(ListarSeguimientoPeticionesVisitaView):
+    """
+    GET /api/peticiones/<id_peticion>/seguimientos/
+    Historial de visitas de UNA petición (mismo serializer y filtros de fecha,
+    más control de acceso por rol sobre esa petición).
+    """
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return queryset.filter(id_peticion_id=self.kwargs['id_peticion'])
 
 
 class AsignarPeticionView(generics.UpdateAPIView):
