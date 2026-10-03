@@ -100,6 +100,54 @@ class AsignarPeticionSerializer(serializers.ModelSerializer):
         read_only_fields = ['asignado_por', 'fecha_asignacion']
 
 
+class DetallePeticionSerializer(serializers.ModelSerializer):
+    codigo = serializers.SerializerMethodField()
+    estado = serializers.CharField(source='id_estado.nombre', default='Pendiente')
+    tipoEstado = serializers.CharField(source='id_estado.nombre', default='Pendiente')
+    solicitanteNombre = serializers.SerializerMethodField()
+    solicitanteTelefono = serializers.CharField(source='responsable.telefono', default='')
+    solicitanteDireccion = serializers.CharField(source='id_ubicacion.direccion', default='')
+    solicitanteComuna = serializers.SerializerMethodField()
+    especie = serializers.CharField(source='id_tipo.nombre', default='')
+    motivo = serializers.CharField(source='descripcion', default='')
+    fechaAsignada = serializers.SerializerMethodField()
+    observaciones = serializers.CharField(source='descripcion', default='')
+
+    class Meta:
+        model = Peticiones
+        fields = [
+            'id_peticion',
+            'codigo',
+            'estado',
+            'tipoEstado',
+            'solicitanteNombre',
+            'solicitanteTelefono',
+            'solicitanteDireccion',
+            'solicitanteComuna',
+            'especie',
+            'motivo',
+            'fechaAsignada',
+            'observaciones'
+        ]
+
+    def get_codigo(self, obj):
+        return obj.numero_radicado or f"#INC-2026-{obj.id_peticion:06d}"
+
+    def get_solicitanteNombre(self, obj):
+        if obj.responsable:
+            return f"{obj.responsable.nombre or ''} {obj.responsable.apellido or ''}".strip() or "Anónimo"
+        return "Anónimo"
+
+    def get_solicitanteComuna(self, obj):
+        return ""
+
+    def get_fechaAsignada(self, obj):
+        fecha = obj.fecha_asignacion or obj.fecha
+        if fecha:
+            return fecha.strftime("%d %b %Y, %H:%M")
+        return ""
+
+
 
 # ============================================================
 # SERIALIZERS DEL ACTA DE VISITA (seguimiento_peticiones_visita)
@@ -396,4 +444,138 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 )
 
         return instance
+
+
+# ============================================================
+# SERIALIZER LIVIANO DE SOLO LECTURA PARA LISTAR SEGUIMIENTOS
+# ============================================================
+
+class VisitaAnimalListSerializer(serializers.ModelSerializer):
+    """Representación compacta de cada animal atendido en una visita."""
+    id_animal = serializers.IntegerField(source='id_animal.id_animal', read_only=True)
+    nombre = serializers.CharField(source='id_animal.nombre', read_only=True, default='', allow_null=True)
+    sexo = serializers.CharField(source='id_animal.sexo', read_only=True, default='', allow_null=True)
+    color = serializers.CharField(source='id_animal.color', read_only=True, default='', allow_null=True)
+    peso = serializers.DecimalField(
+        source='id_animal.peso', max_digits=5, decimal_places=2,
+        read_only=True, allow_null=True,
+    )
+
+    class Meta:
+        model = VisitaAnimal
+        fields = [
+            'id_visita',
+            'id_animal', 'nombre', 'sexo', 'color', 'peso',
+            'fecha', 'nro_radicado_atencion',
+            'quien_reporta', 'lugar_atencion_direccion',
+            'nombre_notificado', 'documento_notificado', 'fecha_notificacion',
+        ]
+
+
+class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
+    """
+    Serializer de solo lectura para LISTAR actas de visita.
+    Liviano: no acepta nested writes, solo expone contadores y
+    resúmenes para tablas/pantallas de consulta.
+    """
+    peticion_numero_radicado = serializers.CharField(
+        source='id_peticion.numero_radicado', read_only=True, default=''
+    )
+    peticion_estado = serializers.CharField(
+        source='id_peticion.id_estado.nombre', read_only=True, default=''
+    )
+    veterinario_nombre = serializers.SerializerMethodField()
+    veterinario_email = serializers.CharField(
+        source='id_veterinario.email', read_only=True, default=''
+    )
+    lugar_atencion = serializers.SerializerMethodField()
+    funcionarios = SeguimientoVisitaFuncionariosSerializer(many=True, read_only=True)
+    total_funcionarios = serializers.SerializerMethodField()
+    animales = serializers.SerializerMethodField()
+    total_animales = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SeguimientoPeticionesVisita
+        fields = [
+            'id_seguimiento',
+            'numero_radicado',
+            'fecha', 'fecha_atencion',
+            'id_peticion', 'peticion_numero_radicado', 'peticion_estado',
+            'id_veterinario', 'veterinario_nombre', 'veterinario_email',
+            'propietario_nombre', 'propietario_cedula',
+            'propietario_telefono', 'propietario_email',
+            'propietario_barrio', 'propietario_direccion',
+            'quien_reporta',
+            'nro_animales_atendidos', 'total_animales', 'animales',
+            'nombre_paciente', 'paciente_especie', 'paciente_sexo',
+            'paciente_raza', 'paciente_color', 'paciente_edad', 'peso_paciente',
+            'anamnesis_descripcion_queja', 'tratamiento_realizado',
+            'compromisos', 'plazo_dias_cumplimiento',
+            'lugar_atencion',
+            'funcionarios', 'total_funcionarios',
+            'notificado_nombre', 'notificaciones_identificacion', 'fecha_notificacion',
+            'notificador_nombre', 'notificador_cargo',
+            'observacion',
+        ]
+        read_only_fields = fields
+
+    def get_veterinario_nombre(self, obj):
+        vet = getattr(obj, 'id_veterinario', None)
+        if not vet:
+            return ''
+        return f"{getattr(vet, 'nombre', '') or ''} {getattr(vet, 'apellido', '') or ''}".strip()
+
+    def get_lugar_atencion(self, obj):
+        ubi = getattr(obj, 'id_ubicacion_visita', None)
+        if not ubi:
+            return None
+        return {
+            'id_ubicacion': ubi.id_ubicacion,
+            'direccion': ubi.direccion,
+            'latitud': ubi.latitud,
+            'longitud': ubi.longitud,
+        }
+
+    def get_total_funcionarios(self, obj):
+        # Usa el prefetch cuando existe para no generar N+1
+        funcionarios = getattr(obj, 'funcionarios', None)
+        try:
+            if funcionarios is not None and hasattr(funcionarios, 'all'):
+                prefetched = getattr(obj, '_prefetched_objects_cache', {}).get('funcionarios')
+                if prefetched is not None:
+                    return len(prefetched)
+                return funcionarios.count()
+        except Exception:
+            pass
+        return 0
+
+    def _visitas_qs(self, obj):
+        # VisitaAnimal no define related_name; se consulta por FK directa.
+        # Se limita a 50 filas por acta para que el listado siga liviano.
+        return (
+            VisitaAnimal.objects
+            .filter(id_seguimiento_id=obj.pk)
+            .select_related('id_animal')
+            .order_by('id_visita')[:50]
+        )
+
+    def get_animales(self, obj):
+        return VisitaAnimalListSerializer(self._visitas_qs(obj), many=True).data
+
+    def get_total_animales(self, obj):
+        if obj.nro_animales_atendidos:
+            try:
+                return int(obj.nro_animales_atendidos)
+            except (TypeError, ValueError):
+                pass
+        try:
+            count = VisitaAnimal.objects.filter(id_seguimiento_id=obj.pk).count()
+        except Exception:
+            count = 0
+        if count:
+            return count
+        # Actas viejas de trazabilidad (ej. cambio de estado) o modo A con animal único
+        if getattr(obj, 'id_animal_id', None):
+            return 1
+        return 0
 
