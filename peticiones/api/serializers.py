@@ -323,6 +323,7 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             # Compromisos y fundamento legal
             'compromisos', 'fundamento_legal', 'plazo_dias_cumplimiento',
             # Funcionarios (write y read)
+            'nombre_funcionario', 'funcionario_cargo',
             'funcionarios', 'funcionarios_detalle',
             # Notificación
             'notificado_nombre', 'notificaciones_identificacion',
@@ -512,6 +513,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'anamnesis_descripcion_queja', 'tratamiento_realizado',
             'compromisos', 'plazo_dias_cumplimiento',
             'lugar_atencion',
+            'nombre_funcionario', 'funcionario_cargo',
             'funcionarios', 'total_funcionarios',
             'notificado_nombre', 'notificaciones_identificacion', 'fecha_notificacion',
             'notificador_nombre', 'notificador_cargo',
