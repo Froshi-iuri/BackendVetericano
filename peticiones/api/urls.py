@@ -29,8 +29,8 @@ urlpatterns = [
     path('seguimiento/<int:id_seguimiento>/', SeguimientoPeticionesVisitaDetailView.as_view(), name='detalle-seguimiento'),
 
     # Detalle y operaciones de la petición
-    path('<int:id_peticion>/', DetallePeticionView.as_view(), name='detalle-peticion'),
     path('<int:id_peticion>/estado/', ActualizarEstadoPeticionView.as_view(), name='actualizar-estado-peticion'),
     path('<int:id_peticion>/asignar/', AsignarPeticionView.as_view(), name='asignar-peticion'),
     path('<int:id_peticion>/seguimientos/', ListarSeguimientosPorPeticionView.as_view(), name='seguimientos-por-peticion'),
+    path('<int:id_peticion>/', DetallePeticionView.as_view(), name='detalle-peticion'),
 ]
