@@ -2,6 +2,7 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
 from django.db.models import Sum, Count
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
 from medicamentos.models import Medicamentos
@@ -55,6 +56,19 @@ class DetalleSalidaViewSet(viewsets.ModelViewSet):
     queryset = DetalleSalida.objects.all()
     serializer_class = DetalleSalidaSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_serializer(self, *args, **kwargs):
+        # Si la data es una lista, decirle a DRF que procese en modo 'many=True'
+        if isinstance(kwargs.get("data", {}), list):
+            kwargs["many"] = True
+        return super().get_serializer(*args, **kwargs)
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        # Al poner @transaction.atomic aquí en la vista, garantizamos que si se envía
+        # un array de múltiples DetalleSalida, todos se guarden y descuenten inventario
+        # en bloque. Si uno solo falla por stock insuficiente, todo el lote se revierte.
+        return super().create(request, *args, **kwargs)
 
 
 class InventariosViewSet(viewsets.ModelViewSet):
