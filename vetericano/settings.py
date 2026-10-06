@@ -212,3 +212,15 @@ else:
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         }
     }
+
+# Configuración para que Swagger pida el Token JWT en lugar de usuario/contraseña
+SWAGGER_SETTINGS = {
+    'SECURITY_DEFINITIONS': {
+        'Bearer': {
+            'type': 'apiKey',
+            'name': 'Authorization',
+            'in': 'header',
+            'description': "Introduce tu token de acceso en este formato: Bearer <tu_token>"
+        }
+    }
+}
