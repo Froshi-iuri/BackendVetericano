@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.db import transaction
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
 
 
@@ -8,16 +9,58 @@ class ProveedoresSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-class CompraSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Compra
-        fields = '__all__'
-
-
 class DetalleCompraSerializer(serializers.ModelSerializer):
     class Meta:
         model = DetalleCompra
         fields = '__all__'
+        extra_kwargs = {'id_compra': {'required': False}}
+
+
+class CompraSerializer(serializers.ModelSerializer):
+    proveedor_nombre = serializers.CharField(source='id_proveedor.nombre', read_only=True)
+    proveedor_telefono = serializers.CharField(source='id_proveedor.telefono', read_only=True)
+    total_productos = serializers.SerializerMethodField()
+    total_unidades = serializers.SerializerMethodField()
+    detalles = DetalleCompraSerializer(source='detallecompra_set', many=True, read_only=True)
+
+    class Meta:
+        model = Compra
+        fields = ['id_compra', 'id_proveedor', 'proveedor_nombre', 'proveedor_telefono', 'fecha', 'total_productos', 'total_unidades', 'detalles']
+
+    def get_total_productos(self, obj):
+        return obj.detallecompra_set.count()
+
+    def get_total_unidades(self, obj):
+        return sum(detalle.cantidad for detalle in obj.detallecompra_set.all() if detalle.cantidad)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        # Extraemos los detalles desde el initial_data, ya que no son validados automáticamente porque read_only=True en el campo o están fuera de validated_data
+        detalles_data = self.initial_data.get('detalles', [])
+        
+        compra = Compra.objects.create(**validated_data)
+        
+        for detalle_data in detalles_data:
+            medicamento_id = detalle_data.get('id_medicamento')
+            cantidad = detalle_data.get('cantidad', 0)
+            precio = detalle_data.get('precio_unitario', 0)
+            
+            # Crear detalle de compra
+            detalle = DetalleCompra.objects.create(
+                id_compra=compra,
+                id_medicamento_id=medicamento_id,
+                cantidad=cantidad,
+                precio_unitario=precio
+            )
+            
+            # Crear lote en el inventario automáticamente
+            Inventarios.objects.create(
+                id_detalle_compra=detalle,
+                cantidad_actual=cantidad,
+                estado='Disponible'
+            )
+            
+        return compra
 
 
 class SalidasSerializer(serializers.ModelSerializer):
