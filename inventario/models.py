@@ -48,7 +48,6 @@ class DetalleCompra(models.Model):
     id_compra = models.ForeignKey(Compra, models.DO_NOTHING, db_column='id_compra')
     id_medicamento = models.ForeignKey('medicamentos.Medicamentos', models.DO_NOTHING, db_column='id_medicamento')
     cantidad = models.IntegerField(blank=True, null=True)
-    precio_unitario = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
 
     class Meta:
         managed = False

@@ -43,14 +43,12 @@ class CompraSerializer(serializers.ModelSerializer):
         for detalle_data in detalles_data:
             medicamento_id = detalle_data.get('id_medicamento')
             cantidad = detalle_data.get('cantidad', 0)
-            precio = detalle_data.get('precio_unitario', 0)
             
             # Crear detalle de compra
             detalle = DetalleCompra.objects.create(
                 id_compra=compra,
                 id_medicamento_id=medicamento_id,
-                cantidad=cantidad,
-                precio_unitario=precio
+                cantidad=cantidad
             )
             
             # Crear lote en el inventario automáticamente
