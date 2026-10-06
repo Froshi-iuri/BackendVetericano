@@ -113,21 +113,42 @@ class DetallePeticionSerializer(serializers.ModelSerializer):
     fechaAsignada = serializers.SerializerMethodField()
     observaciones = serializers.CharField(source='descripcion', default='')
 
+    # Compatibilidad snake_case con PeticionListResponse y clientes móviles
+    numero_radicado = serializers.CharField(read_only=True)
+    tipo = serializers.CharField(source='id_tipo.nombre', default='', read_only=True)
+    asignado_a_nombre = serializers.CharField(source='asignado_a.nombre', default='', read_only=True)
+    asignado_a_apellido = serializers.CharField(source='asignado_a.apellido', default='', read_only=True)
+    ubicacion_direccion = serializers.CharField(source='id_ubicacion.direccion', default='', read_only=True)
+    ubicacion_latitud = serializers.DecimalField(source='id_ubicacion.latitud', max_digits=10, decimal_places=7, read_only=True, allow_null=True)
+    ubicacion_longitud = serializers.DecimalField(source='id_ubicacion.longitud', max_digits=10, decimal_places=7, read_only=True, allow_null=True)
+
     class Meta:
         model = Peticiones
         fields = [
             'id_peticion',
             'codigo',
+            'numero_radicado',
             'estado',
             'tipoEstado',
+            'tipo',
+            'especie',
+            'motivo',
+            'descripcion',
+            'prioridad',
+            'fecha',
+            'fecha_asignacion',
+            'fechaAsignada',
             'solicitanteNombre',
             'solicitanteTelefono',
             'solicitanteDireccion',
             'solicitanteComuna',
-            'especie',
-            'motivo',
-            'fechaAsignada',
-            'observaciones'
+            'asignado_a_nombre',
+            'asignado_a_apellido',
+            'ubicacion_direccion',
+            'ubicacion_latitud',
+            'ubicacion_longitud',
+            'observaciones',
+            'foto'
         ]
 
     def get_codigo(self, obj):
