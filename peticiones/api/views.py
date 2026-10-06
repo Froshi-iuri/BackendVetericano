@@ -1,3 +1,5 @@
+import unicodedata
+import logging
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -13,6 +15,14 @@ from .serializers import (
     ListarPeticionesSerializer, DetallePeticionSerializer,
     ListarSeguimientoPeticionesVisitaSerializer,
 )
+
+logger = logging.getLogger(__name__)
+
+def _normalizar_texto(texto):
+    if not texto:
+        return ""
+    return ''.join(c for c in unicodedata.normalize('NFD', str(texto)) if unicodedata.category(c) != 'Mn').lower().strip()
+
 
 
 class ListarTiposPeticionView(generics.ListAPIView):
@@ -340,15 +350,23 @@ class DetallePeticionView(generics.RetrieveAPIView):
 
 class ActualizarEstadoPeticionView(APIView):
     """
-    PATCH /api/peticiones/<id_peticion>/estado/
+    PATCH/PUT /api/peticiones/<id_peticion>/estado/
     Actualiza el estado de una petición por parte del veterinario o personal a cargo.
     Body:
     {
         "estado": "En tratamiento",
         "observacion": "Motivo opcional del cambio"
     }
+    Opcionalmente acepta:
+    {
+        "id_estado": 9,
+        "observacion": "..."
+    }
     """
     permission_classes = [IsAuthenticated]
+
+    def put(self, request, id_peticion):
+        return self.patch(request, id_peticion)
 
     def patch(self, request, id_peticion):
         try:
@@ -356,34 +374,102 @@ class ActualizarEstadoPeticionView(APIView):
         except Peticiones.DoesNotExist:
             return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
 
-        nuevo_estado_nombre = request.data.get('estado')
-        if not nuevo_estado_nombre:
-            return Response({"error": "Debe especificar el nuevo estado."}, status=status.HTTP_400_BAD_REQUEST)
+        nuevo_estado_nombre = request.data.get('estado') or request.data.get('nuevo_estado')
+        nuevo_estado_id = request.data.get('id_estado')
 
-        # Buscar estado existente por nombre (case-insensitive) o crear uno dinámicamente
-        estado_obj = EstadoPeticiones.objects.filter(nombre__iexact=nuevo_estado_nombre).first()
+        if not nuevo_estado_nombre and not nuevo_estado_id:
+            return Response({"error": "Debe especificar el nuevo estado ('estado' o 'id_estado')."}, status=status.HTTP_400_BAD_REQUEST)
+
+        estado_obj = None
+
+        # 1. Búsqueda por ID numérico si se envió
+        if nuevo_estado_id:
+            try:
+                estado_obj = EstadoPeticiones.objects.filter(id_estado=int(nuevo_estado_id)).first()
+            except (ValueError, TypeError):
+                pass
+
+        # 2. Búsqueda por nombre si aún no se tiene
+        if not estado_obj and nuevo_estado_nombre:
+            nombre_str = str(nuevo_estado_nombre).strip()
+            # Búsqueda exacta (case-insensitive)
+            estado_obj = EstadoPeticiones.objects.filter(nombre__iexact=nombre_str).first()
+
+            # 3. Búsqueda insensible a tildes / acentos
+            if not estado_obj:
+                norm_busqueda = _normalizar_texto(nombre_str)
+                for est in EstadoPeticiones.objects.all():
+                    if _normalizar_texto(est.nombre) == norm_busqueda:
+                        estado_obj = est
+                        break
+
+            # 4. Búsqueda por palabra clave clínica común
+            if not estado_obj:
+                norm_busqueda = _normalizar_texto(nombre_str)
+                mapeo_claves = {
+                    "evaluac": "En evaluación",
+                    "pendient": "En evaluación",
+                    "tratamient": "En tratamiento",
+                    "observac": "En observación",
+                    "alta": "Alta médica",
+                    "fallecid": "Fallecido",
+                    "transferid": "Transferido a otro centro",
+                    "proces": "En Proceso",
+                    "atendid": "Atendida",
+                    "resuelt": "Resuelta",
+                }
+                for clave, nombre_estandar in mapeo_claves.items():
+                    if clave in norm_busqueda:
+                        estado_obj = EstadoPeticiones.objects.filter(nombre__iexact=nombre_estandar).first()
+                        if estado_obj:
+                            break
+
+            # 5. Si es un estado nuevo que no existe en el catálogo, crearlo
+            if not estado_obj:
+                try:
+                    estado_obj = EstadoPeticiones.objects.create(
+                        nombre=nombre_str,
+                        activo=True
+                    )
+                except Exception as e:
+                    logger.warning(f"No se pudo crear estado dinámico {nombre_str}: {e}")
+                    estado_obj = peticion.id_estado or EstadoPeticiones.objects.filter(activo=True).first()
+
         if not estado_obj:
-            estado_obj = EstadoPeticiones.objects.create(
-                nombre=nuevo_estado_nombre,
-                activo=True
-            )
+            return Response({"error": "No se pudo identificar un estado válido."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Asignar estado a la petición
         peticion.id_estado = estado_obj
+        campos_a_actualizar = ['id_estado']
 
+        # Si el usuario que atiende es veterinario (rol 3) y la petición no tenía asignado, auto-asignar
+        if getattr(request.user, 'id_rol_id', None) == 3 and not peticion.asignado_a:
+            peticion.asignado_a = request.user
+            if not peticion.fecha_asignacion:
+                peticion.fecha_asignacion = timezone.now()
+            campos_a_actualizar.extend(['asignado_a', 'fecha_asignacion'])
+
+        # Guardar la petición
+        peticion.save(update_fields=campos_a_actualizar)
+
+        # Guardar trazabilidad opcional en seguimiento si se provee observación
         observacion = request.data.get('observacion')
         if observacion:
-            # Guardamos trazabilidad en seguimiento si se provee observación
-            SeguimientoPeticionesVisita.objects.create(
-                id_peticion=peticion,
-                id_veterinario=request.user,
-                observacion=f"Cambio de estado a '{estado_obj.nombre}': {observacion}"
-            )
-
-        peticion.save(update_fields=['id_estado'])
+            try:
+                vet_usuario = request.user if hasattr(request.user, 'id_usuario') else None
+                if vet_usuario:
+                    SeguimientoPeticionesVisita.objects.create(
+                        id_peticion=peticion,
+                        id_veterinario=vet_usuario,
+                        observacion=f"Cambio de estado a '{estado_obj.nombre}': {observacion}"
+                    )
+            except Exception as e:
+                logger.warning(f"No se pudo registrar seguimiento para cambio de estado: {e}")
 
         return Response({
             "mensaje": f"Estado actualizado a '{estado_obj.nombre}' exitosamente.",
             "id_peticion": peticion.id_peticion,
+            "id_estado": estado_obj.id_estado,
             "estado": estado_obj.nombre
         }, status=status.HTTP_200_OK)
 
