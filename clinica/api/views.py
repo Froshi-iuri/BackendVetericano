@@ -68,3 +68,19 @@ class SeguimientoHospitalarioViewSet(viewsets.ModelViewSet):
     queryset = SeguimientoHospitalario.objects.all()
     serializer_class = SeguimientoHospitalarioSerializer
     permission_classes = [IsAuthenticated]
+
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .serializers import ExpedienteCompletoSerializer
+
+class ExpedienteCompletoAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = ExpedienteCompletoSerializer(data=request.data)
+        if serializer.is_valid():
+            result = serializer.save()
+            return Response(result, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

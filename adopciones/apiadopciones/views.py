@@ -1,12 +1,9 @@
 from rest_framework import viewsets
-from ..models import AdopcionAnimal, SolicitudAdopcion
-from .serializers import AdopcionAnimalSerializer, SolicitudAdopcionSerializer
+from ..models import SolicitudAdopcion
+from .serializers import SolicitudAdopcionSerializer
 from django.core.mail import send_mail
 from django.conf import settings
 
-class AdopcionAnimalViewSet(viewsets.ModelViewSet):
-    queryset = AdopcionAnimal.objects.all()
-    serializer_class = AdopcionAnimalSerializer
 
 class SolicitudAdopcionViewSet(viewsets.ModelViewSet):
     queryset = SolicitudAdopcion.objects.all()
@@ -17,13 +14,14 @@ class SolicitudAdopcionViewSet(viewsets.ModelViewSet):
         solicitud = serializer.save()
         
         # Prepara los datos para la notificación al área jurídica
+        raza_nombre = solicitud.animal.id_raza.nombre if solicitud.animal.id_raza else 'Mestizo'
         asunto = f"Nueva solicitud de adopción para: {solicitud.animal.nombre}"
         mensaje = (
             f"¡Hola equipo jurídico!\n\n"
             f"Se ha registrado una nueva solicitud de adopción con los siguientes datos:\n\n"
             f"--- DATOS DE LA MASCOTA ---\n"
             f"Nombre: {solicitud.animal.nombre}\n"
-            f"Raza: {solicitud.animal.raza}\n\n"
+            f"Raza: {raza_nombre}\n\n"
             f"--- DATOS DEL INTERESADO ---\n"
             f"Nombre: {solicitud.nombre_adoptante}\n"
             f"Cédula: {solicitud.cedula}\n"

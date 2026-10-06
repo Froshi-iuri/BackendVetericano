@@ -31,6 +31,7 @@ class Animal(models.Model):
     caracteristicas = models.TextField(blank=True, null=True)
     observaciones = models.TextField(blank=True, null=True)
     foto_url = models.CharField(max_length=255, blank=True, null=True)
+    disponible_adopcion = models.BooleanField(default=False)
     activo = models.BooleanField(default=True)
 
     class Meta:

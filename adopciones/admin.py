@@ -1,9 +1,6 @@
 from django.contrib import admin
-from .models import AdopcionAnimal
+from .models import SolicitudAdopcion
 
-
-@admin.register(AdopcionAnimal)
-class AdopcionAnimalAdmin(admin.ModelAdmin):
-    list_display = ('id', 'nombre', 'raza', 'disponible', 'fecha_creacion')
-    search_fields = ('nombre', 'raza')
-    list_filter = ('disponible',)
+@admin.register(SolicitudAdopcion)
+class SolicitudAdopcionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'nombre_adoptante', 'animal', 'fecha_solicitud')
