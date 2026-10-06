@@ -47,6 +47,12 @@ class Consulta(models.Model):
     observaciones_examen = models.TextField(blank=True, null=True)
     materiales_utilizados = models.TextField(blank=True, null=True)
     ingresa_cba = models.BooleanField(default=False)
+    examenes_complementarios = models.JSONField(blank=True, null=True)
+    motivo_ingreso_cba = models.TextField(blank=True, null=True)
+    canil_asignado = models.CharField(max_length=50, blank=True, null=True)
+    funcionario_recibe_cba = models.CharField(max_length=150, blank=True, null=True)
+    pronostico = models.CharField(max_length=50, blank=True, null=True)
+    plan_procedimientos = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False

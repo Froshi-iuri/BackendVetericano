@@ -9,6 +9,7 @@ from .views import (
     SeguimientosClinicosViewSet,
     DiagnosticoPatologiaViewSet,
     SeguimientoHospitalarioViewSet,
+    ExpedienteCompletoAPIView,
 )
 
 router = DefaultRouter()
@@ -22,5 +23,6 @@ router.register(r'diagnostico-patologias', DiagnosticoPatologiaViewSet, basename
 router.register(r'seguimientos-hospitalarios', SeguimientoHospitalarioViewSet, basename='seguimiento-hospitalario')
 
 urlpatterns = [
+    path('expediente-completo/', ExpedienteCompletoAPIView.as_view(), name='expediente-completo'),
     path('', include(router.urls)),
 ]
