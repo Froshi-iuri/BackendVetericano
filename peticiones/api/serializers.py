@@ -3,8 +3,9 @@ from django.db import transaction
 from peticiones.models import (
     TipoPeticion, Peticiones, Ubicaciones,
     SeguimientoPeticionesVisita, VisitaAnimal,
-    SeguimientoVisitaFuncionarios,
+    SeguimientoVisitaFuncionarios, EvidenciaPeticiones,
 )
+from peticiones.utils import subir_o_asegurar_cloudinary, obtener_fotos_acta_con_fallback
 from animales.models import Animal, Responsables
 
 
@@ -20,6 +21,12 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
     latitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
     longitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
     foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    fotos = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
 
     class Meta:
         model = Peticiones
@@ -30,6 +37,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             'descripcion',
             'prioridad',
             'foto',
+            'fotos',
             'direccion',
             'latitud',
             'longitud',
@@ -41,6 +49,8 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         direccion = validated_data.pop('direccion', None)
         latitud = validated_data.pop('latitud', None)
         longitud = validated_data.pop('longitud', None)
+        fotos_input = validated_data.pop('fotos', [])
+        foto_input = validated_data.get('foto', None)
 
         # 1. Si viene algún dato de mapa/dirección, creamos el registro en Ubicaciones
         ubicacion = None
@@ -50,6 +60,27 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
                 latitud=latitud,
                 longitud=longitud
             )
+
+        # Consolidar lista de fotos a procesar
+        lista_fotos = []
+        if fotos_input:
+            lista_fotos.extend(fotos_input)
+        if foto_input and foto_input not in lista_fotos:
+            lista_fotos.insert(0, foto_input)
+
+        # Procesar y subir a Cloudinary si es necesario
+        urls_procesadas = []
+        for f in lista_fotos:
+            url_cloud = subir_o_asegurar_cloudinary(f)
+            if url_cloud and url_cloud not in urls_procesadas:
+                urls_procesadas.append(url_cloud)
+
+        if urls_procesadas:
+            validated_data['foto'] = urls_procesadas[0]
+        elif foto_input:
+            url_simple = subir_o_asegurar_cloudinary(foto_input)
+            if url_simple:
+                validated_data['foto'] = url_simple
 
         # 2. Creamos la petición enlazando la ubicación creada
         peticion = Peticiones.objects.create(
@@ -61,6 +92,14 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         # Se rellena con ceros a la izquierda (ej. PET-2026-00055)
         peticion.numero_radicado = f"PET-2026-{str(peticion.id_peticion).zfill(5)}"
         peticion.save(update_fields=['numero_radicado'])
+
+        # 4. Registrar todas las fotos en EvidenciaPeticiones
+        for idx, url in enumerate(urls_procesadas, start=1):
+            EvidenciaPeticiones.objects.create(
+                id_peticion=peticion,
+                ruta_archivo=url,
+                descripcion=f"Evidencia #{idx} de la petición"
+            )
         
         return peticion
 
@@ -73,6 +112,8 @@ class ListarPeticionesSerializer(serializers.ModelSerializer):
     ubicacion_direccion = serializers.CharField(source='id_ubicacion.direccion', read_only=True)
     ubicacion_latitud = serializers.DecimalField(source='id_ubicacion.latitud', max_digits=10, decimal_places=7, read_only=True)
     ubicacion_longitud = serializers.DecimalField(source='id_ubicacion.longitud', max_digits=10, decimal_places=7, read_only=True)
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     class Meta:
         model = Peticiones
@@ -90,8 +131,34 @@ class ListarPeticionesSerializer(serializers.ModelSerializer):
             'ubicacion_direccion',
             'ubicacion_latitud',
             'ubicacion_longitud',
-            'foto'
+            'foto',
+            'fotos',
+            'total_fotos',
         ]
+
+    def _get_fotos_list(self, obj):
+        if hasattr(obj, '_fotos_cache'):
+            return obj._fotos_cache
+        evidencias_cache = getattr(obj, '_prefetched_objects_cache', {}).get('evidenciapeticiones_set')
+        if evidencias_cache is not None:
+            urls = [e.ruta_archivo for e in evidencias_cache if e.ruta_archivo]
+        else:
+            urls = list(
+                EvidenciaPeticiones.objects.filter(id_peticion=obj)
+                .exclude(ruta_archivo__isnull=True)
+                .exclude(ruta_archivo='')
+                .values_list('ruta_archivo', flat=True)
+            )
+        if not urls and obj.foto:
+            urls = [obj.foto]
+        obj._fotos_cache = urls
+        return urls
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
 class AsignarPeticionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -112,6 +179,8 @@ class DetallePeticionSerializer(serializers.ModelSerializer):
     motivo = serializers.CharField(source='descripcion', default='')
     fechaAsignada = serializers.SerializerMethodField()
     observaciones = serializers.CharField(source='descripcion', default='')
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     # Compatibilidad snake_case con PeticionListResponse y clientes móviles
     numero_radicado = serializers.CharField(read_only=True)
@@ -148,8 +217,34 @@ class DetallePeticionSerializer(serializers.ModelSerializer):
             'ubicacion_latitud',
             'ubicacion_longitud',
             'observaciones',
-            'foto'
+            'foto',
+            'fotos',
+            'total_fotos',
         ]
+
+    def _get_fotos_list(self, obj):
+        if hasattr(obj, '_fotos_cache'):
+            return obj._fotos_cache
+        evidencias_cache = getattr(obj, '_prefetched_objects_cache', {}).get('evidenciapeticiones_set')
+        if evidencias_cache is not None:
+            urls = [e.ruta_archivo for e in evidencias_cache if e.ruta_archivo]
+        else:
+            urls = list(
+                EvidenciaPeticiones.objects.filter(id_peticion=obj)
+                .exclude(ruta_archivo__isnull=True)
+                .exclude(ruta_archivo='')
+                .values_list('ruta_archivo', flat=True)
+            )
+        if not urls and obj.foto:
+            urls = [obj.foto]
+        obj._fotos_cache = urls
+        return urls
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
     def get_codigo(self, obj):
         return obj.numero_radicado or f"#INC-2026-{obj.id_peticion:06d}"
@@ -311,6 +406,15 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     # Animales (modo B: varios detallados)
     animales = AnimalRapidoSerializer(many=True, required=False, write_only=True)
 
+    # Fotos del acta de visita (una o varias, subidas a Cloudinary)
+    foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    fotos = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
+
     class Meta:
         model = SeguimientoPeticionesVisita
         fields = [
@@ -353,6 +457,8 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'notificador_nombre', 'notificador_identificacion', 'notificador_cargo',
             # Firmas
             'firma_notificador', 'firma_notificado',
+            # Fotos del acta
+            'foto', 'fotos',
             # Observaciones generales
             'observacion',
             # Fecha de registro automática
@@ -360,11 +466,21 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id_seguimiento', 'fecha', 'lugar_atencion_detalle', 'funcionarios_detalle']
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        fotos = obtener_fotos_acta_con_fallback(instance)
+        data['fotos'] = fotos
+        data['foto'] = fotos[0] if fotos else None
+        data['total_fotos'] = len(fotos)
+        return data
+
     @transaction.atomic
     def create(self, validated_data):
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
         funcionarios_data = validated_data.pop('funcionarios', [])
         animales_data = validated_data.pop('animales', [])
+        fotos_input = validated_data.pop('fotos', [])
+        foto_input = validated_data.pop('foto', None)
 
         # 1. Crear/actualizar ubicación del lugar de atención
         if lugar_atencion_data:
@@ -425,12 +541,30 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 **func_data,
             )
 
+        # 5. Guardar fotos de la visita (Cloudinary + EvidenciaPeticiones)
+        lista_fotos = []
+        if fotos_input:
+            lista_fotos.extend(fotos_input)
+        if foto_input and foto_input not in lista_fotos:
+            lista_fotos.insert(0, foto_input)
+
+        for idx, f_item in enumerate(lista_fotos, start=1):
+            url_cloud = subir_o_asegurar_cloudinary(f_item)
+            if url_cloud:
+                EvidenciaPeticiones.objects.create(
+                    id_peticion=seguimiento.id_peticion,
+                    ruta_archivo=url_cloud,
+                    descripcion=f"Acta de visita #{seguimiento.id_seguimiento} - Foto #{idx}"
+                )
+
         return seguimiento
 
     @transaction.atomic
     def update(self, instance, validated_data):
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
         funcionarios_data = validated_data.pop('funcionarios', None)
+        fotos_input = validated_data.pop('fotos', None)
+        foto_input = validated_data.pop('foto', None)
         validated_data.pop('animales', None)  # No se reemplaza la lista de animales por PATCH
 
         # Actualizar o crear ubicación de la visita
@@ -464,6 +598,28 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                     id_usuario=id_usuario_obj,
                     **func_data,
                 )
+
+        # Registrar fotos adicionales si se envían
+        if fotos_input is not None or foto_input is not None:
+            lista_fotos = []
+            if fotos_input:
+                lista_fotos.extend(fotos_input)
+            if foto_input and foto_input not in lista_fotos:
+                lista_fotos.insert(0, foto_input)
+
+            if lista_fotos:
+                conteo_previo = EvidenciaPeticiones.objects.filter(
+                    id_peticion=instance.id_peticion,
+                    descripcion__startswith=f"Acta de visita #{instance.id_seguimiento}"
+                ).count()
+                for idx, f_item in enumerate(lista_fotos, start=conteo_previo + 1):
+                    url_cloud = subir_o_asegurar_cloudinary(f_item)
+                    if url_cloud:
+                        EvidenciaPeticiones.objects.create(
+                            id_peticion=instance.id_peticion,
+                            ruta_archivo=url_cloud,
+                            descripcion=f"Acta de visita #{instance.id_seguimiento} - Foto #{idx}"
+                        )
 
         return instance
 
@@ -515,6 +671,9 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     total_funcionarios = serializers.SerializerMethodField()
     animales = serializers.SerializerMethodField()
     total_animales = serializers.SerializerMethodField()
+    foto = serializers.SerializerMethodField()
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     class Meta:
         model = SeguimientoPeticionesVisita
@@ -538,9 +697,25 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'funcionarios', 'total_funcionarios',
             'notificado_nombre', 'notificaciones_identificacion', 'fecha_notificacion',
             'notificador_nombre', 'notificador_cargo',
+            'foto', 'fotos', 'total_fotos',
             'observacion',
         ]
         read_only_fields = fields
+
+    def _get_fotos_list(self, obj):
+        if not hasattr(obj, '_fotos_cache'):
+            obj._fotos_cache = obtener_fotos_acta_con_fallback(obj)
+        return obj._fotos_cache
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_foto(self, obj):
+        fotos = self._get_fotos_list(obj)
+        return fotos[0] if fotos else None
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
     def get_veterinario_nombre(self, obj):
         vet = getattr(obj, 'id_veterinario', None)

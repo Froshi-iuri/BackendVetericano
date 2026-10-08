@@ -15,6 +15,7 @@ from .serializers import (
     ListarPeticionesSerializer, DetallePeticionSerializer,
     ListarSeguimientoPeticionesVisitaSerializer,
 )
+from peticiones.utils import obtener_fotos_acta_con_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class ListarPeticionesView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'asignado_a').all()
+        queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'asignado_a').prefetch_related('evidenciapeticiones_set').all()
         
         # 1 = Administrador, 2 = Jurídico, 3 = Veterinario, 4 = Peticionario
         if user.id_rol_id == 3:
@@ -82,12 +83,15 @@ class IniciarPeticionView(generics.CreateAPIView):
             id_estado=estado_inicial
         )
 
+        evidencias_urls = list(peticion.evidenciapeticiones_set.values_list('ruta_archivo', flat=True))
         return Response({
             "mensaje": "Petición iniciada con éxito",
             "id_peticion": peticion.id_peticion,
             "id_tipo": peticion.id_tipo.id_tipo if peticion.id_tipo else None,
             "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None,
-            "foto": peticion.foto
+            "foto": peticion.foto,
+            "fotos": evidencias_urls or ([peticion.foto] if peticion.foto else []),
+            "total_fotos": len(evidencias_urls) if evidencias_urls else (1 if peticion.foto else 0),
         }, status=status.HTTP_201_CREATED)
 
 
@@ -198,10 +202,14 @@ class SeguimientoPeticionesVisitaCreateView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         seguimiento = serializer.save(id_veterinario=request.user)
+        fotos = obtener_fotos_acta_con_fallback(seguimiento)
         return Response(
             {
                 "mensaje": "Acta de visita registrada exitosamente.",
                 "id_seguimiento": seguimiento.id_seguimiento,
+                "foto": fotos[0] if fotos else None,
+                "fotos": fotos,
+                "total_fotos": len(fotos),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -218,7 +226,7 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     queryset = SeguimientoPeticionesVisita.objects.select_related(
         'id_peticion', 'id_veterinario', 'id_animal', 'id_ubicacion_visita'
-    ).prefetch_related('funcionarios')
+    ).prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set')
     lookup_field = 'id_seguimiento'
 
     def update(self, request, *args, **kwargs):
@@ -254,7 +262,7 @@ class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
                 'id_peticion', 'id_peticion__id_estado',
                 'id_veterinario', 'id_animal', 'id_ubicacion_visita',
             )
-            .prefetch_related('funcionarios')
+            .prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set')
         )
 
         # 1 = Administrador, 2 = Jurídico, 3 = Veterinario, 4 = Peticionario
@@ -342,7 +350,7 @@ class DetallePeticionView(generics.RetrieveAPIView):
     GET /api/peticiones/<id_peticion>/
     Retorna el detalle completo de la petición para visualización móvil y web.
     """
-    queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable', 'asignado_a').all()
+    queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable', 'asignado_a').prefetch_related('evidenciapeticiones_set').all()
     serializer_class = DetallePeticionSerializer
     permission_classes = [IsAuthenticated]
     lookup_field = 'id_peticion'
