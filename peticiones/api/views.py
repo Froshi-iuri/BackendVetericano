@@ -272,6 +272,10 @@ class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
             queryset = queryset.filter(id_peticion__responsable=user)
 
         params = self.request.query_params
+        id_seguimiento = params.get('id_seguimiento') or params.get('id')
+        if id_seguimiento:
+            queryset = queryset.filter(id_seguimiento=id_seguimiento)
+
         id_peticion = params.get('id_peticion')
         if id_peticion:
             queryset = queryset.filter(id_peticion_id=id_peticion)

@@ -468,6 +468,23 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        # Fallback de descripcion_paciente si está vacío pero el animal tiene características
+        if not data.get('descripcion_paciente'):
+            animal = getattr(instance, 'id_animal', None)
+            if animal and getattr(animal, 'caracteristicas', None):
+                data['descripcion_paciente'] = animal.caracteristicas
+
+        # Incluir lista de animales atendidos para modo B y detalle completo
+        if 'animales' not in data or not data['animales']:
+            from peticiones.models import VisitaAnimal
+            visitas = (
+                VisitaAnimal.objects
+                .filter(id_seguimiento_id=instance.pk)
+                .select_related('id_animal')
+                .order_by('id_visita')
+            )
+            data['animales'] = VisitaAnimalListSerializer(visitas, many=True).data
+
         fotos = obtener_fotos_acta_con_fallback(instance)
         data['fotos'] = fotos
         data['foto'] = fotos[0] if fotos else None
@@ -638,12 +655,19 @@ class VisitaAnimalListSerializer(serializers.ModelSerializer):
         source='id_animal.peso', max_digits=5, decimal_places=2,
         read_only=True, allow_null=True,
     )
+    caracteristicas = serializers.CharField(
+        source='id_animal.caracteristicas', read_only=True, default='', allow_null=True
+    )
+    descripcion_paciente = serializers.CharField(
+        source='id_animal.caracteristicas', read_only=True, default='', allow_null=True
+    )
 
     class Meta:
         model = VisitaAnimal
         fields = [
             'id_visita',
             'id_animal', 'nombre', 'sexo', 'color', 'peso',
+            'caracteristicas', 'descripcion_paciente',
             'fecha', 'nro_radicado_atencion',
             'quien_reporta', 'lugar_atencion_direccion',
             'nombre_notificado', 'documento_notificado', 'fecha_notificacion',
@@ -671,6 +695,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     total_funcionarios = serializers.SerializerMethodField()
     animales = serializers.SerializerMethodField()
     total_animales = serializers.SerializerMethodField()
+    descripcion_paciente = serializers.SerializerMethodField()
     foto = serializers.SerializerMethodField()
     fotos = serializers.SerializerMethodField()
     total_fotos = serializers.SerializerMethodField()
@@ -690,6 +715,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'nro_animales_atendidos', 'total_animales', 'animales',
             'nombre_paciente', 'paciente_especie', 'paciente_sexo',
             'paciente_raza', 'paciente_color', 'paciente_edad', 'peso_paciente',
+            'descripcion_paciente', 'esterilizacion_paciente', 'desparasitacion',
             'anamnesis_descripcion_queja', 'tratamiento_realizado',
             'compromisos', 'plazo_dias_cumplimiento',
             'lugar_atencion',
@@ -701,6 +727,14 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'observacion',
         ]
         read_only_fields = fields
+
+    def get_descripcion_paciente(self, obj):
+        if obj.descripcion_paciente:
+            return obj.descripcion_paciente
+        animal = getattr(obj, 'id_animal', None)
+        if animal and getattr(animal, 'caracteristicas', None):
+            return animal.caracteristicas
+        return ''
 
     def _get_fotos_list(self, obj):
         if not hasattr(obj, '_fotos_cache'):
