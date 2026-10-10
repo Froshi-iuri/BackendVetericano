@@ -504,37 +504,127 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             ubicacion_visita = Ubicaciones.objects.create(**lugar_atencion_data)
             validated_data['id_ubicacion_visita'] = ubicacion_visita
 
+        # --- LOGICA DE ANIMALES (3 Escenarios) ---
+        nro_animales_atendidos_input = validated_data.get('nro_animales_atendidos')
+        if nro_animales_atendidos_input is None:
+            nro_animales_atendidos_input = 1
+
+        animal_principal = None
+        lista_animales_creados = []
+        animal_serializer = AnimalRapidoSerializer()
+        from datetime import date
+        from especies.models import Raza
+
+        def obtener_raza_generica():
+            return (
+                Raza.objects.filter(nombre__icontains='mestizo').first()
+                or Raza.objects.filter(nombre__icontains='desconocido').first()
+                or Raza.objects.filter(activo=True).first()
+                or Raza.objects.first()
+            )
+
+        def buscar_animal_existente(nombre):
+            if not nombre: return None
+            # Busca si ya existe un animal con ese nombre exacto creado recientemente
+            from datetime import timedelta
+            hoy = date.today()
+            return Animal.objects.filter(
+                nombre__iexact=nombre,
+                fecha_ingreso__gte=hoy - timedelta(days=2)
+            ).order_by('-id_animal').first()
+
+        if animales_data:
+            # Modo B y C combinados
+            if len(animales_data) == 1 and nro_animales_atendidos_input > 1:
+                # Escenario 3: Lote/Camada
+                animal_data = animales_data[0]
+                nombre_sug = animal_data.get('nombre', 'Sin nombre')
+                if "camada" not in nombre_sug.lower() and "lote" not in nombre_sug.lower():
+                    animal_data['nombre'] = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_sug}"
+                
+                # Intentar buscar duplicado o crear
+                animal_exist = buscar_animal_existente(animal_data['nombre'])
+                if animal_exist:
+                    animal_principal = animal_exist
+                else:
+                    animal_principal = animal_serializer.get_or_create_animal(animal_data)
+                
+                lista_animales_creados.append(animal_principal)
+            else:
+                # Escenario 2: Varios animales (o 1 solo detallado en lista)
+                for i, animal_data in enumerate(animales_data):
+                    nombre_sug = animal_data.get('nombre', 'Sin nombre')
+                    animal_exist = buscar_animal_existente(nombre_sug)
+                    
+                    if animal_exist:
+                        animal = animal_exist
+                    else:
+                        animal = animal_serializer.get_or_create_animal(animal_data)
+                        
+                    if i == 0:
+                        animal_principal = animal
+                    lista_animales_creados.append(animal)
+                
+                nro_animales_atendidos_input = len(animales_data)
+        else:
+            # Escenario 1: Sin lista, datos planos en el formulario
+            nombre_plano = validated_data.get('nombre_paciente')
+            if nombre_plano:
+                if nro_animales_atendidos_input > 1:
+                    # Escenario 3 desde texto plano
+                    if "camada" not in nombre_plano.lower() and "lote" not in nombre_plano.lower():
+                        nombre_plano = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_plano}"
+                
+                animal_exist = buscar_animal_existente(nombre_plano)
+                if animal_exist:
+                    animal_principal = animal_exist
+                else:
+                    raza = obtener_raza_generica()
+                    animal_principal = Animal.objects.create(
+                        id_raza=raza,
+                        nombre=nombre_plano,
+                        sexo=validated_data.get('paciente_sexo'),
+                        color=validated_data.get('paciente_color'),
+                        peso=validated_data.get('peso_paciente'),
+                        esterilizado=validated_data.get('esterilizacion_paciente', False),
+                        caracteristicas=validated_data.get('descripcion_paciente'),
+                        fecha_ingreso=date.today(),
+                        activo=True,
+                    )
+                lista_animales_creados.append(animal_principal)
+
+        # Copiar datos del animal principal a las columnas del acta
+        if animal_principal:
+            validated_data['id_animal'] = animal_principal
+            validated_data['nombre_paciente'] = animal_principal.nombre
+            validated_data['paciente_sexo'] = animal_principal.sexo
+            validated_data['paciente_color'] = animal_principal.color
+            validated_data['peso_paciente'] = animal_principal.peso
+            validated_data['esterilizacion_paciente'] = animal_principal.esterilizado
+            validated_data['descripcion_paciente'] = animal_principal.caracteristicas
+            
+            # Intentar obtener raza/especie de manera segura
+            try:
+                if animal_principal.id_raza:
+                    validated_data['paciente_raza'] = animal_principal.id_raza.nombre
+                    if animal_principal.id_raza.id_especie:
+                        validated_data['paciente_especie'] = animal_principal.id_raza.id_especie.nombre
+            except Exception:
+                pass
+
+        validated_data['nro_animales_atendidos'] = nro_animales_atendidos_input
+
         # 2. Crear el registro principal de seguimiento
         seguimiento = SeguimientoPeticionesVisita.objects.create(**validated_data)
 
-        # 3. Procesar animales según el modo recibido
-        if animales_data:
-            # Modo B: Lista detallada de animales
-            animal_serializer = AnimalRapidoSerializer()
-            primer_animal = None
-            for animal_data in animales_data:
-                animal = animal_serializer.get_or_create_animal(animal_data)
-                if primer_animal is None:
-                    primer_animal = animal
-                VisitaAnimal.objects.create(
-                    id_animal=animal,
-                    id_seguimiento=seguimiento,
-                )
-            # El primer animal va como referencia principal en el acta
-            if primer_animal and not seguimiento.id_animal_id:
-                SeguimientoPeticionesVisita.objects.filter(
-                    pk=seguimiento.pk
-                ).update(id_animal_id=primer_animal.pk)
-                seguimiento.id_animal_id = primer_animal.pk
-
-            # Actualizar el contador si no vino explícito
-            if not seguimiento.nro_animales_atendidos:
-                SeguimientoPeticionesVisita.objects.filter(
-                    pk=seguimiento.pk
-                ).update(nro_animales_atendidos=len(animales_data))
-
-        elif seguimiento.id_animal_id:
-            # Modo A: un solo animal ya existente o recién vinculado
+        # 3. Vincular los animales creados a la tabla VisitaAnimal
+        for animal in lista_animales_creados:
+            VisitaAnimal.objects.create(
+                id_animal=animal,
+                id_seguimiento=seguimiento,
+            )
+            
+        if not lista_animales_creados and seguimiento.id_animal_id:
             VisitaAnimal.objects.create(
                 id_animal_id=seguimiento.id_animal_id,
                 id_seguimiento=seguimiento,
@@ -546,7 +636,6 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             nombre = func_data.get('nombre', '')
             cargo = func_data.get('cargo', '')
 
-            # Si es usuario del sistema, completar nombre/cargo desde el perfil
             if id_usuario_obj and not nombre:
                 func_data['nombre'] = f"{id_usuario_obj.nombre} {id_usuario_obj.apellido}".strip()
             if id_usuario_obj and not cargo:
@@ -558,7 +647,7 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 **func_data,
             )
 
-        # 5. Guardar fotos de la visita (Cloudinary + EvidenciaPeticiones)
+        # 5. Guardar fotos de la visita
         lista_fotos = []
         if fotos_input:
             lista_fotos.extend(fotos_input)
