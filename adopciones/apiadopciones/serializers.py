@@ -1,10 +1,5 @@
 from rest_framework import serializers
-from ..models import AdopcionAnimal, SolicitudAdopcion
-
-class AdopcionAnimalSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AdopcionAnimal
-        fields = '__all__'
+from ..models import SolicitudAdopcion
 
 class SolicitudAdopcionSerializer(serializers.ModelSerializer):
     class Meta:
