@@ -3,8 +3,9 @@ from django.db import transaction
 from peticiones.models import (
     TipoPeticion, Peticiones, Ubicaciones,
     SeguimientoPeticionesVisita, VisitaAnimal,
-    SeguimientoVisitaFuncionarios,
+    SeguimientoVisitaFuncionarios, EvidenciaPeticiones,
 )
+from peticiones.utils import subir_o_asegurar_cloudinary, obtener_fotos_acta_con_fallback
 from animales.models import Animal, Responsables
 
 
@@ -20,6 +21,12 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
     latitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
     longitud = serializers.DecimalField(max_digits=10, decimal_places=7, required=False, allow_null=True)
     foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    fotos = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
 
     class Meta:
         model = Peticiones
@@ -30,6 +37,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             'descripcion',
             'prioridad',
             'foto',
+            'fotos',
             'direccion',
             'latitud',
             'longitud',
@@ -41,6 +49,8 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         direccion = validated_data.pop('direccion', None)
         latitud = validated_data.pop('latitud', None)
         longitud = validated_data.pop('longitud', None)
+        fotos_input = validated_data.pop('fotos', [])
+        foto_input = validated_data.get('foto', None)
 
         # 1. Si viene algún dato de mapa/dirección, creamos el registro en Ubicaciones
         ubicacion = None
@@ -50,6 +60,27 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
                 latitud=latitud,
                 longitud=longitud
             )
+
+        # Consolidar lista de fotos a procesar
+        lista_fotos = []
+        if fotos_input:
+            lista_fotos.extend(fotos_input)
+        if foto_input and foto_input not in lista_fotos:
+            lista_fotos.insert(0, foto_input)
+
+        # Procesar y subir a Cloudinary si es necesario
+        urls_procesadas = []
+        for f in lista_fotos:
+            url_cloud = subir_o_asegurar_cloudinary(f)
+            if url_cloud and url_cloud not in urls_procesadas:
+                urls_procesadas.append(url_cloud)
+
+        if urls_procesadas:
+            validated_data['foto'] = urls_procesadas[0]
+        elif foto_input:
+            url_simple = subir_o_asegurar_cloudinary(foto_input)
+            if url_simple:
+                validated_data['foto'] = url_simple
 
         # 2. Creamos la petición enlazando la ubicación creada
         peticion = Peticiones.objects.create(
@@ -61,6 +92,14 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         # Se rellena con ceros a la izquierda (ej. PET-2026-00055)
         peticion.numero_radicado = f"PET-2026-{str(peticion.id_peticion).zfill(5)}"
         peticion.save(update_fields=['numero_radicado'])
+
+        # 4. Registrar todas las fotos en EvidenciaPeticiones
+        for idx, url in enumerate(urls_procesadas, start=1):
+            EvidenciaPeticiones.objects.create(
+                id_peticion=peticion,
+                ruta_archivo=url,
+                descripcion=f"Evidencia #{idx} de la petición"
+            )
         
         return peticion
 
@@ -73,6 +112,8 @@ class ListarPeticionesSerializer(serializers.ModelSerializer):
     ubicacion_direccion = serializers.CharField(source='id_ubicacion.direccion', read_only=True)
     ubicacion_latitud = serializers.DecimalField(source='id_ubicacion.latitud', max_digits=10, decimal_places=7, read_only=True)
     ubicacion_longitud = serializers.DecimalField(source='id_ubicacion.longitud', max_digits=10, decimal_places=7, read_only=True)
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     class Meta:
         model = Peticiones
@@ -90,8 +131,34 @@ class ListarPeticionesSerializer(serializers.ModelSerializer):
             'ubicacion_direccion',
             'ubicacion_latitud',
             'ubicacion_longitud',
-            'foto'
+            'foto',
+            'fotos',
+            'total_fotos',
         ]
+
+    def _get_fotos_list(self, obj):
+        if hasattr(obj, '_fotos_cache'):
+            return obj._fotos_cache
+        evidencias_cache = getattr(obj, '_prefetched_objects_cache', {}).get('evidenciapeticiones_set')
+        if evidencias_cache is not None:
+            urls = [e.ruta_archivo for e in evidencias_cache if e.ruta_archivo]
+        else:
+            urls = list(
+                EvidenciaPeticiones.objects.filter(id_peticion=obj)
+                .exclude(ruta_archivo__isnull=True)
+                .exclude(ruta_archivo='')
+                .values_list('ruta_archivo', flat=True)
+            )
+        if not urls and obj.foto:
+            urls = [obj.foto]
+        obj._fotos_cache = urls
+        return urls
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
 class AsignarPeticionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -112,6 +179,8 @@ class DetallePeticionSerializer(serializers.ModelSerializer):
     motivo = serializers.CharField(source='descripcion', default='')
     fechaAsignada = serializers.SerializerMethodField()
     observaciones = serializers.CharField(source='descripcion', default='')
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     # Compatibilidad snake_case con PeticionListResponse y clientes móviles
     numero_radicado = serializers.CharField(read_only=True)
@@ -148,8 +217,34 @@ class DetallePeticionSerializer(serializers.ModelSerializer):
             'ubicacion_latitud',
             'ubicacion_longitud',
             'observaciones',
-            'foto'
+            'foto',
+            'fotos',
+            'total_fotos',
         ]
+
+    def _get_fotos_list(self, obj):
+        if hasattr(obj, '_fotos_cache'):
+            return obj._fotos_cache
+        evidencias_cache = getattr(obj, '_prefetched_objects_cache', {}).get('evidenciapeticiones_set')
+        if evidencias_cache is not None:
+            urls = [e.ruta_archivo for e in evidencias_cache if e.ruta_archivo]
+        else:
+            urls = list(
+                EvidenciaPeticiones.objects.filter(id_peticion=obj)
+                .exclude(ruta_archivo__isnull=True)
+                .exclude(ruta_archivo='')
+                .values_list('ruta_archivo', flat=True)
+            )
+        if not urls and obj.foto:
+            urls = [obj.foto]
+        obj._fotos_cache = urls
+        return urls
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
     def get_codigo(self, obj):
         return obj.numero_radicado or f"#INC-2026-{obj.id_peticion:06d}"
@@ -311,6 +406,15 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     # Animales (modo B: varios detallados)
     animales = AnimalRapidoSerializer(many=True, required=False, write_only=True)
 
+    # Fotos del acta de visita (una o varias, subidas a Cloudinary)
+    foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    fotos = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
+
     class Meta:
         model = SeguimientoPeticionesVisita
         fields = [
@@ -353,6 +457,8 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'notificador_nombre', 'notificador_identificacion', 'notificador_cargo',
             # Firmas
             'firma_notificador', 'firma_notificado',
+            # Fotos del acta
+            'foto', 'fotos',
             # Observaciones generales
             'observacion',
             # Fecha de registro automática
@@ -360,48 +466,165 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id_seguimiento', 'fecha', 'lugar_atencion_detalle', 'funcionarios_detalle']
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Fallback de descripcion_paciente si está vacío pero el animal tiene características
+        if not data.get('descripcion_paciente'):
+            animal = getattr(instance, 'id_animal', None)
+            if animal and getattr(animal, 'caracteristicas', None):
+                data['descripcion_paciente'] = animal.caracteristicas
+
+        # Incluir lista de animales atendidos para modo B y detalle completo
+        if 'animales' not in data or not data['animales']:
+            from peticiones.models import VisitaAnimal
+            visitas = (
+                VisitaAnimal.objects
+                .filter(id_seguimiento_id=instance.pk)
+                .select_related('id_animal')
+                .order_by('id_visita')
+            )
+            data['animales'] = VisitaAnimalListSerializer(visitas, many=True).data
+
+        fotos = obtener_fotos_acta_con_fallback(instance)
+        data['fotos'] = fotos
+        data['foto'] = fotos[0] if fotos else None
+        data['total_fotos'] = len(fotos)
+        return data
+
     @transaction.atomic
     def create(self, validated_data):
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
         funcionarios_data = validated_data.pop('funcionarios', [])
         animales_data = validated_data.pop('animales', [])
+        fotos_input = validated_data.pop('fotos', [])
+        foto_input = validated_data.pop('foto', None)
 
         # 1. Crear/actualizar ubicación del lugar de atención
         if lugar_atencion_data:
             ubicacion_visita = Ubicaciones.objects.create(**lugar_atencion_data)
             validated_data['id_ubicacion_visita'] = ubicacion_visita
 
+        # --- LOGICA DE ANIMALES (3 Escenarios) ---
+        nro_animales_atendidos_input = validated_data.get('nro_animales_atendidos')
+        if nro_animales_atendidos_input is None:
+            nro_animales_atendidos_input = 1
+
+        animal_principal = None
+        lista_animales_creados = []
+        animal_serializer = AnimalRapidoSerializer()
+        from datetime import date
+        from especies.models import Raza
+
+        def obtener_raza_generica():
+            return (
+                Raza.objects.filter(nombre__icontains='mestizo').first()
+                or Raza.objects.filter(nombre__icontains='desconocido').first()
+                or Raza.objects.filter(activo=True).first()
+                or Raza.objects.first()
+            )
+
+        def buscar_animal_existente(nombre):
+            if not nombre: return None
+            # Busca si ya existe un animal con ese nombre exacto creado recientemente
+            from datetime import timedelta
+            hoy = date.today()
+            return Animal.objects.filter(
+                nombre__iexact=nombre,
+                fecha_ingreso__gte=hoy - timedelta(days=2)
+            ).order_by('-id_animal').first()
+
+        if animales_data:
+            # Modo B y C combinados
+            if len(animales_data) == 1 and nro_animales_atendidos_input > 1:
+                # Escenario 3: Lote/Camada
+                animal_data = animales_data[0]
+                nombre_sug = animal_data.get('nombre', 'Sin nombre')
+                if "camada" not in nombre_sug.lower() and "lote" not in nombre_sug.lower():
+                    animal_data['nombre'] = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_sug}"
+                
+                # Intentar buscar duplicado o crear
+                animal_exist = buscar_animal_existente(animal_data['nombre'])
+                if animal_exist:
+                    animal_principal = animal_exist
+                else:
+                    animal_principal = animal_serializer.get_or_create_animal(animal_data)
+                
+                lista_animales_creados.append(animal_principal)
+            else:
+                # Escenario 2: Varios animales (o 1 solo detallado en lista)
+                for i, animal_data in enumerate(animales_data):
+                    nombre_sug = animal_data.get('nombre', 'Sin nombre')
+                    animal_exist = buscar_animal_existente(nombre_sug)
+                    
+                    if animal_exist:
+                        animal = animal_exist
+                    else:
+                        animal = animal_serializer.get_or_create_animal(animal_data)
+                        
+                    if i == 0:
+                        animal_principal = animal
+                    lista_animales_creados.append(animal)
+                
+                nro_animales_atendidos_input = len(animales_data)
+        else:
+            # Escenario 1: Sin lista, datos planos en el formulario
+            nombre_plano = validated_data.get('nombre_paciente')
+            if nombre_plano:
+                if nro_animales_atendidos_input > 1:
+                    # Escenario 3 desde texto plano
+                    if "camada" not in nombre_plano.lower() and "lote" not in nombre_plano.lower():
+                        nombre_plano = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_plano}"
+                
+                animal_exist = buscar_animal_existente(nombre_plano)
+                if animal_exist:
+                    animal_principal = animal_exist
+                else:
+                    raza = obtener_raza_generica()
+                    animal_principal = Animal.objects.create(
+                        id_raza=raza,
+                        nombre=nombre_plano,
+                        sexo=validated_data.get('paciente_sexo'),
+                        color=validated_data.get('paciente_color'),
+                        peso=validated_data.get('peso_paciente'),
+                        esterilizado=validated_data.get('esterilizacion_paciente', False),
+                        caracteristicas=validated_data.get('descripcion_paciente'),
+                        fecha_ingreso=date.today(),
+                        activo=True,
+                    )
+                lista_animales_creados.append(animal_principal)
+
+        # Copiar datos del animal principal a las columnas del acta
+        if animal_principal:
+            validated_data['id_animal'] = animal_principal
+            validated_data['nombre_paciente'] = animal_principal.nombre
+            validated_data['paciente_sexo'] = animal_principal.sexo
+            validated_data['paciente_color'] = animal_principal.color
+            validated_data['peso_paciente'] = animal_principal.peso
+            validated_data['esterilizacion_paciente'] = animal_principal.esterilizado
+            validated_data['descripcion_paciente'] = animal_principal.caracteristicas
+            
+            # Intentar obtener raza/especie de manera segura
+            try:
+                if animal_principal.id_raza:
+                    validated_data['paciente_raza'] = animal_principal.id_raza.nombre
+                    if animal_principal.id_raza.id_especie:
+                        validated_data['paciente_especie'] = animal_principal.id_raza.id_especie.nombre
+            except Exception:
+                pass
+
+        validated_data['nro_animales_atendidos'] = nro_animales_atendidos_input
+
         # 2. Crear el registro principal de seguimiento
         seguimiento = SeguimientoPeticionesVisita.objects.create(**validated_data)
 
-        # 3. Procesar animales según el modo recibido
-        if animales_data:
-            # Modo B: Lista detallada de animales
-            animal_serializer = AnimalRapidoSerializer()
-            primer_animal = None
-            for animal_data in animales_data:
-                animal = animal_serializer.get_or_create_animal(animal_data)
-                if primer_animal is None:
-                    primer_animal = animal
-                VisitaAnimal.objects.create(
-                    id_animal=animal,
-                    id_seguimiento=seguimiento,
-                )
-            # El primer animal va como referencia principal en el acta
-            if primer_animal and not seguimiento.id_animal_id:
-                SeguimientoPeticionesVisita.objects.filter(
-                    pk=seguimiento.pk
-                ).update(id_animal_id=primer_animal.pk)
-                seguimiento.id_animal_id = primer_animal.pk
-
-            # Actualizar el contador si no vino explícito
-            if not seguimiento.nro_animales_atendidos:
-                SeguimientoPeticionesVisita.objects.filter(
-                    pk=seguimiento.pk
-                ).update(nro_animales_atendidos=len(animales_data))
-
-        elif seguimiento.id_animal_id:
-            # Modo A: un solo animal ya existente o recién vinculado
+        # 3. Vincular los animales creados a la tabla VisitaAnimal
+        for animal in lista_animales_creados:
+            VisitaAnimal.objects.create(
+                id_animal=animal,
+                id_seguimiento=seguimiento,
+            )
+            
+        if not lista_animales_creados and seguimiento.id_animal_id:
             VisitaAnimal.objects.create(
                 id_animal_id=seguimiento.id_animal_id,
                 id_seguimiento=seguimiento,
@@ -413,7 +636,6 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             nombre = func_data.get('nombre', '')
             cargo = func_data.get('cargo', '')
 
-            # Si es usuario del sistema, completar nombre/cargo desde el perfil
             if id_usuario_obj and not nombre:
                 func_data['nombre'] = f"{id_usuario_obj.nombre} {id_usuario_obj.apellido}".strip()
             if id_usuario_obj and not cargo:
@@ -425,12 +647,30 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 **func_data,
             )
 
+        # 5. Guardar fotos de la visita
+        lista_fotos = []
+        if fotos_input:
+            lista_fotos.extend(fotos_input)
+        if foto_input and foto_input not in lista_fotos:
+            lista_fotos.insert(0, foto_input)
+
+        for idx, f_item in enumerate(lista_fotos, start=1):
+            url_cloud = subir_o_asegurar_cloudinary(f_item)
+            if url_cloud:
+                EvidenciaPeticiones.objects.create(
+                    id_peticion=seguimiento.id_peticion,
+                    ruta_archivo=url_cloud,
+                    descripcion=f"Acta de visita #{seguimiento.id_seguimiento} - Foto #{idx}"
+                )
+
         return seguimiento
 
     @transaction.atomic
     def update(self, instance, validated_data):
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
         funcionarios_data = validated_data.pop('funcionarios', None)
+        fotos_input = validated_data.pop('fotos', None)
+        foto_input = validated_data.pop('foto', None)
         validated_data.pop('animales', None)  # No se reemplaza la lista de animales por PATCH
 
         # Actualizar o crear ubicación de la visita
@@ -465,6 +705,28 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                     **func_data,
                 )
 
+        # Registrar fotos adicionales si se envían
+        if fotos_input is not None or foto_input is not None:
+            lista_fotos = []
+            if fotos_input:
+                lista_fotos.extend(fotos_input)
+            if foto_input and foto_input not in lista_fotos:
+                lista_fotos.insert(0, foto_input)
+
+            if lista_fotos:
+                conteo_previo = EvidenciaPeticiones.objects.filter(
+                    id_peticion=instance.id_peticion,
+                    descripcion__startswith=f"Acta de visita #{instance.id_seguimiento}"
+                ).count()
+                for idx, f_item in enumerate(lista_fotos, start=conteo_previo + 1):
+                    url_cloud = subir_o_asegurar_cloudinary(f_item)
+                    if url_cloud:
+                        EvidenciaPeticiones.objects.create(
+                            id_peticion=instance.id_peticion,
+                            ruta_archivo=url_cloud,
+                            descripcion=f"Acta de visita #{instance.id_seguimiento} - Foto #{idx}"
+                        )
+
         return instance
 
 
@@ -482,12 +744,19 @@ class VisitaAnimalListSerializer(serializers.ModelSerializer):
         source='id_animal.peso', max_digits=5, decimal_places=2,
         read_only=True, allow_null=True,
     )
+    caracteristicas = serializers.CharField(
+        source='id_animal.caracteristicas', read_only=True, default='', allow_null=True
+    )
+    descripcion_paciente = serializers.CharField(
+        source='id_animal.caracteristicas', read_only=True, default='', allow_null=True
+    )
 
     class Meta:
         model = VisitaAnimal
         fields = [
             'id_visita',
             'id_animal', 'nombre', 'sexo', 'color', 'peso',
+            'caracteristicas', 'descripcion_paciente',
             'fecha', 'nro_radicado_atencion',
             'quien_reporta', 'lugar_atencion_direccion',
             'nombre_notificado', 'documento_notificado', 'fecha_notificacion',
@@ -515,6 +784,10 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     total_funcionarios = serializers.SerializerMethodField()
     animales = serializers.SerializerMethodField()
     total_animales = serializers.SerializerMethodField()
+    descripcion_paciente = serializers.SerializerMethodField()
+    foto = serializers.SerializerMethodField()
+    fotos = serializers.SerializerMethodField()
+    total_fotos = serializers.SerializerMethodField()
 
     class Meta:
         model = SeguimientoPeticionesVisita
@@ -531,6 +804,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'nro_animales_atendidos', 'total_animales', 'animales',
             'nombre_paciente', 'paciente_especie', 'paciente_sexo',
             'paciente_raza', 'paciente_color', 'paciente_edad', 'peso_paciente',
+            'descripcion_paciente', 'esterilizacion_paciente', 'desparasitacion',
             'anamnesis_descripcion_queja', 'tratamiento_realizado',
             'compromisos', 'plazo_dias_cumplimiento',
             'lugar_atencion',
@@ -538,9 +812,33 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'funcionarios', 'total_funcionarios',
             'notificado_nombre', 'notificaciones_identificacion', 'fecha_notificacion',
             'notificador_nombre', 'notificador_cargo',
+            'foto', 'fotos', 'total_fotos',
             'observacion',
         ]
         read_only_fields = fields
+
+    def get_descripcion_paciente(self, obj):
+        if obj.descripcion_paciente:
+            return obj.descripcion_paciente
+        animal = getattr(obj, 'id_animal', None)
+        if animal and getattr(animal, 'caracteristicas', None):
+            return animal.caracteristicas
+        return ''
+
+    def _get_fotos_list(self, obj):
+        if not hasattr(obj, '_fotos_cache'):
+            obj._fotos_cache = obtener_fotos_acta_con_fallback(obj)
+        return obj._fotos_cache
+
+    def get_fotos(self, obj):
+        return self._get_fotos_list(obj)
+
+    def get_foto(self, obj):
+        fotos = self._get_fotos_list(obj)
+        return fotos[0] if fotos else None
+
+    def get_total_fotos(self, obj):
+        return len(self._get_fotos_list(obj))
 
     def get_veterinario_nombre(self, obj):
         vet = getattr(obj, 'id_veterinario', None)

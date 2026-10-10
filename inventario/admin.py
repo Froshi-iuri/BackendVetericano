@@ -21,7 +21,7 @@ class SalidasAdmin(admin.ModelAdmin):
 
 @admin.register(DetalleCompra)
 class DetalleCompraAdmin(admin.ModelAdmin):
-    list_display = ('id_detalle_compra', 'id_compra', 'id_medicamento', 'cantidad', 'precio_unitario')
+    list_display = ('id_detalle_compra', 'id_compra', 'id_medicamento', 'cantidad')
 
 
 @admin.register(DetalleSalida)
