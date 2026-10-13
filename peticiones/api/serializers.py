@@ -484,13 +484,13 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     )
 
     # Funcionarios (varios)
-    funcionarios = SeguimientoVisitaFuncionariosSerializer(many=True, required=False, write_only=True)
+    funcionarios = SeguimientoVisitaFuncionariosSerializer(many=True, required=False, allow_null=True, write_only=True)
     funcionarios_detalle = SeguimientoVisitaFuncionariosSerializer(
         many=True, read_only=True, source='funcionarios'
     )
 
     # Animales (modo B: varios detallados)
-    animales = AnimalRapidoSerializer(many=True, required=False, write_only=True)
+    animales = AnimalRapidoSerializer(many=True, required=False, allow_null=True, write_only=True)
 
     # Multimedia del acta de visita (fotos y videos, subidas o URLs de Cloudinary)
     foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -498,6 +498,7 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         child=serializers.CharField(),
         required=False,
         allow_empty=True,
+        allow_null=True,
         write_only=True
     )
     video = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -505,11 +506,13 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         child=serializers.CharField(),
         required=False,
         allow_empty=True,
+        allow_null=True,
         write_only=True
     )
     multimedia = serializers.ListField(
         required=False,
         allow_empty=True,
+        allow_null=True,
         write_only=True
     )
     evidencias_detalle = EvidenciaSeguimientoVisitaSerializer(
@@ -598,13 +601,13 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
-        funcionarios_data = validated_data.pop('funcionarios', [])
-        animales_data = validated_data.pop('animales', [])
-        fotos_input = validated_data.pop('fotos', [])
+        funcionarios_data = validated_data.pop('funcionarios', []) or []
+        animales_data = validated_data.pop('animales', []) or []
+        fotos_input = validated_data.pop('fotos', []) or []
         foto_input = validated_data.pop('foto', None)
-        videos_input = validated_data.pop('videos', [])
+        videos_input = validated_data.pop('videos', []) or []
         video_input = validated_data.pop('video', None)
-        multimedia_input = validated_data.pop('multimedia', [])
+        multimedia_input = validated_data.pop('multimedia', []) or []
 
         # 1. Crear/actualizar ubicación del lugar de atención
         if lugar_atencion_data:
