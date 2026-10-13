@@ -64,6 +64,75 @@ from animales.models import Animal, Responsables, AnimalResponsable
 from especies.models import Especie, Raza
 from datetime import datetime
 
+
+# ---------------------------------------------------------------------------
+# Descuento de inventario desde consultas clínicas
+# Replica la misma lógica de lotes/FIFO de inventario.api.DetalleSalidaSerializer
+# sin modificar el módulo de inventario.
+# ---------------------------------------------------------------------------
+def _filtro_lotes_medicamento(id_medicamento):
+    from django.db.models import Q
+    from inventario.models import Inventarios
+    return Inventarios.objects.filter(
+        Q(id_detalle_compra__id_medicamento_id=id_medicamento) |
+        Q(id_detalle_salida__id_administracion__id_medicamento_id=id_medicamento),
+        cantidad_actual__gt=0
+    )
+
+
+def _stock_disponible(id_medicamento):
+    from django.db.models import Sum
+    return _filtro_lotes_medicamento(id_medicamento).aggregate(
+        total=Sum('cantidad_actual')
+    )['total'] or 0
+
+
+def _parse_cantidad_usada(valor):
+    """Devuelve un entero >= 0 o lanza ValueError si el valor no es un entero válido."""
+    if valor in (None, ''):
+        return 0
+    if isinstance(valor, bool):
+        raise ValueError
+    numero = float(valor)
+    if numero < 0 or not numero.is_integer():
+        raise ValueError
+    return int(numero)
+
+
+def _debe_descontar(item):
+    """Solo descuenta si trae id_medicamento, cantidad_usada > 0 y no se marcó descontar_inventario=false."""
+    if item.get('descontar_inventario') is False:
+        return False
+    return bool(item.get('id_medicamento')) and item.get('_cantidad_usada', 0) > 0
+
+
+def _descontar_fifo(id_medicamento, cantidad):
+    """Descuenta `cantidad` de los lotes más antiguos. Debe ejecutarse dentro de transaction.atomic."""
+    from inventario.models import Inventarios
+    ids_lotes = list(_filtro_lotes_medicamento(id_medicamento).values_list('id_inventario', flat=True))
+    # Bloqueo de filas para evitar descuentos concurrentes sobre el mismo lote
+    lotes = list(
+        Inventarios.objects.select_for_update()
+        .filter(pk__in=ids_lotes, cantidad_actual__gt=0)
+        .order_by('id_inventario')
+    )
+    total = sum(lote.cantidad_actual for lote in lotes)
+    if cantidad > total:
+        return False, total
+
+    por_descontar = cantidad
+    for lote in lotes:
+        if por_descontar <= 0:
+            break
+        if lote.cantidad_actual >= por_descontar:
+            lote.cantidad_actual -= por_descontar
+            por_descontar = 0
+        else:
+            por_descontar -= lote.cantidad_actual
+            lote.cantidad_actual = 0
+        lote.save(update_fields=['cantidad_actual'])
+    return True, total
+
 class ExpedienteCompletoSerializer(serializers.Serializer):
     id_animal = serializers.IntegerField(required=False, allow_null=True)
     animal = serializers.JSONField(required=False, allow_null=True)
@@ -94,7 +163,70 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
                 "motivoConsulta": "El motivo de la consulta es obligatorio para registrar la atención médica."
             })
 
+        self._validar_medicamentos_tratamientos(attrs)
+
         return attrs
+
+    def _validar_medicamentos_tratamientos(self, attrs):
+        """
+        Valida los tratamientos que traen id_medicamento / cantidad_usada.
+        Los tratamientos solo-texto (flujo actual) no se validan ni descuentan.
+        """
+        from medicamentos.models import Medicamentos
+
+        hoja2 = attrs.get('hoja2') or {}
+        tratamientos = hoja2.get('tratamientos') if isinstance(hoja2, dict) else None
+        if not isinstance(tratamientos, list):
+            return
+
+        errores = []
+        solicitados = {}  # id_medicamento -> cantidad total a descontar
+
+        for idx, item in enumerate(tratamientos, start=1):
+            if not isinstance(item, dict):
+                continue
+            id_med = item.get('id_medicamento')
+
+            try:
+                item['_cantidad_usada'] = _parse_cantidad_usada(item.get('cantidad_usada'))
+            except (ValueError, TypeError):
+                errores.append(f"Tratamiento #{idx}: 'cantidad_usada' debe ser un número entero mayor o igual a 0.")
+                continue
+
+            if item.get('descontar_inventario') is True:
+                if not id_med:
+                    errores.append(f"Tratamiento #{idx}: para descontar inventario se requiere 'id_medicamento'.")
+                    continue
+                if item['_cantidad_usada'] <= 0:
+                    errores.append(f"Tratamiento #{idx}: para descontar inventario 'cantidad_usada' debe ser mayor a 0.")
+                    continue
+
+            if id_med:
+                try:
+                    id_med = int(id_med)
+                except (ValueError, TypeError):
+                    errores.append(f"Tratamiento #{idx}: 'id_medicamento' inválido.")
+                    continue
+                item['id_medicamento'] = id_med
+                if not Medicamentos.objects.filter(pk=id_med).exists():
+                    errores.append(f"Tratamiento #{idx}: el medicamento con id {id_med} no existe.")
+                    continue
+
+            if _debe_descontar(item):
+                solicitados[id_med] = solicitados.get(id_med, 0) + item['_cantidad_usada']
+
+        # Validación de stock (sumando si el mismo medicamento viene en varias líneas)
+        for id_med, cantidad in solicitados.items():
+            disponible = _stock_disponible(id_med)
+            if cantidad > disponible:
+                med = Medicamentos.objects.filter(pk=id_med).first()
+                nombre = med.nombre if med else id_med
+                errores.append(
+                    f"Stock insuficiente para '{nombre}'. Disponibles: {disponible}, solicitados: {cantidad}."
+                )
+
+        if errores:
+            raise serializers.ValidationError({"tratamientos": errores})
 
     def create(self, validated_data):
         with transaction.atomic():
@@ -303,22 +435,87 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
 
             # 7. Tratamientos
             tratamientos_list = hoja2_data.get('tratamientos', [])
-            if tratamientos_list:
-                Tratamientos.objects.bulk_create([
-                    Tratamientos(
-                        id_consulta=consulta,
-                        producto_base=t.get('productoBase', ''),
-                        dosis_basica=t.get('dosisBasica', ''),
-                        presentacion=t.get('presentacion', ''),
-                        via_administracion=t.get('via', ''),
-                        frecuencia_duracion=t.get('frecuenciaDuracion', '')
-                    ) for t in tratamientos_list
-                ])
+            medicamentos_descontados = []
+
+            def _nuevo_tratamiento(t):
+                return Tratamientos(
+                    id_consulta=consulta,
+                    producto_base=t.get('productoBase', ''),
+                    dosis_basica=t.get('dosisBasica', ''),
+                    presentacion=t.get('presentacion', ''),
+                    via_administracion=t.get('via', ''),
+                    frecuencia_duracion=t.get('frecuenciaDuracion', '')
+                )
+
+            vinculados = [t for t in tratamientos_list if isinstance(t, dict) and t.get('id_medicamento')]
+
+            if tratamientos_list and not vinculados:
+                # Flujo original: tratamientos solo texto, no se toca inventario
+                Tratamientos.objects.bulk_create([_nuevo_tratamiento(t) for t in tratamientos_list])
+
+            elif tratamientos_list:
+                from django.utils import timezone
+                from medicamentos.models import TratamientoMedicamentos
+                from inventario.models import Salidas
+
+                ahora = timezone.now()
+                if timezone.is_aware(ahora):
+                    ahora = timezone.localtime(ahora)
+
+                responsable = ""
+                user = getattr(request, 'user', None) if request else None
+                if user is not None and getattr(user, 'is_authenticated', False):
+                    responsable = " ".join(
+                        p for p in [getattr(user, 'nombre', ''), getattr(user, 'apellido', '')] if p
+                    ).strip() or veterinario_nombre
+
+                for t in tratamientos_list:
+                    tratamiento = _nuevo_tratamiento(t)
+                    tratamiento.save()
+
+                    id_med = t.get('id_medicamento')
+                    if not id_med:
+                        continue
+
+                    descontar = _debe_descontar(t)
+                    TratamientoMedicamentos.objects.create(
+                        id_tratamiento=tratamiento,
+                        id_medicamento_id=id_med,
+                        dosis=t.get('dosisBasica', ''),
+                        via=t.get('via', ''),
+                        fecha_aplicacion=ahora.date() if descontar else None,
+                        hora_administrada=ahora.time() if descontar else None,
+                        responsable_admin=responsable or None,
+                    )
+
+                    if descontar:
+                        cantidad = t['_cantidad_usada']
+                        ok, disponible = _descontar_fifo(id_med, cantidad)
+                        if not ok:
+                            # Puede ocurrir si otro usuario consumió stock entre la validación y el guardado.
+                            # Al lanzar la excepción la transacción completa se revierte.
+                            raise serializers.ValidationError({
+                                "tratamientos": [
+                                    f"Stock insuficiente para el medicamento {id_med}. "
+                                    f"Disponibles: {disponible}, solicitados: {cantidad}."
+                                ]
+                            })
+                        medicamentos_descontados.append({
+                            "id_medicamento": id_med,
+                            "cantidad": cantidad,
+                            "estado": "Descontado correctamente"
+                        })
+
+                if medicamentos_descontados:
+                    Salidas.objects.create(
+                        motivo=f"Uso en Consulta #{consulta.id_consulta} - Animal #{animal_obj.id_animal}"[:100]
+                    )
 
         return {
             'status': 'success',
             'id_animal': animal_obj.id_animal,
             'historia_id': historia.id_historia,
             'consulta_id': consulta.id_consulta,
-            'numero_historia': historia.numero_historia or f"HC-{animal_obj.id_animal}"
+            'numero_historia': historia.numero_historia or f"HC-{animal_obj.id_animal}",
+            'medicamentos_descontados': medicamentos_descontados
         }
