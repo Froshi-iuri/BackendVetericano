@@ -76,6 +76,26 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
     hoja3 = serializers.JSONField(required=False, allow_null=True)
     rescate = serializers.JSONField(required=False, allow_null=True)
 
+    def validate(self, attrs):
+        id_animal = attrs.get('id_animal')
+        animal_data = attrs.get('animal') or {}
+        motivo = attrs.get('motivoConsulta')
+
+        tiene_id_animal = bool(id_animal or (isinstance(animal_data, dict) and (animal_data.get('id_animal') or animal_data.get('id'))))
+        tiene_nombre_animal = bool(isinstance(animal_data, dict) and str(animal_data.get('nombre', '')).strip())
+
+        if not tiene_id_animal and not tiene_nombre_animal:
+            raise serializers.ValidationError({
+                "animal": "Debe especificar el id_animal existente o ingresar al menos el nombre del animal a registrar."
+            })
+
+        if not motivo or not str(motivo).strip():
+            raise serializers.ValidationError({
+                "motivoConsulta": "El motivo de la consulta es obligatorio para registrar la atención médica."
+            })
+
+        return attrs
+
     def create(self, validated_data):
         with transaction.atomic():
             animal_data = validated_data.get('animal') or {}
@@ -151,7 +171,7 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
                         tipo_responsabilidad='Tenedor'
                     )
 
-            # 4. Historia Clínica
+            # 4. Historia Clínica (Unicidad garantizada: 1 animal = 1 historia)
             def parse_date(date_str):
                 if not date_str: return None
                 try:
@@ -217,6 +237,18 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
                 except:
                     return None
 
+            request = self.context.get('request')
+            veterinario_nombre = ""
+            if request and hasattr(request, 'user') and request.user.is_authenticated:
+                veterinario_nombre = getattr(request.user, 'nombre', '') or getattr(request.user, 'username', '')
+
+            funcionario_cba = hoja3_data.get('funcionarioRecibeCBA') or veterinario_nombre
+
+            if veterinario_nombre:
+                if not isinstance(organos_data, dict):
+                    organos_data = {}
+                organos_data['_veterinario_responsable'] = veterinario_nombre
+
             consulta = Consulta.objects.create(
                 id_historia=historia,
                 motivo_consulta=validated_data.get('motivoConsulta', ''),
@@ -239,19 +271,35 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
                 ingresa_cba=True if hoja3_data.get('ingresaCBA') == 'SI' else False,
                 motivo_ingreso_cba=hoja3_data.get('motivoIngresoNoIngreso', ''),
                 canil_asignado=hoja3_data.get('canilAsignado', ''),
-                funcionario_recibe_cba=hoja3_data.get('funcionarioRecibeCBA', '')
+                funcionario_recibe_cba=funcionario_cba
             )
 
-            # 6. Diagnóstico
+            # 6. Diagnóstico y Catálogo de Patologías
             problemas = hoja2_data.get('listaProblemas', [])
             diag_final = hoja2_data.get('diagnosticoFinal', '')
             if problemas or diag_final:
-                Diagnostico.objects.create(
+                diag_obj = Diagnostico.objects.create(
                     id_consulta=consulta,
                     lista_problemas="; ".join(problemas) if isinstance(problemas, list) else str(problemas),
                     descripcion=diag_final,
                     tipo_diagnostico='Final'
                 )
+
+                id_patologia = hoja2_data.get('idPatologia')
+                patologia_obj = None
+                from patologias.models import Patologia
+                if id_patologia:
+                    patologia_obj = Patologia.objects.filter(pk=id_patologia).first()
+                elif diag_final:
+                    patologia_obj = Patologia.objects.filter(nombre__iexact=str(diag_final).strip()).first()
+
+                if patologia_obj:
+                    from clinica.models import DiagnosticoPatologia
+                    DiagnosticoPatologia.objects.create(
+                        id_diagnostico=diag_obj,
+                        id_patologia=patologia_obj,
+                        hallazgos_pruebas=hoja2_data.get('descripcionHallazgos', '')
+                    )
 
             # 7. Tratamientos
             tratamientos_list = hoja2_data.get('tratamientos', [])
@@ -272,5 +320,5 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
             'id_animal': animal_obj.id_animal,
             'historia_id': historia.id_historia,
             'consulta_id': consulta.id_consulta,
-            'numero_historia': historia.numero_historia or ''
+            'numero_historia': historia.numero_historia or f"HC-{animal_obj.id_animal}"
         }
