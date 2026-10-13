@@ -84,11 +84,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'identificacion',
             'nombre',
             'apellido',
-<<<<<<< HEAD
-            'telefono',   # <-- AÑADIDO: Es necesario para que lo puedan ver y editar
-=======
             'telefono',
->>>>>>> a817b6c775956ac2feaa6f5e0ac51626f138889f
             'id_rol',
             'nombre_rol',
             'activo',

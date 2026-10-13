@@ -8,6 +8,7 @@ from .models import (
     SeguimientoPeticionesVisita,
     VisitaAnimal,
     SeguimientoVisitaFuncionarios,
+    EvidenciaSeguimientoVisita,
 )
 
 
@@ -57,4 +58,12 @@ class SeguimientoVisitaFuncionariosAdmin(admin.ModelAdmin):
     list_display = ('id', 'id_seguimiento', 'nombre', 'cargo', 'es_externo', 'es_principal')
     list_filter = ('es_externo', 'es_principal')
     search_fields = ('nombre', 'cargo', 'institucion')
+
+
+@admin.register(EvidenciaSeguimientoVisita)
+class EvidenciaSeguimientoVisitaAdmin(admin.ModelAdmin):
+    list_display = ('id_evidencia', 'id_seguimiento', 'tipo_archivo', 'descripcion', 'fecha')
+    list_filter = ('tipo_archivo', 'fecha')
+    search_fields = ('descripcion', 'ruta_archivo')
+
 
