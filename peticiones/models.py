@@ -201,3 +201,29 @@ class SeguimientoVisitaFuncionarios(models.Model):
 
     def __str__(self):
         return f"{self.nombre} ({self.cargo}) - Seguimiento #{self.id_seguimiento_id}"
+
+
+class EvidenciaSeguimientoVisita(models.Model):
+    """
+    Evidencias multimedia (fotos y videos) recolectadas durante la visita de campo
+    del acta de seres sintientes.
+    """
+    id_evidencia = models.AutoField(primary_key=True)
+    id_seguimiento = models.ForeignKey(
+        SeguimientoPeticionesVisita,
+        models.CASCADE,
+        db_column='id_seguimiento',
+        related_name='evidencias'
+    )
+    ruta_archivo = models.CharField(max_length=500)
+    tipo_archivo = models.CharField(max_length=20, default='imagen', blank=True, null=True)  # 'imagen', 'video'
+    descripcion = models.CharField(max_length=255, blank=True, null=True)
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = 'evidencia_seguimiento_visita'
+
+    def __str__(self):
+        return f"Evidencia #{self.id_evidencia} (Visita #{self.id_seguimiento_id}) - {self.tipo_archivo}"
+

@@ -4,8 +4,15 @@ from peticiones.models import (
     TipoPeticion, Peticiones, Ubicaciones,
     SeguimientoPeticionesVisita, VisitaAnimal,
     SeguimientoVisitaFuncionarios, EvidenciaPeticiones,
+    EvidenciaSeguimientoVisita,
 )
-from peticiones.utils import subir_o_asegurar_cloudinary, obtener_fotos_acta_con_fallback
+from peticiones.utils import (
+    subir_o_asegurar_cloudinary,
+    obtener_fotos_acta_con_fallback,
+    obtener_videos_acta,
+    obtener_multimedia_acta,
+    detectar_tipo_archivo,
+)
 from animales.models import Animal, Responsables
 
 
@@ -375,6 +382,85 @@ class AnimalRapidoSerializer(serializers.Serializer):
         return animal
 
 
+class EvidenciaSeguimientoVisitaSerializer(serializers.ModelSerializer):
+    """
+    Serializer para evidencias multimedia (fotos y videos) del acta de visita de campo.
+    """
+    class Meta:
+        model = EvidenciaSeguimientoVisita
+        fields = ['id_evidencia', 'id_seguimiento', 'ruta_archivo', 'tipo_archivo', 'descripcion', 'fecha']
+        read_only_fields = ['id_evidencia', 'fecha']
+
+
+def _guardar_evidencias_seguimiento(seguimiento, fotos_input=None, foto_input=None,
+                                    videos_input=None, video_input=None,
+                                    multimedia_input=None):
+    """
+    Procesa y almacena fotos y videos del acta en la tabla dedicada EvidenciaSeguimientoVisita.
+    """
+    conteo_previo = EvidenciaSeguimientoVisita.objects.filter(id_seguimiento=seguimiento).count()
+
+    # 1. Fotos
+    lista_fotos = []
+    if fotos_input:
+        lista_fotos.extend(fotos_input)
+    if foto_input and foto_input not in lista_fotos:
+        lista_fotos.insert(0, foto_input)
+
+    for idx, f_item in enumerate(lista_fotos, start=conteo_previo + 1):
+        url_cloud = subir_o_asegurar_cloudinary(f_item)
+        if url_cloud:
+            tipo = detectar_tipo_archivo(url_cloud)
+            EvidenciaSeguimientoVisita.objects.create(
+                id_seguimiento=seguimiento,
+                ruta_archivo=url_cloud,
+                tipo_archivo=tipo,
+                descripcion=f"Acta de visita #{seguimiento.id_seguimiento} - Foto #{idx}"
+            )
+
+    # 2. Videos
+    lista_videos = []
+    if videos_input:
+        lista_videos.extend(videos_input)
+    if video_input and video_input not in lista_videos:
+        lista_videos.insert(0, video_input)
+
+    conteo_videos_prev = EvidenciaSeguimientoVisita.objects.filter(
+        id_seguimiento=seguimiento, tipo_archivo='video'
+    ).count()
+
+    for idx, v_item in enumerate(lista_videos, start=conteo_videos_prev + 1):
+        url_cloud = subir_o_asegurar_cloudinary(v_item)
+        if url_cloud:
+            EvidenciaSeguimientoVisita.objects.create(
+                id_seguimiento=seguimiento,
+                ruta_archivo=url_cloud,
+                tipo_archivo='video',
+                descripcion=f"Acta de visita #{seguimiento.id_seguimiento} - Video #{idx}"
+            )
+
+    # 3. Multimedia genérica (dict o str)
+    if multimedia_input:
+        for idx, m_item in enumerate(multimedia_input, start=1):
+            if isinstance(m_item, dict):
+                ruta = m_item.get('ruta_archivo') or m_item.get('url') or m_item.get('file')
+                tipo = m_item.get('tipo_archivo') or m_item.get('tipo') or detectar_tipo_archivo(ruta)
+                desc = m_item.get('descripcion') or f"Acta de visita #{seguimiento.id_seguimiento} - {tipo.capitalize()} #{idx}"
+            else:
+                ruta = m_item
+                tipo = detectar_tipo_archivo(ruta)
+                desc = f"Acta de visita #{seguimiento.id_seguimiento} - {tipo.capitalize()} #{idx}"
+
+            url_cloud = subir_o_asegurar_cloudinary(ruta)
+            if url_cloud:
+                EvidenciaSeguimientoVisita.objects.create(
+                    id_seguimiento=seguimiento,
+                    ruta_archivo=url_cloud,
+                    tipo_archivo=tipo,
+                    descripcion=desc
+                )
+
+
 class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     """
     Serializer principal del acta de visita de campo.
@@ -406,13 +492,28 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     # Animales (modo B: varios detallados)
     animales = AnimalRapidoSerializer(many=True, required=False, write_only=True)
 
-    # Fotos del acta de visita (una o varias, subidas a Cloudinary)
+    # Multimedia del acta de visita (fotos y videos, subidas o URLs de Cloudinary)
     foto = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     fotos = serializers.ListField(
         child=serializers.CharField(),
         required=False,
         allow_empty=True,
         write_only=True
+    )
+    video = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    videos = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
+    multimedia = serializers.ListField(
+        required=False,
+        allow_empty=True,
+        write_only=True
+    )
+    evidencias_detalle = EvidenciaSeguimientoVisitaSerializer(
+        many=True, read_only=True, source='evidencias'
     )
 
     class Meta:
@@ -457,14 +558,14 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'notificador_nombre', 'notificador_identificacion', 'notificador_cargo',
             # Firmas
             'firma_notificador', 'firma_notificado',
-            # Fotos del acta
-            'foto', 'fotos',
+            # Multimedia del acta (fotos, videos y estructura completa)
+            'foto', 'fotos', 'video', 'videos', 'multimedia', 'evidencias_detalle',
             # Observaciones generales
             'observacion',
             # Fecha de registro automática
             'fecha',
         ]
-        read_only_fields = ['id_seguimiento', 'fecha', 'lugar_atencion_detalle', 'funcionarios_detalle']
+        read_only_fields = ['id_seguimiento', 'fecha', 'lugar_atencion_detalle', 'funcionarios_detalle', 'evidencias_detalle']
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -485,10 +586,13 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             )
             data['animales'] = VisitaAnimalListSerializer(visitas, many=True).data
 
-        fotos = obtener_fotos_acta_con_fallback(instance)
-        data['fotos'] = fotos
-        data['foto'] = fotos[0] if fotos else None
-        data['total_fotos'] = len(fotos)
+        mm_data = obtener_multimedia_acta(instance)
+        data['fotos'] = mm_data['fotos']
+        data['foto'] = mm_data['foto']
+        data['total_fotos'] = mm_data['total_fotos']
+        data['videos'] = mm_data['videos']
+        data['total_videos'] = mm_data['total_videos']
+        data['multimedia'] = mm_data['multimedia']
         return data
 
     @transaction.atomic
@@ -498,6 +602,9 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         animales_data = validated_data.pop('animales', [])
         fotos_input = validated_data.pop('fotos', [])
         foto_input = validated_data.pop('foto', None)
+        videos_input = validated_data.pop('videos', [])
+        video_input = validated_data.pop('video', None)
+        multimedia_input = validated_data.pop('multimedia', [])
 
         # 1. Crear/actualizar ubicación del lugar de atención
         if lugar_atencion_data:
@@ -647,21 +754,15 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 **func_data,
             )
 
-        # 5. Guardar fotos de la visita
-        lista_fotos = []
-        if fotos_input:
-            lista_fotos.extend(fotos_input)
-        if foto_input and foto_input not in lista_fotos:
-            lista_fotos.insert(0, foto_input)
-
-        for idx, f_item in enumerate(lista_fotos, start=1):
-            url_cloud = subir_o_asegurar_cloudinary(f_item)
-            if url_cloud:
-                EvidenciaPeticiones.objects.create(
-                    id_peticion=seguimiento.id_peticion,
-                    ruta_archivo=url_cloud,
-                    descripcion=f"Acta de visita #{seguimiento.id_seguimiento} - Foto #{idx}"
-                )
+        # 5. Guardar evidencias multimedia (fotos y videos) en EvidenciaSeguimientoVisita
+        _guardar_evidencias_seguimiento(
+            seguimiento,
+            fotos_input=fotos_input,
+            foto_input=foto_input,
+            videos_input=videos_input,
+            video_input=video_input,
+            multimedia_input=multimedia_input,
+        )
 
         return seguimiento
 
@@ -671,6 +772,9 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         funcionarios_data = validated_data.pop('funcionarios', None)
         fotos_input = validated_data.pop('fotos', None)
         foto_input = validated_data.pop('foto', None)
+        videos_input = validated_data.pop('videos', None)
+        video_input = validated_data.pop('video', None)
+        multimedia_input = validated_data.pop('multimedia', None)
         validated_data.pop('animales', None)  # No se reemplaza la lista de animales por PATCH
 
         # Actualizar o crear ubicación de la visita
@@ -705,27 +809,16 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                     **func_data,
                 )
 
-        # Registrar fotos adicionales si se envían
-        if fotos_input is not None or foto_input is not None:
-            lista_fotos = []
-            if fotos_input:
-                lista_fotos.extend(fotos_input)
-            if foto_input and foto_input not in lista_fotos:
-                lista_fotos.insert(0, foto_input)
-
-            if lista_fotos:
-                conteo_previo = EvidenciaPeticiones.objects.filter(
-                    id_peticion=instance.id_peticion,
-                    descripcion__startswith=f"Acta de visita #{instance.id_seguimiento}"
-                ).count()
-                for idx, f_item in enumerate(lista_fotos, start=conteo_previo + 1):
-                    url_cloud = subir_o_asegurar_cloudinary(f_item)
-                    if url_cloud:
-                        EvidenciaPeticiones.objects.create(
-                            id_peticion=instance.id_peticion,
-                            ruta_archivo=url_cloud,
-                            descripcion=f"Acta de visita #{instance.id_seguimiento} - Foto #{idx}"
-                        )
+        # Registrar evidencias multimedia adicionales si se envían
+        if any(x is not None for x in (fotos_input, foto_input, videos_input, video_input, multimedia_input)):
+            _guardar_evidencias_seguimiento(
+                instance,
+                fotos_input=fotos_input,
+                foto_input=foto_input,
+                videos_input=videos_input,
+                video_input=video_input,
+                multimedia_input=multimedia_input,
+            )
 
         return instance
 
@@ -788,6 +881,9 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     foto = serializers.SerializerMethodField()
     fotos = serializers.SerializerMethodField()
     total_fotos = serializers.SerializerMethodField()
+    videos = serializers.SerializerMethodField()
+    total_videos = serializers.SerializerMethodField()
+    multimedia = serializers.SerializerMethodField()
 
     class Meta:
         model = SeguimientoPeticionesVisita
@@ -813,6 +909,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'notificado_nombre', 'notificaciones_identificacion', 'fecha_notificacion',
             'notificador_nombre', 'notificador_cargo',
             'foto', 'fotos', 'total_fotos',
+            'videos', 'total_videos', 'multimedia',
             'observacion',
         ]
         read_only_fields = fields
@@ -839,6 +936,27 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
 
     def get_total_fotos(self, obj):
         return len(self._get_fotos_list(obj))
+
+    def _get_videos_list(self, obj):
+        if not hasattr(obj, '_videos_cache'):
+            obj._videos_cache = obtener_videos_acta(obj)
+        return obj._videos_cache
+
+    def get_videos(self, obj):
+        return self._get_videos_list(obj)
+
+    def get_total_videos(self, obj):
+        return len(self._get_videos_list(obj))
+
+    def get_multimedia(self, obj):
+        fotos = self._get_fotos_list(obj)
+        videos = self._get_videos_list(obj)
+        mm = []
+        for f in fotos:
+            mm.append({'url': f, 'tipo': 'imagen'})
+        for v in videos:
+            mm.append({'url': v, 'tipo': 'video'})
+        return mm
 
     def get_veterinario_nombre(self, obj):
         vet = getattr(obj, 'id_veterinario', None)
