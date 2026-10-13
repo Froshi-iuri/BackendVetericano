@@ -22,16 +22,36 @@ from .serializers import (
 )
 
 
+from animales.models import Animal
+
+
 class HistoriaClinicaViewSet(viewsets.ModelViewSet):
     queryset = HistoriaClinica.objects.all()
     serializer_class = HistoriaClinicaSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        id_animal = self.request.query_params.get('id_animal')
+        if id_animal:
+            queryset = queryset.filter(id_animal_id=id_animal)
+        return queryset
 
 
 class ConsultaViewSet(viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset().order_by('-fecha_hora')
+        id_animal = self.request.query_params.get('id_animal')
+        if id_animal:
+            queryset = queryset.filter(id_historia__id_animal_id=id_animal)
+        id_historia = self.request.query_params.get('id_historia')
+        if id_historia:
+            queryset = queryset.filter(id_historia_id=id_historia)
+        return queryset
 
 
 class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
@@ -126,6 +146,7 @@ class ExpedienteCompletoAPIView(APIView):
         animal_data = {}
         if animal:
             animal_data = {
+                "id_animal": animal.id_animal,
                 "especie": animal.id_raza.id_especie.nombre if (animal.id_raza and animal.id_raza.id_especie) else "Desconocida",
                 "raza": animal.id_raza.nombre if animal.id_raza else "Mestizo",
                 "nombre": animal.nombre or "",
@@ -220,3 +241,120 @@ class ExpedienteCompletoAPIView(APIView):
             result = serializer.save()
             return Response(result, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ExpedientePorAnimalAPIView(APIView):
+    """
+    GET /api/clinica/expediente-por-animal/<int:id_animal>/
+    Obtiene los antecedentes y expediente médico consolidado de un animal dado su ID.
+    Si ya tiene historia, retorna sus datos anamnésicos y consultas previas ordenadas por fecha.
+    Si no tiene historia, retorna los datos conocidos del animal y del tenedor listos para precargar.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        operation_description="Obtiene el expediente médico consolidado y antecedentes de un animal por su id_animal.",
+        responses={200: openapi.Response('Expediente y antecedentes del animal')}
+    )
+    def get(self, request, id_animal, *args, **kwargs):
+        from django.shortcuts import get_object_or_404
+
+        animal = get_object_or_404(
+            Animal.objects.select_related('id_raza', 'id_raza__id_especie').prefetch_related(
+                'animalresponsable_set__id_responsable'
+            ),
+            pk=id_animal
+        )
+
+        # Tenedor / Responsable
+        tenedor_data = {}
+        relacion = animal.animalresponsable_set.filter(tipo_responsabilidad='Tenedor').last()
+        if not relacion:
+            relacion = animal.animalresponsable_set.last()
+        if relacion and relacion.id_responsable:
+            resp = relacion.id_responsable
+            tenedor_data = {
+                "documentoIdentidad": resp.documento or "",
+                "nombres": resp.nombre or "",
+                "telefono": resp.telefono or "",
+                "correoElectronico": resp.correo or "",
+                "direccion": resp.direccion or "",
+            }
+
+        animal_data = {
+            "id_animal": animal.id_animal,
+            "especie": animal.id_raza.id_especie.nombre if (animal.id_raza and animal.id_raza.id_especie) else "Desconocida",
+            "raza": animal.id_raza.nombre if animal.id_raza else "Mestizo",
+            "nombre": animal.nombre or "",
+            "sexo": animal.sexo or "",
+            "color": animal.color or "",
+            "peso": float(animal.peso) if animal.peso else None,
+            "descripcionBreve": animal.observaciones or "",
+            "caracteristicasEspeciales": animal.caracteristicas or "",
+            "fotoUrl": animal.foto_url or "",
+            "numeroHistoriaClinica": ""
+        }
+
+        historia = HistoriaClinica.objects.filter(id_animal=animal).first()
+        if not historia:
+            return Response({
+                "tiene_historia": False,
+                "id_animal": animal.id_animal,
+                "animal": animal_data,
+                "tenedor": tenedor_data,
+                "anamnesicos": {},
+                "consultas_anteriores": []
+            }, status=status.HTTP_200_OK)
+
+        animal_data["numeroHistoriaClinica"] = historia.numero_historia or ""
+
+        anamnesicos_data = {
+            "id_historia": historia.id_historia,
+            "ultimaDesparasitacion": historia.fecha_ultima_desparasitacion.isoformat() if historia.fecha_ultima_desparasitacion else "",
+            "productoDesparasitacion": historia.producto_desparasitacion or "",
+            "vacunas": historia.vacunas or "",
+            "enfermedadesAnteriores": historia.enfermedades_anteriores or "",
+            "tratamientos": historia.tratamientos_anteriores or "",
+            "evolucion": historia.evolucion_previa or "",
+            "alimentacion": historia.alimentacion or "",
+            "historiaReproductiva": historia.estado_reproductivo or "",
+            "ultimoCelo": historia.fecha_ultimo_celo.isoformat() if historia.fecha_ultimo_celo else "",
+            "fechaUltimoParto": historia.fecha_ultimo_parto.isoformat() if historia.fecha_ultimo_parto else ""
+        }
+
+        consultas_qs = historia.consulta_set.all().prefetch_related('diagnostico_set', 'tratamientos_set').order_by('-fecha_hora')
+        consultas_anteriores = []
+        for c in consultas_qs:
+            diag = c.diagnostico_set.last()
+            consultas_anteriores.append({
+                "id_consulta": c.id_consulta,
+                "fecha_hora": c.fecha_hora.isoformat() if c.fecha_hora else "",
+                "motivo_consulta": c.motivo_consulta or "",
+                "diagnostico_final": diag.descripcion if diag else "",
+                "pronostico": c.pronostico or "",
+                "ingresa_cba": c.ingresa_cba,
+                "frecuencia_cardiaca": c.frecuencia_cardiaca,
+                "frecuencia_respiratoria": c.frecuencia_respiratoria,
+                "temperatura": float(c.temperatura) if c.temperatura else None,
+                "tratamientos": [
+                    {
+                        "producto_base": t.producto_base or "",
+                        "dosis_basica": t.dosis_basica or "",
+                        "presentacion": t.presentacion or "",
+                        "via": t.via_administracion or "",
+                        "frecuencia": t.frecuencia_duracion or ""
+                    }
+                    for t in c.tratamientos_set.all()
+                ]
+            })
+
+        return Response({
+            "tiene_historia": True,
+            "id_animal": animal.id_animal,
+            "id_historia": historia.id_historia,
+            "numero_historia": historia.numero_historia or "",
+            "animal": animal_data,
+            "tenedor": tenedor_data,
+            "anamnesicos": anamnesicos_data,
+            "consultas_anteriores": consultas_anteriores
+        }, status=status.HTTP_200_OK)
