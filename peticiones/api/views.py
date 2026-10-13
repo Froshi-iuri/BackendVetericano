@@ -15,7 +15,7 @@ from .serializers import (
     ListarPeticionesSerializer, DetallePeticionSerializer,
     ListarSeguimientoPeticionesVisitaSerializer,
 )
-from peticiones.utils import obtener_fotos_acta_con_fallback
+from peticiones.utils import obtener_fotos_acta_con_fallback, obtener_multimedia_acta
 
 logger = logging.getLogger(__name__)
 
@@ -202,14 +202,17 @@ class SeguimientoPeticionesVisitaCreateView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         seguimiento = serializer.save(id_veterinario=request.user)
-        fotos = obtener_fotos_acta_con_fallback(seguimiento)
+        mm_data = obtener_multimedia_acta(seguimiento)
         return Response(
             {
                 "mensaje": "Acta de visita registrada exitosamente.",
                 "id_seguimiento": seguimiento.id_seguimiento,
-                "foto": fotos[0] if fotos else None,
-                "fotos": fotos,
-                "total_fotos": len(fotos),
+                "foto": mm_data['foto'],
+                "fotos": mm_data['fotos'],
+                "total_fotos": mm_data['total_fotos'],
+                "videos": mm_data['videos'],
+                "total_videos": mm_data['total_videos'],
+                "multimedia": mm_data['multimedia'],
             },
             status=status.HTTP_201_CREATED,
         )
@@ -226,7 +229,7 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     queryset = SeguimientoPeticionesVisita.objects.select_related(
         'id_peticion', 'id_veterinario', 'id_animal', 'id_ubicacion_visita'
-    ).prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set')
+    ).prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set', 'evidencias')
     lookup_field = 'id_seguimiento'
 
     def update(self, request, *args, **kwargs):
@@ -262,7 +265,7 @@ class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
                 'id_peticion', 'id_peticion__id_estado',
                 'id_veterinario', 'id_animal', 'id_ubicacion_visita',
             )
-            .prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set')
+            .prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set', 'evidencias')
         )
 
         # 1 = Administrador, 2 = Jurídico, 3 = Veterinario, 4 = Peticionario
