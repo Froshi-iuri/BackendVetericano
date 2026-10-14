@@ -125,7 +125,7 @@ class ExpedienteCompletoAPIView(APIView):
                     'id_historia__id_animal__id_raza',
                     'id_historia__id_animal__id_raza__id_especie'
                 ).prefetch_related(
-                    'tratamientos_set',
+                    'tratamientos_set__tratamientomedicamentos_set__id_medicamento',
                     'diagnostico_set',
                     'id_historia__id_animal__animalresponsable_set__id_responsable'
                 ),
@@ -199,16 +199,21 @@ class ExpedienteCompletoAPIView(APIView):
             lista_problemas = diagnostico_obj.lista_problemas.split('; ') if diagnostico_obj and diagnostico_obj.lista_problemas else []
             diagnostico_final = diagnostico_obj.descripcion if diagnostico_obj else ""
 
-            tratamientos_data = [
-                {
+            tratamientos_data = []
+            for t in consulta.tratamientos_set.all():
+                tm = t.tratamientomedicamentos_set.first()
+                t_dict = {
+                    "id_tratamiento": t.id_tratamiento,
                     "productoBase": t.producto_base or "",
                     "dosisBasica": t.dosis_basica or "",
                     "presentacion": t.presentacion or "",
                     "via": t.via_administracion or "",
-                    "frecuenciaDuracion": t.frecuencia_duracion or ""
+                    "frecuenciaDuracion": t.frecuencia_duracion or "",
+                    "id_medicamento": tm.id_medicamento_id if tm else None,
+                    "medicamento_catalogo": tm.id_medicamento.nombre if (tm and tm.id_medicamento) else None,
+                    "suministrado_clinica": bool(tm and tm.fecha_aplicacion)
                 }
-                for t in consulta.tratamientos_set.all()
-            ]
+                tratamientos_data.append(t_dict)
 
             # Hoja 2
             hoja2_data = {
@@ -445,10 +450,27 @@ class ExpedientePorAnimalAPIView(APIView):
             "fechaUltimoParto": historia.fecha_ultimo_parto.isoformat() if historia.fecha_ultimo_parto else ""
         }
 
-        consultas_qs = historia.consulta_set.all().prefetch_related('diagnostico_set', 'tratamientos_set').order_by('-fecha_hora')
+        consultas_qs = historia.consulta_set.all().prefetch_related(
+            'diagnostico_set',
+            'tratamientos_set__tratamientomedicamentos_set__id_medicamento'
+        ).order_by('-fecha_hora')
         consultas_anteriores = []
         for c in consultas_qs:
             diag = c.diagnostico_set.last()
+            tratamientos_list = []
+            for t in c.tratamientos_set.all():
+                tm = t.tratamientomedicamentos_set.first()
+                tratamientos_list.append({
+                    "id_tratamiento": t.id_tratamiento,
+                    "producto_base": t.producto_base or "",
+                    "dosis_basica": t.dosis_basica or "",
+                    "presentacion": t.presentacion or "",
+                    "via": t.via_administracion or "",
+                    "frecuencia": t.frecuencia_duracion or "",
+                    "id_medicamento": tm.id_medicamento_id if tm else None,
+                    "medicamento_catalogo": tm.id_medicamento.nombre if (tm and tm.id_medicamento) else None,
+                    "suministrado_clinica": bool(tm and tm.fecha_aplicacion)
+                })
             consultas_anteriores.append({
                 "id_consulta": c.id_consulta,
                 "fecha_hora": c.fecha_hora.isoformat() if c.fecha_hora else "",
@@ -459,16 +481,7 @@ class ExpedientePorAnimalAPIView(APIView):
                 "frecuencia_cardiaca": c.frecuencia_cardiaca,
                 "frecuencia_respiratoria": c.frecuencia_respiratoria,
                 "temperatura": float(c.temperatura) if c.temperatura else None,
-                "tratamientos": [
-                    {
-                        "producto_base": t.producto_base or "",
-                        "dosis_basica": t.dosis_basica or "",
-                        "presentacion": t.presentacion or "",
-                        "via": t.via_administracion or "",
-                        "frecuencia": t.frecuencia_duracion or ""
-                    }
-                    for t in c.tratamientos_set.all()
-                ]
+                "tratamientos": tratamientos_list
             })
 
         return Response({
