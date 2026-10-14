@@ -38,7 +38,6 @@ class RegisterCustomSerializer(serializers.ModelSerializer):
         validated_data['id_rol'] = rol_peticionario
         
         return super().create(validated_data)
-
 class LoginCustomSerializer(serializers.Serializer):
     """
     Serializador que genera el formulario de Login en Swagger y
@@ -65,7 +64,6 @@ class LoginCustomSerializer(serializers.Serializer):
         # Si algo de arriba falla, rechazamos el login.
         raise serializers.ValidationError("Credenciales incorrectas.")
 
-
 class UsuariosSerializer(serializers.ModelSerializer):
 
     nombre_rol = serializers.CharField(
@@ -85,11 +83,11 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'nombre',
             'apellido',
             'telefono',
+            'matricula_profesional',
             'id_rol',
             'nombre_rol',
             'activo',
         )
-        # Hacemos que estos campos no sean obligatorios al hacer PATCH
         extra_kwargs = {
             'email': {'required': False},
             'identificacion': {'required': False},
