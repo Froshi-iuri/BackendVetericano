@@ -27,7 +27,11 @@ class Usuarios(models.Model):
     email = models.EmailField(unique=True, max_length=150)
     password = models.CharField(max_length=255)
     telefono = models.CharField(max_length=30, blank=True, null=True)
+<<<<<<< HEAD
     matricula_profesional = models.CharField(max_length=50, blank=True, null=True)
+=======
+    foto_perfil = models.TextField(blank=True, null=True)
+>>>>>>> c76762c (fix: column foto_perfil in usuarios, seguimiento_petiicones_visita now have especies)
     activo = models.BooleanField(default=True)
 
     class Meta:

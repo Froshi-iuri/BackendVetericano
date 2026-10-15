@@ -316,12 +316,14 @@ class SeguimientoVisitaFuncionariosSerializer(serializers.ModelSerializer):
 class AnimalRapidoSerializer(serializers.Serializer):
     """
     Datos para registrar un animal desde el acta de visita.
-    id_raza es opcional; si no se envía, se busca una raza genérica 'Mestizo/Desconocida'.
+    Permite id_raza directo, o nombre de especie y raza para asociar/crear la raza adecuada.
     """
     id_animal = serializers.IntegerField(required=False, allow_null=True,
                                          help_text="ID de animal ya existente en el sistema.")
     nombre = serializers.CharField(max_length=100, required=False, default='Sin nombre')
     id_raza = serializers.IntegerField(required=False, allow_null=True)
+    especie = serializers.CharField(max_length=100, required=False, allow_blank=True, allow_null=True)
+    raza = serializers.CharField(max_length=100, required=False, allow_blank=True, allow_null=True)
     sexo = serializers.CharField(max_length=10, required=False, allow_blank=True, allow_null=True)
     color = serializers.CharField(max_length=50, required=False, allow_blank=True, allow_null=True)
     peso = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
@@ -332,9 +334,9 @@ class AnimalRapidoSerializer(serializers.Serializer):
     def get_or_create_animal(self, data):
         """
         Retorna un Animal existente (si se envió id_animal)
-        o crea uno nuevo con los datos provistos.
+        o crea uno nuevo con los datos provistos resolviendo especie y raza.
         """
-        from especies.models import Raza
+        from especies.models import Especie, Raza
         from datetime import date
 
         if data.get('id_animal'):
@@ -345,30 +347,58 @@ class AnimalRapidoSerializer(serializers.Serializer):
                     f"No existe un animal con id_animal={data['id_animal']}."
                 )
 
-        # Determinar raza
+        # 1. Determinar raza por id_raza si fue enviado
+        raza_obj = None
         id_raza = data.get('id_raza')
         if id_raza:
             try:
-                raza = Raza.objects.get(pk=id_raza)
+                raza_obj = Raza.objects.select_related('id_especie').get(pk=id_raza)
             except Raza.DoesNotExist:
-                raise serializers.ValidationError(
-                    f"No existe una raza con id_raza={id_raza}."
+                raza_obj = None
+
+        # 2. Si no hay id_raza, resolver a través de especie y raza (patrón ExpedienteCompletoSerializer)
+        if not raza_obj:
+            especie_nombre = (data.get('especie') or '').strip()
+            raza_nombre = (data.get('raza') or '').strip() or 'Mestizo'
+
+            especie_obj = None
+            if especie_nombre:
+                especie_obj = (
+                    Especie.objects.filter(nombre__iexact=especie_nombre).first()
+                    or Especie.objects.filter(nombre__icontains=especie_nombre).first()
                 )
-        else:
-            # Raza por defecto: Mestizo o la primera disponible
-            raza = (
+                if not especie_obj:
+                    try:
+                        especie_obj = Especie.objects.create(nombre=especie_nombre, activo=True)
+                    except Exception:
+                        especie_obj = Especie.objects.filter(activo=True).first()
+
+            if especie_obj:
+                raza_obj = (
+                    Raza.objects.filter(nombre__iexact=raza_nombre, id_especie=especie_obj).first()
+                    or Raza.objects.filter(nombre__icontains=raza_nombre, id_especie=especie_obj).first()
+                )
+                if not raza_obj:
+                    try:
+                        raza_obj = Raza.objects.create(nombre=raza_nombre, id_especie=especie_obj, activo=True)
+                    except Exception:
+                        raza_obj = Raza.objects.filter(id_especie=especie_obj).first()
+
+        # 3. Fallback seguro si no se encontró raza específica
+        if not raza_obj:
+            raza_obj = (
                 Raza.objects.filter(nombre__icontains='mestizo').first()
                 or Raza.objects.filter(nombre__icontains='desconocido').first()
                 or Raza.objects.filter(activo=True).first()
                 or Raza.objects.first()
             )
-            if not raza:
+            if not raza_obj:
                 raise serializers.ValidationError(
                     "No hay razas configuradas en el sistema. Contacta al administrador."
                 )
 
         animal = Animal.objects.create(
-            id_raza=raza,
+            id_raza=raza_obj,
             nombre=data.get('nombre') or 'Sin nombre',
             sexo=data.get('sexo'),
             color=data.get('color'),
@@ -633,16 +663,6 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 or Raza.objects.first()
             )
 
-        def buscar_animal_existente(nombre):
-            if not nombre: return None
-            # Busca si ya existe un animal con ese nombre exacto creado recientemente
-            from datetime import timedelta
-            hoy = date.today()
-            return Animal.objects.filter(
-                nombre__iexact=nombre,
-                fecha_ingreso__gte=hoy - timedelta(days=2)
-            ).order_by('-id_animal').first()
-
         if animales_data:
             # Modo B y C combinados
             if len(animales_data) == 1 and nro_animales_atendidos_input > 1:
@@ -652,25 +672,12 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 if "camada" not in nombre_sug.lower() and "lote" not in nombre_sug.lower():
                     animal_data['nombre'] = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_sug}"
                 
-                # Intentar buscar duplicado o crear
-                animal_exist = buscar_animal_existente(animal_data['nombre'])
-                if animal_exist:
-                    animal_principal = animal_exist
-                else:
-                    animal_principal = animal_serializer.get_or_create_animal(animal_data)
-                
+                animal_principal = animal_serializer.get_or_create_animal(animal_data)
                 lista_animales_creados.append(animal_principal)
             else:
                 # Escenario 2: Varios animales (o 1 solo detallado en lista)
                 for i, animal_data in enumerate(animales_data):
-                    nombre_sug = animal_data.get('nombre', 'Sin nombre')
-                    animal_exist = buscar_animal_existente(nombre_sug)
-                    
-                    if animal_exist:
-                        animal = animal_exist
-                    else:
-                        animal = animal_serializer.get_or_create_animal(animal_data)
-                        
+                    animal = animal_serializer.get_or_create_animal(animal_data)
                     if i == 0:
                         animal_principal = animal
                     lista_animales_creados.append(animal)
@@ -678,18 +685,38 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                 nro_animales_atendidos_input = len(animales_data)
         else:
             # Escenario 1: Sin lista, datos planos en el formulario
-            nombre_plano = validated_data.get('nombre_paciente')
-            if nombre_plano:
-                if nro_animales_atendidos_input > 1:
-                    # Escenario 3 desde texto plano
-                    if "camada" not in nombre_plano.lower() and "lote" not in nombre_plano.lower():
-                        nombre_plano = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_plano}"
-                
-                animal_exist = buscar_animal_existente(nombre_plano)
-                if animal_exist:
-                    animal_principal = animal_exist
-                else:
-                    raza = obtener_raza_generica()
+            id_animal_directo = validated_data.get('id_animal')
+            if id_animal_directo:
+                animal_principal = id_animal_directo
+                lista_animales_creados.append(animal_principal)
+            else:
+                nombre_plano = validated_data.get('nombre_paciente')
+                if nombre_plano:
+                    if nro_animales_atendidos_input > 1:
+                        # Escenario 3 desde texto plano
+                        if "camada" not in nombre_plano.lower() and "lote" not in nombre_plano.lower():
+                            nombre_plano = f"Camada/Lote ({nro_animales_atendidos_input} animales) - {nombre_plano}"
+                    
+                    # Resolver raza adecuada según paciente_especie y paciente_raza
+                    from especies.models import Especie, Raza
+                    esp_nombre = (validated_data.get('paciente_especie') or '').strip()
+                    rz_nombre = (validated_data.get('paciente_raza') or '').strip() or 'Mestizo'
+
+                    raza = None
+                    if esp_nombre:
+                        esp_obj = (
+                            Especie.objects.filter(nombre__iexact=esp_nombre).first()
+                            or Especie.objects.filter(nombre__icontains=esp_nombre).first()
+                        )
+                        if esp_obj:
+                            raza = (
+                                Raza.objects.filter(nombre__iexact=rz_nombre, id_especie=esp_obj).first()
+                                or Raza.objects.filter(nombre__icontains=rz_nombre, id_especie=esp_obj).first()
+                            )
+
+                    if not raza:
+                        raza = obtener_raza_generica()
+
                     animal_principal = Animal.objects.create(
                         id_raza=raza,
                         nombre=nombre_plano,
@@ -701,7 +728,7 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
                         fecha_ingreso=date.today(),
                         activo=True,
                     )
-                lista_animales_creados.append(animal_principal)
+                    lista_animales_creados.append(animal_principal)
 
         # Copiar datos del animal principal a las columnas del acta
         if animal_principal:
@@ -713,12 +740,16 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             validated_data['esterilizacion_paciente'] = animal_principal.esterilizado
             validated_data['descripcion_paciente'] = animal_principal.caracteristicas
             
-            # Intentar obtener raza/especie de manera segura
+            # Intentar obtener raza/especie de manera segura respetando lo enviado por el usuario
             try:
                 if animal_principal.id_raza:
-                    validated_data['paciente_raza'] = animal_principal.id_raza.nombre
+                    if not validated_data.get('paciente_raza'):
+                        validated_data['paciente_raza'] = animal_principal.id_raza.nombre
                     if animal_principal.id_raza.id_especie:
-                        validated_data['paciente_especie'] = animal_principal.id_raza.id_especie.nombre
+                        esp_db = animal_principal.id_raza.id_especie.nombre
+                        esp_actual = validated_data.get('paciente_especie')
+                        if not esp_actual or esp_actual.lower() in ('desconocida', 'desconocido'):
+                            validated_data['paciente_especie'] = esp_db
             except Exception:
                 pass
 
@@ -834,6 +865,8 @@ class VisitaAnimalListSerializer(serializers.ModelSerializer):
     """Representación compacta de cada animal atendido en una visita."""
     id_animal = serializers.IntegerField(source='id_animal.id_animal', read_only=True)
     nombre = serializers.CharField(source='id_animal.nombre', read_only=True, default='', allow_null=True)
+    especie = serializers.CharField(source='id_animal.id_raza.id_especie.nombre', read_only=True, default='', allow_null=True)
+    raza = serializers.CharField(source='id_animal.id_raza.nombre', read_only=True, default='', allow_null=True)
     sexo = serializers.CharField(source='id_animal.sexo', read_only=True, default='', allow_null=True)
     color = serializers.CharField(source='id_animal.color', read_only=True, default='', allow_null=True)
     peso = serializers.DecimalField(
@@ -851,7 +884,7 @@ class VisitaAnimalListSerializer(serializers.ModelSerializer):
         model = VisitaAnimal
         fields = [
             'id_visita',
-            'id_animal', 'nombre', 'sexo', 'color', 'peso',
+            'id_animal', 'nombre', 'especie', 'raza', 'sexo', 'color', 'peso',
             'caracteristicas', 'descripcion_paciente',
             'fecha', 'nro_radicado_atencion',
             'quien_reporta', 'lugar_atencion_direccion',

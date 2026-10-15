@@ -57,6 +57,8 @@ class LoginView(generics.GenericAPIView):
             "id_usuario": user.id_usuario,
             "nombre": user.nombre,
             "apellido": user.apellido,
+            "telefono": getattr(user, 'telefono', None),
+            "foto_perfil": getattr(user, 'foto_perfil', None),
             "id_rol": user.id_rol.id_rol,
             "tokens": {
                 "refresh": str(refresh),

@@ -16,5 +16,7 @@ class DashboardSerializer(serializers.ModelSerializer):
             'nombre',
             'apellido',
             'email',
+            'telefono',
+            'foto_perfil',
             'nombre_rol',
         )

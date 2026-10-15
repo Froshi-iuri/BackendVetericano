@@ -693,6 +693,7 @@ class Usuarios(models.Model):
     activo = models.BooleanField()
     identificacion = models.CharField(max_length=20, blank=True, null=True)
     telefono = models.CharField(max_length=30, blank=True, null=True)
+    foto_perfil = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False
