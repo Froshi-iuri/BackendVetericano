@@ -28,6 +28,7 @@ class Usuarios(models.Model):
     password = models.CharField(max_length=255)
     telefono = models.CharField(max_length=30, blank=True, null=True)
     matricula_profesional = models.CharField(max_length=50, blank=True, null=True)
+    foto_perfil = models.TextField(blank=True, null=True)
     activo = models.BooleanField(default=True)
 
     class Meta:
