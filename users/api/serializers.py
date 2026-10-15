@@ -6,6 +6,7 @@ from rest_framework import serializers
 # Esto es CRÍTICO: nunca guardes contraseñas en texto plano.
 from django.contrib.auth.hashers import make_password, check_password
 from users.models import Usuarios, Rol
+from peticiones.utils import subir_o_asegurar_cloudinary
 
 class RegisterCustomSerializer(serializers.ModelSerializer):
     # Ya no declaramos id_rol aquí arriba. 
@@ -75,6 +76,9 @@ class UsuariosSerializer(serializers.ModelSerializer):
     telefono = serializers.CharField(
         required=False, allow_blank=True, allow_null=True
     )
+    foto_perfil = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True
+    )
 
     class Meta:
         model = Usuarios
@@ -85,6 +89,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'nombre',
             'apellido',
             'telefono',
+            'foto_perfil',
             'id_rol',
             'nombre_rol',
             'activo',
@@ -94,7 +99,13 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'email': {'required': False},
             'identificacion': {'required': False},
             'id_rol': {'required': False},
+            'foto_perfil': {'required': False},
         }
+
+    def validate_foto_perfil(self, value):
+        if not value:
+            return None
+        return subir_o_asegurar_cloudinary(value)
 
     def validate(self, data):
         request = self.context.get('request')
