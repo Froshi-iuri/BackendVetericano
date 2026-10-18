@@ -529,7 +529,7 @@ def verificar_idempotencia_consumo_clinico(
                 f"(veterinario, medicamento o unidades no coinciden)."
             )
 
-        id_origen_reg = getattr(reg, campo_origen)
+        id_origen_reg = getattr(reg, f"{campo_origen}_id")
         if reg.origen_tipo != origen_tipo or id_origen_reg is None:
             raise ConflictoIdempotenciaConsumoError(
                 f"El client_uuid '{reg.client_uuid}' ya fue registrado con un origen distinto "
@@ -539,7 +539,7 @@ def verificar_idempotencia_consumo_clinico(
         if id_origen_esperado is not None and id_origen_reg != id_origen_esperado:
             raise ConflictoIdempotenciaConsumoError(
                 f"El client_uuid '{reg.client_uuid}' ya está asociado a otro registro de origen "
-                f"({campo_origen}={id_origen_reg}, esperado={id_origen_esperado})."
+                f"({campo_origen}_id={id_origen_reg}, esperado={id_origen_esperado})."
             )
 
         origenes_encontrados.add(id_origen_reg)
