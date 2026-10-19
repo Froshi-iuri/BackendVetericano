@@ -1129,3 +1129,688 @@ class KitFlujoTestCase(TestCase):
         self.assertEqual(l_med_a.cantidad_actual, 5)
         self.assertEqual(InventarioConsumosRegistro.objects.filter(client_uuid=u_invalido).count(), 0)
         self.assertEqual(InventarioKardex.objects.filter(client_uuid=u_invalido).count(), 0)
+
+    def test_kit_36b_caracterizacion_normalizar_fecha_compra(self):
+        """
+        TEST-KIT-36B: Caracterización de _normalizar_fecha_compra y desplazamiento FIFO entre fechas naive y aware.
+        Invocación con None, date(2026, 5, 1), datetime(2026, 5, 1, 10, 0) naive
+        y datetime(2026, 5, 1, 10, 0, tzinfo=ZoneInfo('America/Bogota')) aware (UTC-5).
+        Retorna respectivamente datetime.min, datetime(2026, 5, 1, 0, 0) naive,
+        datetime(2026, 5, 1, 10, 0) naive y datetime(2026, 5, 1, 15, 0) naive.
+        Caracteriza contraste con DECISIONES §11.8: dos compras locales a las 10:00 difieren
+        en 5 horas en la ordenación Python/SQL (10:00 vs 15:00), alterando la prioridad FIFO de asignación.
+        El test documenta el comportamiento actual sin modificarlo.
+        """
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        from inventario.services.kit_service import _normalizar_fecha_compra
+
+        # 1. Caso None -> datetime.min naive
+        res_none = _normalizar_fecha_compra(None)
+        self.assertEqual(res_none, datetime.min)
+        self.assertIsNone(res_none.tzinfo)
+
+        # 2. Caso date -> datetime(year, month, day, 0, 0) naive
+        d = date(2026, 5, 1)
+        res_date = _normalizar_fecha_compra(d)
+        self.assertEqual(res_date, datetime(2026, 5, 1, 0, 0))
+        self.assertIsNone(res_date.tzinfo)
+
+        # 3. Caso datetime naive -> datetime identico naive
+        dt_naive = datetime(2026, 5, 1, 10, 0)
+        res_naive = _normalizar_fecha_compra(dt_naive)
+        self.assertEqual(res_naive, datetime(2026, 5, 1, 10, 0))
+        self.assertIsNone(res_naive.tzinfo)
+
+        # 4. Caso datetime aware (America/Bogota UTC-5) -> conversion a UTC (15:00) y remocion de tzinfo (naive)
+        dt_aware = datetime(2026, 5, 1, 10, 0, tzinfo=ZoneInfo("America/Bogota"))
+        res_aware = _normalizar_fecha_compra(dt_aware)
+        self.assertEqual(res_aware, datetime(2026, 5, 1, 15, 0))
+        self.assertIsNone(res_aware.tzinfo)
+
+        # Caracterizacion del desplazamiento relativo de 5 horas entre compras locales a las 10:00
+        # aware (15:00) vs naive (10:00): en ordenamiento FIFO la naive parece 5 horas mas antigua
+        delta = res_aware - res_naive
+        self.assertEqual(delta, timedelta(hours=5))
+
+    def test_kit_39_asignar_medicamento_invalido_o_sin_lotes(self):
+        """
+        TEST-KIT-39: Validaciones de kit_service al asignar: Medicamento inexistente o sin lotes.
+        Gestor autenticado intenta asignar:
+        1. Medicamento inexistente en catalogo institucional -> HTTP 400 Bad Request, error='MEDICAMENTO_INVALIDO'.
+        2. Medicamento existente pero sin lotes disponibles/vigentes en bodega CBA -> HTTP 400 Bad Request, error='MEDICAMENTO_SIN_LOTES_ASIGNABLES'.
+        Verifica cero modificaciones en tablas de inventario (KitVeterinarioLotes, Inventarios, InventarioKardex).
+        """
+        count_kit_ini = KitVeterinarioLotes.objects.count()
+        count_inv_ini = Inventarios.objects.count()
+        count_kardex_ini = InventarioKardex.objects.count()
+
+        # Escenario 1: Medicamento inexistente (id_medicamento=999999)
+        payload_inexistente = {
+            "id_veterinario": self.vet_a.id_usuario,
+            "motivo": "Dotacion medicamento inexistente",
+            "items": [
+                {
+                    "id_medicamento": 999999,
+                    "cantidad": 10
+                }
+            ]
+        }
+        resp1 = self.client.post(
+            "/api/inventario/kit/asignar/",
+            payload_inexistente,
+            format="json",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp1.data.get("error"), "MEDICAMENTO_INVALIDO")
+
+        # Escenario 2: Medicamento existente pero sin lotes en bodega
+        med_sin_lotes = crear_medicamento(nombre="Med Sin Lotes CBA 39")
+        payload_sin_lotes = {
+            "id_veterinario": self.vet_a.id_usuario,
+            "motivo": "Dotacion medicamento sin lotes",
+            "items": [
+                {
+                    "id_medicamento": med_sin_lotes.id_medicamento,
+                    "cantidad": 5
+                }
+            ]
+        }
+        resp2 = self.client.post(
+            "/api/inventario/kit/asignar/",
+            payload_sin_lotes,
+            format="json",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp2.data.get("error"), "MEDICAMENTO_SIN_LOTES_ASIGNABLES")
+
+        # Invariantes en base de datos: cero filas modificadas / anadidas
+        self.assertEqual(KitVeterinarioLotes.objects.count(), count_kit_ini)
+        self.assertEqual(Inventarios.objects.count(), count_inv_ini)
+        self.assertEqual(InventarioKardex.objects.count(), count_kardex_ini)
+
+    def test_kit_41_sincronizar_offline_mixto_con_conflictos(self):
+        """
+        TEST-KIT-41: Sincronización offline dedicada con payload mixto y conflictos (DISENO §5.3).
+        Veterinario con stock suficiente para Med A (5 unidades) pero sin stock para Med B (0 unidades).
+        POST /api/inventario/kit/sincronizar-offline/ con lote [Med A (2 uds), Med B (3 uds)]:
+        - HTTP 409 Conflict, error='CONFLICTO_STOCK_KIT', con aplicados y conflictos.
+        - Med A: descontado exitosamente en kit (saldo pasa de 5 a 3), registro en InventarioConsumosRegistro con estado='APLICADO' y fila kardex CONSUMO_HISTORIA.
+        - Med B: registrado en InventarioConsumosRegistro con estado='RECHAZADO_CONFLICTO' y codigo_http=409, sin kardex.
+        """
+        from inventario.constants import CONSUMO_ESTADO_RECHAZADO_CONFLICTO
+
+        # Setup: Med A con 5 unidades en kit; Med B sin stock en kit para vet_a
+        b_med_a = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=90), estado="Agotado")
+        l_med_a = crear_lote_kit(self.vet_a, b_med_a, cantidad=5, cantidad_ref=5, fecha_vencimiento=b_med_a.fecha_vencimiento)
+
+        consulta = crear_consulta()
+        u_aplica = uuid.uuid4()
+        u_conflicto = uuid.uuid4()
+
+        payload = {
+            "consumos": [
+                {
+                    "client_uuid": str(u_aplica),
+                    "id_medicamento": self.med_a.id_medicamento,
+                    "unidades": 2,
+                    "id_consulta": consulta.id_consulta,
+                },
+                {
+                    "client_uuid": str(u_conflicto),
+                    "id_medicamento": self.med_b.id_medicamento,
+                    "unidades": 3,
+                    "id_consulta": consulta.id_consulta,
+                }
+            ]
+        }
+
+        response = self.client.post(
+            "/api/inventario/kit/sincronizar-offline/",
+            payload,
+            format="json",
+            **self.headers_vet_a
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data.get("error"), "CONFLICTO_STOCK_KIT")
+
+        aplicados = response.data.get("aplicados", [])
+        conflictos = response.data.get("conflictos", [])
+        self.assertEqual(len(aplicados), 1)
+        self.assertEqual(len(conflictos), 1)
+
+        # Verificacion item aplicado
+        ap = aplicados[0]
+        self.assertEqual(ap.get("client_uuid"), str(u_aplica))
+        self.assertEqual(ap.get("id_medicamento"), self.med_a.id_medicamento)
+        self.assertEqual(ap.get("unidades_descontadas"), 2)
+        self.assertEqual(ap.get("estado"), CONSUMO_ESTADO_APLICADO)
+        self.assertEqual(ap.get("codigo_http"), 200)
+
+        # Verificacion item en conflicto
+        conf = conflictos[0]
+        self.assertEqual(conf.get("client_uuid"), str(u_conflicto))
+        self.assertEqual(conf.get("id_medicamento"), self.med_b.id_medicamento)
+        self.assertEqual(conf.get("unidades"), 3)
+        self.assertEqual(conf.get("stock_disponible_actual"), 0)
+        self.assertEqual(conf.get("estado"), CONSUMO_ESTADO_RECHAZADO_CONFLICTO)
+        self.assertEqual(conf.get("codigo_http"), 409)
+        self.assertIn("Stock insuficiente en el kit", conf.get("motivo_rechazo", ""))
+
+        # Verificacion en BD: Med A descontado de 5 a 3
+        l_med_a.refresh_from_db()
+        self.assertEqual(l_med_a.cantidad_actual, 3)
+
+        # Verificacion en BD: Registro APLICADO para u_aplica
+        reg_ap = InventarioConsumosRegistro.objects.filter(client_uuid=u_aplica).first()
+        self.assertIsNotNone(reg_ap)
+        self.assertEqual(reg_ap.estado, CONSUMO_ESTADO_APLICADO)
+        self.assertEqual(reg_ap.codigo_http, 200)
+        self.assertEqual(reg_ap.cantidad_descontada, 2)
+
+        # Verificacion en BD: Registro RECHAZADO_CONFLICTO para u_conflicto
+        reg_conf = InventarioConsumosRegistro.objects.filter(client_uuid=u_conflicto).first()
+        self.assertIsNotNone(reg_conf)
+        self.assertEqual(reg_conf.estado, CONSUMO_ESTADO_RECHAZADO_CONFLICTO)
+        self.assertEqual(reg_conf.codigo_http, 409)
+        self.assertEqual(reg_conf.cantidad_descontada, 0)
+        self.assertEqual(reg_conf.cantidad_solicitada, 3)
+        self.assertEqual(reg_conf.stock_disponible_al_rechazo, 0)
+
+        # Verificacion en BD: Kardex (1 fila para Med A, 0 filas para Med B)
+        k_ap = InventarioKardex.objects.filter(client_uuid=u_aplica).first()
+        self.assertIsNotNone(k_ap)
+        self.assertEqual(k_ap.tipo_movimiento, TIPO_KARDEX_CONSUMO_HISTORIA)
+        self.assertEqual(k_ap.ubicacion, UBICACION_KARDEX_KIT)
+        self.assertEqual(k_ap.cantidad, 2)
+        self.assertEqual(k_ap.saldo_anterior, 5)
+        self.assertEqual(k_ap.saldo_resultante, 3)
+
+        k_conf_count = InventarioKardex.objects.filter(client_uuid=u_conflicto).count()
+        self.assertEqual(k_conf_count, 0)
+
+    def test_kit_42a_consulta_mi_kit(self):
+        """
+        TEST-KIT-42A: Consulta del Kit Propio (/api/inventario/kit/mi-kit/).
+        Veterinario A autenticado con 2 lotes en kit (1 vigente de 10 uds, 1 vencido de 5 uds).
+        Verifica:
+        - Vet A: HTTP 200 OK con estructura real {'total_unidades': 15, 'items': [...]},
+          con saldos disponible=10 y vencido=5.
+        - Gestor (Rol 1): HTTP 403 Forbidden (EsVeterinario).
+        - Jurídico (Rol 2): HTTP 403 Forbidden (EsVeterinario).
+        - Peticionario (Rol 4): HTTP 403 Forbidden (EsVeterinario).
+        - Base de datos inalterada (solo lectura).
+        """
+        b_vig = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=60), estado="Agotado")
+        b_ven = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy - timedelta(days=15), estado="Agotado")
+
+        crear_lote_kit(self.vet_a, b_vig, cantidad=10, cantidad_ref=10, fecha_vencimiento=b_vig.fecha_vencimiento)
+        crear_lote_kit(self.vet_a, b_ven, cantidad=5, cantidad_ref=5, fecha_vencimiento=b_ven.fecha_vencimiento)
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42a@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42a@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Consulta autorizada como Vet A -> 200 OK
+        resp_vet = self.client.get(
+            "/api/inventario/kit/mi-kit/",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_200_OK)
+        self.assertIn("total_unidades", resp_vet.data)
+        self.assertIn("items", resp_vet.data)
+        self.assertEqual(resp_vet.data["total_unidades"], 15)
+
+        items = resp_vet.data["items"]
+        item_med = next((it for it in items if it["id_medicamento"] == self.med_a.id_medicamento), None)
+        self.assertIsNotNone(item_med)
+        self.assertEqual(item_med["saldo_disponible"], 10)
+        self.assertEqual(item_med["saldo_vencido"], 5)
+        self.assertEqual(len(item_med["lotes"]), 2)
+
+        for lote_dict in item_med["lotes"]:
+            self.assertIn("id_kit_lote", lote_dict)
+            self.assertIn("id_inventario", lote_dict)
+            self.assertIn("cantidad_actual", lote_dict)
+            self.assertIn("cantidad_referencia", lote_dict)
+            self.assertIn("fecha_vencimiento", lote_dict)
+            self.assertIn("vencido", lote_dict)
+
+        # 2. Roles no autorizados -> 403 Forbidden (EsVeterinario)
+        resp_gestor = self.client.get("/api/inventario/kit/mi-kit/", **self.headers_gestor)
+        self.assertEqual(resp_gestor.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol2 = self.client.get("/api/inventario/kit/mi-kit/", **headers_rol2)
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get("/api/inventario/kit/mi-kit/", **headers_rol4)
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
+    def test_kit_42b_consulta_kit_veterinario_gestor(self):
+        """
+        TEST-KIT-42B: Consulta de Kit por Gestor (/api/inventario/kit/veterinario/{id}/).
+        Gestor autenticado consulta kit de Vet A con stock y veterinario inexistente #99999.
+        Verifica:
+        - Gestor consultando Vet A: HTTP 200 OK con estructura {'total_unidades': 12, 'items': [...]}.
+        - Gestor con id=99999 inexistente: HTTP 404 Not Found, error='VETERINARIO_NO_ENCONTRADO'.
+        - Vet A (Rol 3): HTTP 403 Forbidden (EsGestorInventario).
+        - Jurídico (Rol 2): HTTP 403 Forbidden (EsGestorInventario).
+        - Peticionario (Rol 4): HTTP 403 Forbidden (EsGestorInventario).
+        - Base de datos inalterada (solo lectura).
+        """
+        b = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=120), estado="Agotado")
+        crear_lote_kit(self.vet_a, b, cantidad=12, cantidad_ref=12, fecha_vencimiento=b.fecha_vencimiento)
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42b@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42b@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Gestor consultando Vet A existente -> 200 OK
+        resp_gestor = self.client.get(
+            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+        self.assertIn("total_unidades", resp_gestor.data)
+        self.assertIn("items", resp_gestor.data)
+        self.assertEqual(resp_gestor.data["total_unidades"], 12)
+        self.assertGreater(len(resp_gestor.data["items"]), 0)
+
+        # 2. Gestor consultando veterinario inexistente -> 404 Not Found
+        resp_404 = self.client.get(
+            "/api/inventario/kit/veterinario/99999/",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_404.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(resp_404.data.get("error"), "VETERINARIO_NO_ENCONTRADO")
+        self.assertIn("El veterinario #99999 no existe o no está activo.", resp_404.data.get("detalle", ""))
+
+        # 3. Roles no autorizados -> 403 Forbidden (EsGestorInventario)
+        resp_vet = self.client.get(
+            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol2 = self.client.get(
+            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
+            **headers_rol2
+        )
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get(
+            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
+            **headers_rol4
+        )
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 4. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
+    def test_kit_42c_snapshot_movil_offline(self):
+        """
+        TEST-KIT-42C: Snapshot Móvil para persistencia offline (/api/inventario/kit/snapshot-movil/).
+        Veterinario A con stock vigente en kit.
+        Verifica:
+        - Vet A: HTTP 200 OK con estructura real {'timestamp': int, 'stock': [{'id_medicamento': ..., 'nombre': ..., 'saldo_disponible': ...}]}.
+        - Filtro opcional ?id_medicamento= restringe el snapshot al farmaco indicado.
+        - Gestor (Rol 1): HTTP 403 Forbidden (EsVeterinario).
+        - Jurídico (Rol 2): HTTP 403 Forbidden (EsVeterinario).
+        - Peticionario (Rol 4): HTTP 403 Forbidden (EsVeterinario).
+        - Base de datos inalterada (solo lectura).
+        """
+        b_a = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=90), estado="Agotado")
+        b_b = crear_lote_bodega(self.med_b, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=90), estado="Agotado")
+        crear_lote_kit(self.vet_a, b_a, cantidad=8, cantidad_ref=8, fecha_vencimiento=b_a.fecha_vencimiento)
+        crear_lote_kit(self.vet_a, b_b, cantidad=6, cantidad_ref=6, fecha_vencimiento=b_b.fecha_vencimiento)
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42c@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42c@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Consulta autorizada como Vet A -> 200 OK con estructura real
+        resp_vet = self.client.get(
+            "/api/inventario/kit/snapshot-movil/",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_200_OK)
+        self.assertIn("timestamp", resp_vet.data)
+        self.assertIsInstance(resp_vet.data["timestamp"], int)
+        self.assertIn("stock", resp_vet.data)
+        self.assertIsInstance(resp_vet.data["stock"], list)
+
+        stock_items = resp_vet.data["stock"]
+        item_a = next((s for s in stock_items if s["id_medicamento"] == self.med_a.id_medicamento), None)
+        self.assertIsNotNone(item_a)
+        self.assertEqual(item_a["saldo_disponible"], 8)
+        self.assertEqual(item_a["nombre"], self.med_a.nombre)
+
+        # Filtro por ?id_medicamento=
+        resp_filtro = self.client.get(
+            f"/api/inventario/kit/snapshot-movil/?id_medicamento={self.med_a.id_medicamento}",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_filtro.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp_filtro.data["stock"]), 1)
+        self.assertEqual(resp_filtro.data["stock"][0]["id_medicamento"], self.med_a.id_medicamento)
+
+        # 2. Roles no autorizados -> 403 Forbidden (EsVeterinario)
+        resp_gestor = self.client.get("/api/inventario/kit/snapshot-movil/", **self.headers_gestor)
+        self.assertEqual(resp_gestor.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol2 = self.client.get("/api/inventario/kit/snapshot-movil/", **headers_rol2)
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get("/api/inventario/kit/snapshot-movil/", **headers_rol4)
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
+    def test_kit_42d_consulta_alertas_filtros(self):
+        """
+        TEST-KIT-42D: Consulta y Filtros de Alertas (/api/inventario/kit/alertas/).
+        Gestor y Veterinario autenticados. Kit con lote vencido y lote en stock critico (< 5 unidades).
+        Verifica:
+        - Gestor y Vet: HTTP 200 OK (EsGestorOVeterinario) con estructura {'agotados': [], 'criticos': [...], 'bajos': [], 'vencidos': [...], 'proximos_a_vencer': [...]}.
+        - Gestor puede filtrar por ?id_veterinario={id_vet}; si no existe -> 404 VETERINARIO_NO_ENCONTRADO.
+        - Jurídico (Rol 2) y Peticionario (Rol 4): HTTP 403 Forbidden.
+        - Base de datos inalterada (solo lectura).
+        """
+        b_ven = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy - timedelta(days=5), estado="Agotado")
+        crear_lote_kit(self.vet_a, b_ven, cantidad=4, cantidad_ref=10, fecha_vencimiento=b_ven.fecha_vencimiento)
+
+        b_crit = crear_lote_bodega(self.med_b, cantidad=0, fecha_vencimiento=self.hoy + timedelta(days=90), estado="Agotado")
+        crear_lote_kit(self.vet_a, b_crit, cantidad=3, cantidad_ref=10, fecha_vencimiento=b_crit.fecha_vencimiento)
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42d@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42d@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Vet consulta sus alertas -> 200 OK
+        resp_vet = self.client.get(
+            "/api/inventario/kit/alertas/",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_200_OK)
+        for k in ["agotados", "criticos", "bajos", "vencidos", "proximos_a_vencer"]:
+            self.assertIn(k, resp_vet.data)
+
+        criticos_vet = [c for c in resp_vet.data["criticos"] if c["id_medicamento"] == self.med_b.id_medicamento]
+        self.assertEqual(len(criticos_vet), 1)
+
+        vencidos_vet = [v for v in resp_vet.data["vencidos"] if v["id_medicamento"] == self.med_a.id_medicamento]
+        self.assertEqual(len(vencidos_vet), 1)
+
+        # 2. Gestor consulta alertas globales y con filtro por veterinario -> 200 OK
+        resp_gestor = self.client.get(
+            f"/api/inventario/kit/alertas/?id_veterinario={self.vet_a.id_usuario}",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+        self.assertIn("criticos", resp_gestor.data)
+        self.assertIn("vencidos", resp_gestor.data)
+
+        # Gestor con id_veterinario inexistente -> 404 VETERINARIO_NO_ENCONTRADO
+        resp_gestor_404 = self.client.get(
+            "/api/inventario/kit/alertas/?id_veterinario=99999",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_gestor_404.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(resp_gestor_404.data.get("error"), "VETERINARIO_NO_ENCONTRADO")
+
+        # 3. Roles no autorizados -> 403 Forbidden (EsGestorOVeterinario)
+        resp_rol2 = self.client.get("/api/inventario/kit/alertas/", **headers_rol2)
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get("/api/inventario/kit/alertas/", **headers_rol4)
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 4. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
+    def test_kit_42e_consulta_kardex_filtros(self):
+        """
+        TEST-KIT-42E: Consulta y Filtros de Kardex del Kit (/api/inventario/kit/kardex/).
+        Gestor y Veterinario autenticados. Movimientos de kardex existentes en BD.
+        Verifica:
+        - Gestor y Vet: HTTP 200 OK (EsGestorOVeterinario) con respuesta paginada ('count', 'results').
+        - Vet solo observa sus propios movimientos; Gestor puede filtrar por ?id_veterinario=.
+        - Filtros de fecha (?desde=&hasta=) y tipo (?tipo_movimiento=) aplicados correctamente.
+        - Jurídico (Rol 2) y Peticionario (Rol 4): HTTP 403 Forbidden.
+        - Base de datos inalterada (solo lectura).
+        """
+        b_a = crear_lote_bodega(self.med_a, cantidad=50, fecha_vencimiento=self.hoy + timedelta(days=180))
+        k1 = InventarioKardex.objects.create(
+            tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA,
+            ubicacion=UBICACION_KARDEX_KIT,
+            id_usuario_ejecuta=self.vet_a,
+            id_veterinario=self.vet_a,
+            id_medicamento=self.med_a,
+            id_inventario=b_a,
+            cantidad=3,
+            saldo_anterior=10,
+            saldo_resultante=7,
+            motivo="Tratamiento canino",
+            fecha_hora=timezone.now()
+        )
+        k2 = InventarioKardex.objects.create(
+            tipo_movimiento=TIPO_KARDEX_ASIGNACION_KIT,
+            ubicacion=UBICACION_KARDEX_GENERAL,
+            id_usuario_ejecuta=self.gestor,
+            id_veterinario=self.vet_b,
+            id_medicamento=self.med_a,
+            id_inventario=b_a,
+            cantidad=5,
+            saldo_anterior=50,
+            saldo_resultante=45,
+            motivo="Dotacion a Vet B",
+            fecha_hora=timezone.now()
+        )
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42e@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42e@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Vet A consulta kardex -> 200 OK paginado, solo ve k1 (su propio id_veterinario)
+        resp_vet = self.client.get(
+            "/api/inventario/kit/kardex/",
+            **self.headers_vet_a
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_200_OK)
+        self.assertIn("count", resp_vet.data)
+        self.assertIn("results", resp_vet.data)
+        ids_encontrados = [r["id_kardex"] for r in resp_vet.data["results"]]
+        self.assertIn(k1.id_kardex, ids_encontrados)
+        self.assertNotIn(k2.id_kardex, ids_encontrados)
+
+        # 2. Gestor consulta kardex con filtros de fecha y tipo_movimiento -> 200 OK
+        hoy_str = self.hoy.isoformat()
+        resp_gestor = self.client.get(
+            f"/api/inventario/kit/kardex/?desde={hoy_str}&hasta={hoy_str}&tipo_movimiento={TIPO_KARDEX_CONSUMO_HISTORIA}",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+        self.assertIn("results", resp_gestor.data)
+        for r in resp_gestor.data["results"]:
+            self.assertEqual(r["tipo_movimiento"], TIPO_KARDEX_CONSUMO_HISTORIA)
+
+        # Estructura del registro retornado
+        r0 = resp_gestor.data["results"][0]
+        for campo in ["id_kardex", "tipo_movimiento", "ubicacion", "id_veterinario", "nombre_medicamento", "cantidad", "saldo_anterior", "saldo_resultante"]:
+            self.assertIn(campo, r0)
+
+        # 3. Roles no autorizados -> 403 Forbidden (EsGestorOVeterinario)
+        resp_rol2 = self.client.get("/api/inventario/kit/kardex/", **headers_rol2)
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get("/api/inventario/kit/kardex/", **headers_rol4)
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 4. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
+    def test_kit_42f_bandeja_conflictos_gestor(self):
+        """
+        TEST-KIT-42F: Bandeja de Conflictos Offline para Gestor (/api/inventario/kit/conflictos/).
+        Consumos previos en InventarioConsumosRegistro con estado='RECHAZADO_CONFLICTO'.
+        Verifica:
+        - Gestor: HTTP 200 OK (EsGestorInventario) con respuesta paginada y estructura de ConflictoOutputSerializer
+          ('id_consumo', 'client_uuid', 'id_veterinario', 'id_medicamento', 'stock_disponible_al_rechazo', 'motivo_rechazo', 'fecha_consumo').
+        - Filtros opcionales (?resuelto=false, ?id_veterinario=) aplicados en el QuerySet.
+        - Vet A (Rol 3): HTTP 403 Forbidden (EsGestorInventario).
+        - Jurídico (Rol 2): HTTP 403 Forbidden (EsGestorInventario).
+        - Peticionario (Rol 4): HTTP 403 Forbidden (EsGestorInventario).
+        - Base de datos inalterada (solo lectura).
+        """
+        from inventario.constants import CONSUMO_ESTADO_RECHAZADO_CONFLICTO
+
+        u_conf = uuid.uuid4()
+        conflicto_reg = InventarioConsumosRegistro.objects.create(
+            client_uuid=u_conf,
+            id_veterinario=self.vet_a,
+            id_medicamento=self.med_a,
+            cantidad_solicitada=4,
+            cantidad_descontada=0,
+            estado=CONSUMO_ESTADO_RECHAZADO_CONFLICTO,
+            codigo_http=409,
+            origen_tipo="DIRECTO",
+            stock_disponible_al_rechazo=0,
+            motivo_rechazo="Stock insuficiente en el kit de prueba"
+        )
+
+        user_rol2 = crear_usuario(rol_id=2, email="juridico_42f@cba.gov.co")
+        user_rol4 = crear_usuario(rol_id=4, email="peticionario_42f@cba.gov.co")
+        headers_rol2 = obtener_headers_jwt(user_rol2)
+        headers_rol4 = obtener_headers_jwt(user_rol4)
+
+        counts_pre = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+
+        # 1. Gestor consulta la bandeja de conflictos -> 200 OK paginado
+        resp_gestor = self.client.get(
+            "/api/inventario/kit/conflictos/",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+        self.assertIn("count", resp_gestor.data)
+        self.assertIn("results", resp_gestor.data)
+        self.assertGreaterEqual(resp_gestor.data["count"], 1)
+
+        encontrado = next((c for c in resp_gestor.data["results"] if c["client_uuid"] == str(u_conf)), None)
+        self.assertIsNotNone(encontrado)
+        self.assertEqual(encontrado["id_consumo"], conflicto_reg.id_consumo)
+        self.assertEqual(encontrado["id_veterinario"], self.vet_a.id_usuario)
+        self.assertEqual(encontrado["id_medicamento"], self.med_a.id_medicamento)
+        self.assertEqual(encontrado["cantidad_solicitada"], 4)
+        self.assertEqual(encontrado["stock_disponible_al_rechazo"], 0)
+        self.assertIn("Stock insuficiente", encontrado["motivo_rechazo"])
+        self.assertIn("fecha_consumo", encontrado)
+
+        # Filtro por resuelto=false y por id_veterinario
+        resp_filtro = self.client.get(
+            f"/api/inventario/kit/conflictos/?resuelto=false&id_veterinario={self.vet_a.id_usuario}",
+            **self.headers_gestor
+        )
+        self.assertEqual(resp_filtro.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(resp_filtro.data["count"], 1)
+
+        # 2. Roles no autorizados -> 403 Forbidden (EsGestorInventario)
+        resp_vet = self.client.get("/api/inventario/kit/conflictos/", **self.headers_vet_a)
+        self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol2 = self.client.get("/api/inventario/kit/conflictos/", **headers_rol2)
+        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
+
+        resp_rol4 = self.client.get("/api/inventario/kit/conflictos/", **headers_rol4)
+        self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Base de datos inalterada
+        counts_post = (
+            KitVeterinarioLotes.objects.count(),
+            Inventarios.objects.count(),
+            InventarioKardex.objects.count(),
+            InventarioConsumosRegistro.objects.count(),
+        )
+        self.assertEqual(counts_pre, counts_post)
+
