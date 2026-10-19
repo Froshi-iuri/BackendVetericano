@@ -107,12 +107,18 @@ def _debe_descontar(item):
 
 
 def _descontar_fifo(id_medicamento, cantidad):
-    """Descuenta `cantidad` de los lotes más antiguos. Debe ejecutarse dentro de transaction.atomic."""
+    """
+    Descuenta `cantidad` de los lotes más antiguos. Debe ejecutarse dentro de transaction.atomic.
+    Usa select_for_update(no_key=True) (FOR NO KEY UPDATE) para evitar deadlock 40P01 con el
+    bloqueo FOR KEY SHARE que PostgreSQL adquiere sobre inventarios al insertar filas de kardex
+    en descontar_consumo_kit; alineado con el lock no_key de inventarios en solicitudes_service
+    y kit_service (la función solo actualiza cantidad_actual, sin alterar columnas clave/FK).
+    """
     from inventario.models import Inventarios
     ids_lotes = list(_filtro_lotes_medicamento(id_medicamento).values_list('id_inventario', flat=True))
-    # Bloqueo de filas para evitar descuentos concurrentes sobre el mismo lote
+    # Bloqueo de filas para evitar descuentos concurrentes sobre el mismo lote (FOR NO KEY UPDATE)
     lotes = list(
-        Inventarios.objects.select_for_update()
+        Inventarios.objects.select_for_update(no_key=True)
         .filter(pk__in=ids_lotes, cantidad_actual__gt=0)
         .order_by('id_inventario')
     )

@@ -499,7 +499,7 @@ class KitConcurrenciaTestCase(VetericanoTransactionTestCase):
 
     def test_con_48_deadlock_bodega_legacy_vs_kit_kardex(self):
         """
-        TEST-CON-48 (Caso 14): Deadlock Bodega Legacy FOR UPDATE vs Kit Kardex.
+        TEST-CON-48 (Caso 14): Prevención de Deadlock Bodega Legacy FOR UPDATE vs Kit Kardex.
         - Mismo veterinario en ambas peticiones.
         - Ambas vía POST /api/clinica/expediente-completo/ en modo online con client_uuid,
           animales e historias independientes.
@@ -508,26 +508,22 @@ class KitConcurrenciaTestCase(VetericanoTransactionTestCase):
         - Petición A: Med X en tratamiento legacy de bodega (hoja2.tratamientos con descuento)
           y Med Y en kit (medicamentos_usados).
         - Petición B: Med X y Med Y en kit (medicamentos_usados).
-        - Ciclo demostrado:
-          * A retiene FOR UPDATE sobre inventarios(X) (via _descontar_fifo, serializers.py:114-118).
-          * B retiene FOR UPDATE sobre kit_veterinario_lotes(X e Y) (via descontar_consumo_kit, consumo_service.py:498-502).
-          * B intenta insertar kardex para X (consumo_service.py:709-725) y PostgreSQL solicita FOR KEY SHARE sobre inventarios(X). B queda bloqueada por A.
-          * A intenta descontar kit de Y (serializers.py:622, consumo_service.py:498) y solicita FOR UPDATE sobre kit_veterinario_lotes(Y). A queda bloqueada por B.
-          * Ciclo A -> B -> A resuelto por PostgreSQL en ~1000ms con SQLSTATE 40P01.
+        - Prevención de ciclo tras fix (no_key=True en _descontar_fifo):
+          * A adquiere FOR NO KEY UPDATE sobre inventarios(X) (vía _descontar_fifo).
+          * B retiene FOR UPDATE sobre kit_veterinario_lotes(X e Y) (vía descontar_consumo_kit).
+          * B inserta kardex para X y PostgreSQL solicita FOR KEY SHARE sobre inventarios(X).
+            Como FOR NO KEY UPDATE no choca con FOR KEY SHARE, B NO queda bloqueada por A.
+          * El ciclo A -> B -> A ya no se forma. Ambas peticiones completan exitosamente (HTTP 201).
         - Determinismo / Instrumentación:
-          Se parchea descontar_consumo_kit tal como lo importa clinica.api.serializers
-          (importado dinámicamente desde inventario.services.consumo_service), con un wrapper
-          que introduce time.sleep(0.5) exclusivamente para el Hilo A. Esto garantiza que A
-          adquiera el lock de bodega antes de que B complete sus locks y bloquee en kardex.
-        - Resultados aceptados (prueba de caracterización):
-          (a) Un hilo 201 y el otro víctima con SQLSTATE 40P01 / HTTP 500 (confirmando Hallazgo 4:
-              ExpedienteCompletoAPIView.post en views.py:387-392 no captura OperationalError).
-          (b) Ambos hilos 201 (el ciclo no se formó).
+          Se mantiene la instrumentación con wrapper que introduce time.sleep (0.5 Hilo A, 0.3 Hilo B)
+          para forzar el solapamiento temporal y conservar el test como suite de regresión.
         - Invariantes en BD:
+          * Ambos hilos terminan 201 Created (sin 40P01 ni 500).
           * Saldos nunca negativos.
-          * Sobreviviente tiene consulta, consumo(s) APLICADO y kardex coherente.
-          * Víctima no deja consulta, consumo, kardex ni descuento de bodega (rollback total).
-          * Principio de conservación: saldos de bodega y kit coherentes con lo aplicado.
+          * Ambas historias tienen su Consulta creada (exactamente 1 en historia_a y 1 en historia_b).
+          * Exactamente 3 consumos APLICADO (u_a_y, u_b_x, u_b_y).
+          * Exactamente 3 filas kardex TIPO_KARDEX_CONSUMO_HISTORIA.
+          * Principio de conservación: saldos de bodega y kit coherentes con los consumos.
         """
         vet = crear_usuario(rol_id=3, email="vet_con48@cba.gov.co")
         headers_vet = obtener_headers_jwt(vet)
@@ -697,17 +693,29 @@ class KitConcurrenciaTestCase(VetericanoTransactionTestCase):
 
         statuses = [r['status'] for r in resultados]
 
-        es_caso_a = (
-            len([s for s in statuses if s == status.HTTP_201_CREATED]) == 1
-            and any(
-                r['status'] in ('DEADLOCK_40P01', 'DEADLOCK_500') or '40P01' in str(r.get('data', ''))
-                for r in resultados if r['status'] != status.HTTP_201_CREATED
+        # Inversión de aserciones: se exige que NO haya deadlock y ambos hilos retornen HTTP 201 Created
+        self.assertEqual(
+            res_a['status'],
+            status.HTTP_201_CREATED,
+            f"Hilo A no devolvió 201. Statuses: {statuses}, Detalle: {resultados}"
+        )
+        self.assertEqual(
+            res_b['status'],
+            status.HTTP_201_CREATED,
+            f"Hilo B no devolvió 201. Statuses: {statuses}, Detalle: {resultados}"
+        )
+
+        for r in resultados:
+            self.assertNotIn(
+                r['status'],
+                ('DEADLOCK_40P01', 'DEADLOCK_500'),
+                f"Detectado deadlock en hilo {r['hilo']}: {r}"
             )
-        )
-        self.assertTrue(
-            es_caso_a,
-            f"Exigido caso (a): un 201 y una víctima 40P01 de deadlock. Statuses: {statuses}, Detalle: {resultados}"
-        )
+            self.assertNotIn(
+                '40P01',
+                str(r.get('data', '')),
+                f"Detectado código 40P01 en hilo {r['hilo']}: {r}"
+            )
 
         lote_bodega_x.refresh_from_db()
         lote_bodega_y.refresh_from_db()
@@ -720,100 +728,75 @@ class KitConcurrenciaTestCase(VetericanoTransactionTestCase):
         self.assertGreaterEqual(kl_x.cantidad_actual, 0)
         self.assertGreaterEqual(kl_y.cantidad_actual, 0)
 
-        ganador = next(r for r in resultados if r['status'] == status.HTTP_201_CREATED)
-        victima = next(r for r in resultados if r['status'] != status.HTTP_201_CREATED)
+        # Estado final en BD: ambos hilos aplicaron sus consumos
+        # lote_bodega_x: 50 - 2 (tratamiento legacy A) = 48
+        self.assertEqual(lote_bodega_x.cantidad_actual, 48)
+        # lote_bodega_y: 50 (sin consumos de bodega general)
+        self.assertEqual(lote_bodega_y.cantidad_actual, 50)
+        # kl_x: 10 - 4 (consumo kit B) = 6
+        self.assertEqual(kl_x.cantidad_actual, 6)
+        # kl_y: 10 - 3 (consumo kit A) - 5 (consumo kit B) = 2
+        self.assertEqual(kl_y.cantidad_actual, 2)
 
-        if ganador['hilo'] == 0:
-            # Hilo A sobrevivió, Hilo B fue víctima de deadlock
-            self.assertEqual(Consulta.objects.filter(id_historia=historia_a).count(), 1)
-            self.assertEqual(Consulta.objects.filter(id_historia=historia_b).count(), 0)
+        # Conservación: bodega_x + kl_x == 54 y bodega_y + kl_y == 52
+        self.assertEqual(lote_bodega_x.cantidad_actual + kl_x.cantidad_actual, 54)
+        self.assertEqual(lote_bodega_y.cantidad_actual + kl_y.cantidad_actual, 52)
 
-            # Consumos: APLICADO para A, 0 para B (rollback completo)
-            self.assertEqual(
-                InventarioConsumosRegistro.objects.filter(
-                    client_uuid=u_a_y, estado=CONSUMO_ESTADO_APLICADO
-                ).count(),
-                1
-            )
-            self.assertEqual(
-                InventarioConsumosRegistro.objects.filter(
-                    client_uuid__in=[u_b_x, u_b_y]
-                ).count(),
-                0
-            )
+        # Consultas: exactamente 1 Consulta en historia_a y 1 en historia_b
+        self.assertEqual(Consulta.objects.filter(id_historia=historia_a).count(), 1)
+        self.assertEqual(Consulta.objects.filter(id_historia=historia_b).count(), 1)
 
-            # Kardex: 1 para A (consumo kit Y = 3), 0 para B
-            self.assertEqual(
-                InventarioKardex.objects.filter(
-                    client_uuid=u_a_y, tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
-                ).count(),
-                1
-            )
-            self.assertEqual(
-                InventarioKardex.objects.filter(
-                    client_uuid__in=[u_b_x, u_b_y]
-                ).count(),
-                0
-            )
+        # Consumos: 3 filas InventarioConsumosRegistro en estado APLICADO (u_a_y, u_b_x, u_b_y, una cada una)
+        self.assertEqual(
+            InventarioConsumosRegistro.objects.filter(
+                client_uuid=u_a_y, estado=CONSUMO_ESTADO_APLICADO
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioConsumosRegistro.objects.filter(
+                client_uuid=u_b_x, estado=CONSUMO_ESTADO_APLICADO
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioConsumosRegistro.objects.filter(
+                client_uuid=u_b_y, estado=CONSUMO_ESTADO_APLICADO
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioConsumosRegistro.objects.filter(
+                client_uuid__in=[u_a_y, u_b_x, u_b_y], estado=CONSUMO_ESTADO_APLICADO
+            ).count(),
+            3
+        )
 
-            # Saldos coherentes
-            self.assertEqual(lote_bodega_x.cantidad_actual, 48)  # 50 - 2
-            self.assertEqual(lote_bodega_y.cantidad_actual, 50)
-            self.assertEqual(kl_x.cantidad_actual, 10)
-            self.assertEqual(kl_y.cantidad_actual, 7)   # 10 - 3
-
-            # Principio de conservación: Bodega + Kit == Stock Inicial - Consumo
-            self.assertEqual(lote_bodega_x.cantidad_actual + kl_x.cantidad_actual, 58)
-            self.assertEqual(lote_bodega_y.cantidad_actual + kl_y.cantidad_actual, 57)
-
-        else:
-            # Hilo B sobrevivió, Hilo A fue víctima de deadlock
-            self.assertEqual(Consulta.objects.filter(id_historia=historia_b).count(), 1)
-            self.assertEqual(Consulta.objects.filter(id_historia=historia_a).count(), 0)
-
-            # Consumos: APLICADO para B, 0 para A (rollback completo)
-            self.assertEqual(
-                InventarioConsumosRegistro.objects.filter(
-                    client_uuid=u_b_x, estado=CONSUMO_ESTADO_APLICADO
-                ).count(),
-                1
-            )
-            self.assertEqual(
-                InventarioConsumosRegistro.objects.filter(
-                    client_uuid=u_b_y, estado=CONSUMO_ESTADO_APLICADO
-                ).count(),
-                1
-            )
-            self.assertEqual(
-                InventarioConsumosRegistro.objects.filter(
-                    client_uuid=u_a_y
-                ).count(),
-                0
-            )
-
-            # Kardex: 2 para B (consumos kit X = 4 e Y = 5), 0 para A
-            self.assertEqual(
-                InventarioKardex.objects.filter(
-                    client_uuid__in=[u_b_x, u_b_y], tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
-                ).count(),
-                2
-            )
-            self.assertEqual(
-                InventarioKardex.objects.filter(
-                    client_uuid=u_a_y
-                ).count(),
-                0
-            )
-
-            # Saldos coherentes (descuento de bodega de A revertido limpiamente)
-            self.assertEqual(lote_bodega_x.cantidad_actual, 50)  # Revertido
-            self.assertEqual(lote_bodega_y.cantidad_actual, 50)
-            self.assertEqual(kl_x.cantidad_actual, 6)   # 10 - 4
-            self.assertEqual(kl_y.cantidad_actual, 5)   # 10 - 5
-
-            # Principio de conservación
-            self.assertEqual(lote_bodega_x.cantidad_actual + kl_x.cantidad_actual, 56)
-            self.assertEqual(lote_bodega_y.cantidad_actual + kl_y.cantidad_actual, 55)
+        # Kardex: exactamente 3 filas con tipo TIPO_KARDEX_CONSUMO_HISTORIA, una por cada uno de esos client_uuid
+        self.assertEqual(
+            InventarioKardex.objects.filter(
+                client_uuid=u_a_y, tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioKardex.objects.filter(
+                client_uuid=u_b_x, tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioKardex.objects.filter(
+                client_uuid=u_b_y, tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
+            ).count(),
+            1
+        )
+        self.assertEqual(
+            InventarioKardex.objects.filter(
+                client_uuid__in=[u_a_y, u_b_x, u_b_y], tipo_movimiento=TIPO_KARDEX_CONSUMO_HISTORIA
+            ).count(),
+            3
+        )
 
     def test_con_45_doble_aprobacion_concurrente_devolucion(self):
         """
