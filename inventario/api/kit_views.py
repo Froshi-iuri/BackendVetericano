@@ -270,7 +270,8 @@ class KitRetiroDirectoView(KitErrorHandlingMixin, APIView):
             "cantidad_total_retirada": resultado['cantidad_total_retirada'],
             "unidades_reintegradas": resultado['unidades_reintegradas_bodega'],
             "unidades_baja_vencimiento": resultado['unidades_baja_vencimiento'],
-            "lotes_afectados": resultado['lotes_afectados'],
+            "lotes_reintegrados_bodega": resultado['lotes_reintegrados_bodega'],
+            "bajas_vencimiento": resultado['bajas_vencimiento'],
         }, status=status.HTTP_200_OK)
 
 

@@ -7,7 +7,6 @@ Especificación:
 - plan/DECISIONES.md (§1, §4, §5, §7, §8, §11, §12).
 """
 
-import unittest
 import uuid
 from datetime import timedelta
 from django.test import TestCase
@@ -238,7 +237,6 @@ class KitFlujoTestCase(TestCase):
         self.assertEqual(ret_gen.saldo_anterior, 20)
         self.assertEqual(ret_gen.saldo_resultante, 22)
 
-    @unittest.expectedFailure
     def test_kit_24b_retiro_directo_endpoint_h_c2(self):
         """
         TEST-KIT-24B: Retiro directo de stock vía POST /api/inventario/kit/retiro-directo/.
@@ -246,11 +244,12 @@ class KitFlujoTestCase(TestCase):
         - cantidad_total_retirada = 7
         - unidades_baja_vencimiento = 5
         - unidades_reintegradas = 2
+        - lotes_reintegrados_bodega y bajas_vencimiento
 
-        HALLAZGO H-C2: kit_views.py:273 accede a resultado['lotes_afectados'], clave que no existe
-        en el retorno de retirar_stock_de_kit (kit_service.py:754-763 devuelve lotes_reintegrados_bodega
-        y bajas_vencimiento); lotes_afectados solo existe en procesar_devolucion_aprobada.
-        Se decora con @unittest.expectedFailure para documentar el hallazgo de la vista sin enmascararlo.
+        HALLAZGO H-C2 (CORREGIDO): kit_views.py accedía a resultado['lotes_afectados'],
+        clave inexistente en el retorno de retirar_stock_de_kit (kit_service.py:754-763).
+        Corregido en kit_views.py para exponer lotes_reintegrados_bodega y bajas_vencimiento.
+        Ya no es fallo esperado; test regular de regresión.
         """
         # Crear lotes de bodega base
         b1 = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy - timedelta(days=10), estado="Agotado")
@@ -258,9 +257,9 @@ class KitFlujoTestCase(TestCase):
         b3 = crear_lote_bodega(self.med_a, cantidad=20, fecha_vencimiento=self.hoy + timedelta(days=90), estado="Disponible")
 
         # Asignar lotes al kit del veterinario
-        crear_lote_kit(self.vet_a, b1, cantidad=2, cantidad_ref=2, fecha_vencimiento=b1.fecha_vencimiento)
-        crear_lote_kit(self.vet_a, b2, cantidad=3, cantidad_ref=3, fecha_vencimiento=b2.fecha_vencimiento)
-        crear_lote_kit(self.vet_a, b3, cantidad=10, cantidad_ref=10, fecha_vencimiento=b3.fecha_vencimiento)
+        kl1 = crear_lote_kit(self.vet_a, b1, cantidad=2, cantidad_ref=2, fecha_vencimiento=b1.fecha_vencimiento)
+        kl2 = crear_lote_kit(self.vet_a, b2, cantidad=3, cantidad_ref=3, fecha_vencimiento=b2.fecha_vencimiento)
+        kl3 = crear_lote_kit(self.vet_a, b3, cantidad=10, cantidad_ref=10, fecha_vencimiento=b3.fecha_vencimiento)
 
         payload = {
             "id_veterinario": self.vet_a.id_usuario,
@@ -280,6 +279,23 @@ class KitFlujoTestCase(TestCase):
         self.assertEqual(response.data.get("cantidad_total_retirada"), 7)
         self.assertEqual(response.data.get("unidades_baja_vencimiento"), 5)
         self.assertEqual(response.data.get("unidades_reintegradas"), 2)
+
+        # Aserciones sobre claves nuevas de lotes en la respuesta
+        self.assertEqual(len(response.data.get("bajas_vencimiento", [])), 2)
+        self.assertEqual(len(response.data.get("lotes_reintegrados_bodega", [])), 1)
+        self.assertEqual(response.data["lotes_reintegrados_bodega"][0]["cantidad_retirada"], 2)
+        self.assertEqual(response.data["lotes_reintegrados_bodega"][0]["saldo_resultante_bodega"], 22)
+        self.assertEqual(response.data["lotes_reintegrados_bodega"][0]["saldo_restante_kit"], 8)
+
+        # Estado en BD
+        b3.refresh_from_db()
+        kl1.refresh_from_db()
+        kl2.refresh_from_db()
+        kl3.refresh_from_db()
+        self.assertEqual(b3.cantidad_actual, 22)
+        self.assertEqual(kl1.cantidad_actual, 0)
+        self.assertEqual(kl2.cantidad_actual, 0)
+        self.assertEqual(kl3.cantidad_actual, 8)
 
     def test_kit_33a_semantica_referencia_lote_nuevo(self):
         """
