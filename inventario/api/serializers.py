@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.db import transaction
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
+from .permissions import _es_gestor
 
 
 class ProveedoresSerializer(serializers.ModelSerializer):
@@ -122,3 +123,41 @@ class InventariosSerializer(serializers.ModelSerializer):
     class Meta:
         model = Inventarios
         fields = '__all__'
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        if request and self.instance is not None and not _es_gestor(request.user):
+            # 1. Validar claves permitidas en self.initial_data
+            if hasattr(self, 'initial_data') and self.initial_data:
+                claves_recibidas = set(self.initial_data.keys())
+                claves_no_permitidas = claves_recibidas - {'cantidad_actual', 'estado'}
+                if claves_no_permitidas:
+                    raise serializers.ValidationError(
+                        f"Campos no permitidos para ajuste de stock: {sorted(list(claves_no_permitidas))}.",
+                        code='AJUSTE_STOCK_CAMPOS_NO_PERMITIDOS'
+                    )
+
+            # 2. Validar que cantidad_actual no sea negativa
+            if 'cantidad_actual' in attrs and attrs['cantidad_actual'] is not None and attrs['cantidad_actual'] < 0:
+                raise serializers.ValidationError(
+                    "La cantidad_actual no puede ser negativa.",
+                    code='AJUSTE_STOCK_NEGATIVO'
+                )
+
+        return super().validate(attrs)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        request = self.context.get('request')
+        if request and not _es_gestor(request.user) and 'cantidad_actual' in validated_data:
+            instancia_bloqueada = Inventarios.objects.select_for_update(no_key=True).get(pk=instance.pk)
+            nueva_cantidad = validated_data['cantidad_actual']
+            if nueva_cantidad is not None and nueva_cantidad > instancia_bloqueada.cantidad_actual:
+                raise serializers.ValidationError(
+                    "No esta permitido aumentar la cantidad_actual en ajuste de stock.",
+                    code='AJUSTE_STOCK_AUMENTO_NO_PERMITIDO'
+                )
+            return super().update(instancia_bloqueada, validated_data)
+
+        return super().update(instance, validated_data)
+

@@ -1,7 +1,7 @@
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from .permissions import EsGestorOLecturaStaffLegacy, PermisoInventariosLegacy
 from django.db import transaction
 from django.db.models import Sum, Count
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
@@ -19,13 +19,13 @@ from .serializers import (
 class ProveedoresViewSet(viewsets.ModelViewSet):
     queryset = Proveedores.objects.all()
     serializer_class = ProveedoresSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EsGestorOLecturaStaffLegacy]
 
 
 class CompraViewSet(viewsets.ModelViewSet):
     queryset = Compra.objects.all()
     serializer_class = CompraSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EsGestorOLecturaStaffLegacy]
 
     @action(detail=False, methods=['get'])
     def estadisticas(self, request):
@@ -43,19 +43,19 @@ class CompraViewSet(viewsets.ModelViewSet):
 class DetalleCompraViewSet(viewsets.ModelViewSet):
     queryset = DetalleCompra.objects.all()
     serializer_class = DetalleCompraSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EsGestorOLecturaStaffLegacy]
 
 
 class SalidasViewSet(viewsets.ModelViewSet):
     queryset = Salidas.objects.all()
     serializer_class = SalidasSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EsGestorOLecturaStaffLegacy]
 
 
 class DetalleSalidaViewSet(viewsets.ModelViewSet):
     queryset = DetalleSalida.objects.all()
     serializer_class = DetalleSalidaSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EsGestorOLecturaStaffLegacy]
 
     def get_serializer(self, *args, **kwargs):
         # Si la data es una lista, decirle a DRF que procese en modo 'many=True'
@@ -74,4 +74,4 @@ class DetalleSalidaViewSet(viewsets.ModelViewSet):
 class InventariosViewSet(viewsets.ModelViewSet):
     queryset = Inventarios.objects.all()
     serializer_class = InventariosSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoInventariosLegacy]

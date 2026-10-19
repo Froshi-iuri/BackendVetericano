@@ -12,7 +12,12 @@ Define las políticas de control de acceso basadas en roles institucionales (R10
 from typing import Any, Tuple
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
-from inventario.constants import INVENTARIO_GESTOR_ROLES, ROL_VETERINARIO
+from inventario.constants import (
+    INVENTARIO_GESTOR_ROLES,
+    ROL_VETERINARIO,
+    INVENTARIO_LECTURA_LEGACY_ROLES,
+    INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES,
+)
 
 
 def _resolver_usuario_activo_y_rol(user: Any) -> Tuple[bool, Any]:
@@ -142,4 +147,83 @@ class EsVeterinarioDuenioDelKit(BasePermission):
         if vet_id is not None:
             return vet_id == request.user.id_usuario
         return False
+
+
+class EsGestorOLecturaStaffLegacy(BasePermission):
+    """
+    Permiso para viewsets legacy de inventario (proveedores, compras, salidas, etc.):
+    autoriza operaciones de solo lectura (SAFE_METHODS: GET, HEAD, OPTIONS) a usuarios
+    activos de staff (roles en INVENTARIO_LECTURA_LEGACY_ROLES: Admin, Juridico, Veterinario),
+    y reserva las mutaciones (POST, PUT, PATCH, DELETE) exclusivamente a gestores de inventario.
+    Existe para mantener compatibilidad con la web previa a la migracion al kit.
+    Politica fail-closed: si el usuario no es activo o su rol es desconocido/None, retorna False.
+    """
+    message = "Se requieren permisos de gestor de inventario o rol de staff autorizado para esta accion."
+
+    def has_permission(self, request, view) -> bool:
+        es_activo, rol_id = _resolver_usuario_activo_y_rol(request.user)
+        if not es_activo or rol_id is None:
+            return False
+
+        if request.method in SAFE_METHODS:
+            return rol_id in INVENTARIO_LECTURA_LEGACY_ROLES
+
+        return _es_gestor(request.user)
+
+    def has_object_permission(self, request, view, obj) -> bool:
+        es_activo, rol_id = _resolver_usuario_activo_y_rol(request.user)
+        if not es_activo or rol_id is None:
+            return False
+
+        if request.method in SAFE_METHODS:
+            return rol_id in INVENTARIO_LECTURA_LEGACY_ROLES
+
+        return _es_gestor(request.user)
+
+
+class PermisoInventariosLegacy(BasePermission):
+    """
+    Permiso para el viewset legacy de inventarios (InventariosViewSet):
+    - Gestor: permitido en todos los metodos (POST, PUT, PATCH, DELETE, GET, etc.).
+    - Metodos SAFE (GET, HEAD, OPTIONS): permitido si el rol esta en INVENTARIO_LECTURA_LEGACY_ROLES.
+    - Metodo PATCH: permitido si el rol esta en INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES (Veterinario, Juridico),
+      delegando las restricciones de contenido especificas (solo reducir stock/estado) al serializer.
+    - Cualquier otra combinacion (POST, PUT, DELETE de no gestor; Peticionario en cualquier metodo): denegado (False).
+    Existe para mantener compatibilidad con la web previa a la migracion al kit (acta web y consulta de lotes).
+    Politica fail-closed: usuarios inactivos o roles nulos/desconocidos reciben False.
+    """
+    message = "Acceso restringido: no posee permisos para realizar esta operacion sobre el inventario."
+
+    def has_permission(self, request, view) -> bool:
+        es_activo, rol_id = _resolver_usuario_activo_y_rol(request.user)
+        if not es_activo or rol_id is None:
+            return False
+
+        if _es_gestor(request.user):
+            return True
+
+        if request.method in SAFE_METHODS:
+            return rol_id in INVENTARIO_LECTURA_LEGACY_ROLES
+
+        if request.method == 'PATCH':
+            return rol_id in INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES
+
+        return False
+
+    def has_object_permission(self, request, view, obj) -> bool:
+        es_activo, rol_id = _resolver_usuario_activo_y_rol(request.user)
+        if not es_activo or rol_id is None:
+            return False
+
+        if _es_gestor(request.user):
+            return True
+
+        if request.method in SAFE_METHODS:
+            return rol_id in INVENTARIO_LECTURA_LEGACY_ROLES
+
+        if request.method == 'PATCH':
+            return rol_id in INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES
+
+        return False
+
 

@@ -12,6 +12,12 @@ Proyecto VETERICANO - Centro de Bienestar Animal (CBA) Popayán.
 INVENTARIO_GESTOR_ROLES = [1]
 ROL_VETERINARIO = 3
 
+# Roles autorizados para lectura en viewsets antiguos de inventario (Administrador, Juridico, Veterinario)
+INVENTARIO_LECTURA_LEGACY_ROLES = [1, 2, 3]
+
+# Roles autorizados para PATCH limitado de cantidad_actual y estado en inventarios (acta web)
+INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES = [2, 3]
+
 # ----------------------------------------------------------------------------
 # 2. UMBRALES DE ALERTA DE STOCK Y VENCIMIENTO (R11)
 # ----------------------------------------------------------------------------
