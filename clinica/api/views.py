@@ -1,4 +1,5 @@
-from rest_framework import viewsets
+from rest_framework import viewsets, status
+from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from clinica.models import (
     HistoriaClinica,
@@ -22,10 +23,31 @@ from .serializers import (
 )
 
 
+from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError, RestrictedError
 from animales.models import Animal
 
 
-class HistoriaClinicaViewSet(viewsets.ModelViewSet):
+class RestrictDeleteProtectionMixin:
+    """
+    Captura errores de restricción de integridad referencial al intentar eliminar
+    registros clínicos que poseen otros registros asociados que dependen de ellos.
+    """
+    def destroy(self, request, *args, **kwargs):
+        try:
+            with transaction.atomic():
+                return super().destroy(request, *args, **kwargs)
+        except (ProtectedError, RestrictedError, IntegrityError):
+            return Response(
+                {
+                    "error": "No se puede eliminar este registro porque tiene otros registros asociados que dependen de él.",
+                    "codigo": "REGISTRO_CON_DEPENDENCIAS",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+
+class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = HistoriaClinica.objects.all()
     serializer_class = HistoriaClinicaSerializer
     permission_classes = [IsAuthenticated]
@@ -38,7 +60,7 @@ class HistoriaClinicaViewSet(viewsets.ModelViewSet):
         return queryset
 
 
-class ConsultaViewSet(viewsets.ModelViewSet):
+class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
     permission_classes = [IsAuthenticated]
@@ -60,7 +82,7 @@ class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-class TratamientosViewSet(viewsets.ModelViewSet):
+class TratamientosViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Tratamientos.objects.all()
     serializer_class = TratamientosSerializer
     permission_classes = [IsAuthenticated]
@@ -91,14 +113,13 @@ class SeguimientoHospitalarioViewSet(viewsets.ModelViewSet):
 
 
 from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
 from .serializers import ExpedienteCompletoSerializer
+from inventario.api.kit_views import KitErrorHandlingMixin
 
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-class ExpedienteCompletoAPIView(APIView):
+class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     @swagger_auto_schema(
@@ -370,6 +391,280 @@ class ExpedienteCompletoAPIView(APIView):
             return Response(result, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    @swagger_auto_schema(
+        operation_description="Actualiza la historia clínica y evolución del animal registrando trazabilidad y auditoría de cambios (Jira SCRUM-84 / HE06-HU013).",
+        responses={200: "Historia clínica actualizada con éxito", 400: "Datos inválidos o historia anulada", 404: "No encontrado"}
+    )
+    def patch(self, request, *args, **kwargs):
+        from django.db import transaction
+        from datetime import datetime
+
+        data = request.data
+        id_animal = data.get('id_animal')
+        if not id_animal:
+            animal_data = data.get('animal') or {}
+            id_animal = animal_data.get('id_animal') or animal_data.get('id')
+
+        if not id_animal:
+            return Response(
+                {"detail": "El id_animal es obligatorio para actualizar la historia clínica."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        animal = Animal.objects.filter(pk=id_animal).first()
+        if not animal:
+            return Response(
+                {"detail": f"No se encontró el animal con ID {id_animal}."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        historia = HistoriaClinica.objects.filter(id_animal=animal).first()
+        if not historia:
+            return Response(
+                {"detail": f"El animal '{animal.nombre}' no posee historia clínica registrada previa."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Criterio Jira HE06-HU013 Escenario 3.0: Edición bloqueada en historia anulada
+        if str(historia.estado_general or '').strip().lower() == 'anulado':
+            return Response(
+                {"detail": "La historia clínica se encuentra anulada y no puede ser modificada."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Criterio Jira HE06-HU013 Escenario 2.0: Validación de campos obligatorios
+        diagnostico_principal = data.get('diagnostico_principal') or data.get('diagnosticoPrincipal') or ''
+        evolucion = data.get('evolucion') or ''
+        pronostico = data.get('pronostico') or 'Favorable'
+        plan_tratamiento = data.get('plan_tratamiento') or data.get('planTratamiento') or ''
+        motivo_modificacion = data.get('motivo_modificacion') or data.get('motivoModificacion') or ''
+
+        if not str(diagnostico_principal).strip():
+            return Response({"detail": "El diagnóstico principal es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
+        if not str(evolucion).strip():
+            return Response({"detail": "La evolución médica es obligatoria."}, status=status.HTTP_400_BAD_REQUEST)
+        if not str(motivo_modificacion).strip():
+            return Response({"detail": "Debe justificar el motivo de la modificación para el historial de auditoría."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from inventario.constants import CONSUMO_ORIGEN_HISTORIA
+        from inventario.services.consumo_service import descontar_consumo_kit
+        from inventario.api.kit_serializers import (
+            validar_payload_consumo_kit,
+            verificar_idempotencia_consumo_clinico,
+            extraer_alertas_farmacia,
+        )
+
+        id_vet_kit = getattr(request.user, 'id_usuario', None)
+        consumos_kit, es_offline_kit = validar_payload_consumo_kit(
+            raw_meds=data.get('medicamentos_usados'),
+            raw_offline=data.get('sincronizacion_offline', False),
+            id_veterinario=id_vet_kit,
+            permitir_multipart=False,
+        )
+
+        with transaction.atomic():
+            # Actualizar peso del animal si fue suministrado
+            nuevo_peso = data.get('peso')
+            peso_anterior = float(animal.peso) if animal.peso else None
+            if nuevo_peso is not None and str(nuevo_peso).strip() != '':
+                try:
+                    nuevo_peso_float = float(nuevo_peso)
+                    if nuevo_peso_float != peso_anterior:
+                        animal.peso = nuevo_peso_float
+                        animal.save(update_fields=['peso'])
+                except (ValueError, TypeError):
+                    pass
+
+            # Obtener última consulta asociada a la historia clínica única
+            consulta = historia.consulta_set.order_by('-fecha_hora').first()
+            if not consulta:
+                consulta = Consulta.objects.create(
+                    id_historia=historia,
+                    motivo_consulta=f"Actualización / Control: {motivo_modificacion}",
+                    pronostico=pronostico
+                )
+
+            diag_obj = consulta.diagnostico_set.last()
+            diag_anterior = diag_obj.descripcion if diag_obj else ""
+            evolucion_anterior = historia.evolucion_previa or ""
+            pronostico_anterior = consulta.pronostico or ""
+            plan_anterior = consulta.plan_procedimientos or historia.tratamientos_anteriores or ""
+
+            # Calcular campos cambiados (Criterio Jira HE06-HU013 Escenario 4.0)
+            campos_cambiados = []
+            if str(diagnostico_principal).strip() != str(diag_anterior).strip():
+                campos_cambiados.append({
+                    "campo": "diagnostico_principal",
+                    "etiqueta": "Diagnóstico Principal",
+                    "valor_anterior": diag_anterior or "(vacío)",
+                    "valor_nuevo": diagnostico_principal
+                })
+            if str(evolucion).strip() != str(evolucion_anterior).strip():
+                campos_cambiados.append({
+                    "campo": "evolucion",
+                    "etiqueta": "Evolución Clínica",
+                    "valor_anterior": evolucion_anterior or "(vacío)",
+                    "valor_nuevo": evolucion
+                })
+            if str(pronostico).strip() != str(pronostico_anterior).strip():
+                campos_cambiados.append({
+                    "campo": "pronostico",
+                    "etiqueta": "Pronóstico",
+                    "valor_anterior": pronostico_anterior or "(vacío)",
+                    "valor_nuevo": pronostico
+                })
+            if str(plan_tratamiento).strip() != str(plan_anterior).strip():
+                campos_cambiados.append({
+                    "campo": "plan_tratamiento",
+                    "etiqueta": "Plan de Tratamiento",
+                    "valor_anterior": plan_anterior or "(vacío)",
+                    "valor_nuevo": plan_tratamiento
+                })
+            if nuevo_peso is not None and str(nuevo_peso).strip() != '' and peso_anterior != float(nuevo_peso):
+                campos_cambiados.append({
+                    "campo": "peso",
+                    "etiqueta": "Peso del Paciente",
+                    "valor_anterior": f"{peso_anterior} kg" if peso_anterior is not None else "(vacío)",
+                    "valor_nuevo": f"{nuevo_peso} kg"
+                })
+
+            # Identificar usuario en sesión
+            vet_nombre = ""
+            vet_rol = "Veterinario Oficial"
+            if request.user and request.user.is_authenticated:
+                vet_nombre = f"{getattr(request.user, 'nombre', '')} {getattr(request.user, 'apellido', '')}".strip() or getattr(request.user, 'username', '')
+                if hasattr(request.user, 'id_rol') and request.user.id_rol:
+                    vet_rol = getattr(request.user.id_rol, 'nombre_rol', 'Veterinario')
+
+            nuevo_registro = {
+                "id_auditoria": int(datetime.now().timestamp() * 1000),
+                "id_historia": historia.id_historia,
+                "id_consulta": consulta.id_consulta,
+                "usuario": vet_nombre or "Veterinario CBA",
+                "rol": vet_rol,
+                "fecha_hora": datetime.now().isoformat(),
+                "tipo_accion": "Actualización de Evolución y Diagnóstico",
+                "motivo_cambio": motivo_modificacion,
+                "campos_cambiados": campos_cambiados if campos_cambiados else [{
+                    "campo": "evolucion",
+                    "etiqueta": "Evolución",
+                    "valor_anterior": evolucion_anterior or "(sin cambio)",
+                    "valor_nuevo": evolucion
+                }]
+            }
+
+            # Persistencia de auditoría en JSONField sin requerir nuevas tablas SQL
+            eval_sistemas = consulta.evaluacion_sistemas if isinstance(consulta.evaluacion_sistemas, dict) else {}
+            historial = eval_sistemas.get('_historial_modificaciones', [])
+            if not isinstance(historial, list):
+                historial = []
+            historial.insert(0, nuevo_registro)
+            eval_sistemas['_historial_modificaciones'] = historial
+            consulta.evaluacion_sistemas = eval_sistemas
+
+            # Actualizar constantes fisiológicas
+            def parse_num(val, cast_fn):
+                if val is None or str(val).strip() == '': return None
+                try: return cast_fn(val)
+                except: return None
+
+            fc = parse_num(data.get('frecuencia_cardiaca') or data.get('frecuenciaCardiaca'), int)
+            fr = parse_num(data.get('frecuencia_respiratoria') or data.get('frecuenciaRespiratoria'), int)
+            temp = parse_num(data.get('temperatura'), float)
+
+            if fc is not None: consulta.frecuencia_cardiaca = fc
+            if fr is not None: consulta.frecuencia_respiratoria = fr
+            if temp is not None: consulta.temperatura = temp
+
+            diagnostico_diferencial = data.get('diagnostico_diferencial') or data.get('diagnosticoDiferencial') or ''
+            if diagnostico_diferencial:
+                consulta.hallazgos_examen = diagnostico_diferencial
+
+            consulta.plan_procedimientos = plan_tratamiento
+            consulta.pronostico = pronostico
+            consulta.save()
+
+            # Actualizar antecedentes en HistoriaClinica
+            historia.evolucion_previa = evolucion
+            historia.tratamientos_anteriores = plan_tratamiento
+            historia.save(update_fields=['evolucion_previa', 'tratamientos_anteriores'])
+
+            # Actualizar Diagnóstico final
+            lista_prob = data.get('lista_problemas') or data.get('listaProblemas') or ''
+            if isinstance(lista_prob, list):
+                lista_prob = "; ".join(lista_prob)
+
+            if diag_obj:
+                diag_obj.descripcion = diagnostico_principal
+                diag_obj.lista_problemas = str(lista_prob)
+                diag_obj.save(update_fields=['descripcion', 'lista_problemas'])
+            else:
+                diag_obj = Diagnostico.objects.create(
+                    id_consulta=consulta,
+                    descripcion=diagnostico_principal,
+                    lista_problemas=str(lista_prob),
+                    tipo_diagnostico='Final'
+                )
+
+            # Vincular catálogo de Patología si fue seleccionada
+            id_patologia = data.get('id_patologia') or data.get('idPatologia')
+            from patologias.models import Patologia
+            pat_obj = None
+            if id_patologia:
+                pat_obj = Patologia.objects.filter(pk=id_patologia).first()
+            elif diagnostico_principal:
+                pat_obj = Patologia.objects.filter(nombre__iexact=str(diagnostico_principal).strip()).first()
+
+            if pat_obj:
+                from clinica.models import DiagnosticoPatologia
+                dp = DiagnosticoPatologia.objects.filter(id_diagnostico=diag_obj).first()
+                if dp:
+                    dp.id_patologia = pat_obj
+                    dp.save(update_fields=['id_patologia'])
+                else:
+                    DiagnosticoPatologia.objects.create(
+                        id_diagnostico=diag_obj,
+                        id_patologia=pat_obj,
+                        hallazgos_pruebas=diagnostico_diferencial
+                    )
+
+            alertas_farmacia = None
+            if consumos_kit:
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=consulta.id_consulta,
+                    post_descuento=False,
+                )
+                resultado_kit = descontar_consumo_kit(
+                    id_veterinario=id_vet_kit,
+                    consumos=consumos_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    origen_ids={'id_consulta': consulta.id_consulta},
+                    es_offline=es_offline_kit,
+                )
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=consulta.id_consulta,
+                    post_descuento=True,
+                )
+                alertas_farmacia = extraer_alertas_farmacia(resultado_kit)
+
+        respuesta_patch = {
+            "status": "success",
+            "mensaje": "Historia clínica actualizada con éxito. La evolución y diagnóstico fueron registrados en el expediente.",
+            "historia_id": historia.id_historia,
+            "consulta_id": consulta.id_consulta,
+            "auditoria": nuevo_registro,
+            "historial_modificaciones": historial
+        }
+        if alertas_farmacia:
+            respuesta_patch["alertas_farmacia"] = alertas_farmacia
+        return Response(respuesta_patch, status=status.HTTP_200_OK)
+
 
 class ExpedientePorAnimalAPIView(APIView):
     """
@@ -431,7 +726,8 @@ class ExpedientePorAnimalAPIView(APIView):
                 "animal": animal_data,
                 "tenedor": tenedor_data,
                 "anamnesicos": {},
-                "consultas_anteriores": []
+                "consultas_anteriores": [],
+                "historial_modificaciones": []
             }, status=status.HTTP_200_OK)
 
         animal_data["numeroHistoriaClinica"] = historia.numero_historia or ""
@@ -455,8 +751,14 @@ class ExpedientePorAnimalAPIView(APIView):
             'tratamientos_set__tratamientomedicamentos_set__id_medicamento'
         ).order_by('-fecha_hora')
         consultas_anteriores = []
-        for c in consultas_qs:
+        historial_modificaciones = []
+
+        for index, c in enumerate(consultas_qs):
             diag = c.diagnostico_set.last()
+            # Extraer auditoría persistente de la consulta más reciente
+            if index == 0 and isinstance(c.evaluacion_sistemas, dict):
+                historial_modificaciones = c.evaluacion_sistemas.get('_historial_modificaciones', [])
+
             tratamientos_list = []
             for t in c.tratamientos_set.all():
                 tm = t.tratamientomedicamentos_set.first()
@@ -489,8 +791,10 @@ class ExpedientePorAnimalAPIView(APIView):
             "id_animal": animal.id_animal,
             "id_historia": historia.id_historia,
             "numero_historia": historia.numero_historia or "",
+            "estado_general": historia.estado_general or "activo",
             "animal": animal_data,
             "tenedor": tenedor_data,
             "anamnesicos": anamnesicos_data,
-            "consultas_anteriores": consultas_anteriores
+            "consultas_anteriores": consultas_anteriores,
+            "historial_modificaciones": historial_modificaciones
         }, status=status.HTTP_200_OK)

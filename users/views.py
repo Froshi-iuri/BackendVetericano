@@ -21,18 +21,18 @@ load_dotenv()
 
 @api_view(['POST'])
 def solicitar_recuperacion(request):
-    email = request.data.get('email')
+    email = (request.data.get('email') or '').strip()
     
     if not email:
         return Response({'error': 'Por favor ingresa un correo electrónico.'}, status=status.HTTP_400_BAD_REQUEST)
     
-    try:
-        user = Usuarios.objects.get(email__iexact=email)
-    except Usuarios.DoesNotExist:
+    user = Usuarios.objects.filter(email__iexact=email).first()
+    if not user:
         return Response({'error': 'No existe un usuario con este correo.'}, status=status.HTTP_404_NOT_FOUND)
     
+    email_key = email.lower()
     codigo = str(random.randint(100000, 999999))
-    cache.set(f'recuperacion_{email}', codigo, timeout=900)
+    cache.set(f'recuperacion_{email_key}', codigo, timeout=900)
     
     asunto = 'Código de recuperación de contraseña'
     cuerpo = f'Hola, tu código para recuperar la contraseña es: {codigo}'
@@ -45,8 +45,8 @@ def solicitar_recuperacion(request):
         <p>Este código es válido por 15 minutos.</p>
         </body></html>"""
         resultado = enviar_correo_transaccional_brevo(
-            destinatario_email=email,
-            destinatario_nombre='Usuario',
+            destinatario_email=user.email,
+            destinatario_nombre=user.nombre or 'Usuario',
             asunto=asunto,
             contenido_html=html_content,
         )
@@ -61,27 +61,30 @@ def solicitar_recuperacion(request):
 
 @api_view(['POST'])
 def confirmar_recuperacion(request):
-    email = request.data.get('email')
-    codigo = request.data.get('codigo')
-    nueva_password = request.data.get('nueva_password')
+    email = (request.data.get('email') or '').strip()
+    codigo = (request.data.get('codigo') or '').strip()
+    nueva_password = (request.data.get('nueva_password') or '').strip()
     
     if not email or not codigo or not nueva_password:
         return Response({'error': 'Todos los campos son obligatorios.'}, status=status.HTTP_400_BAD_REQUEST)
     
-    try:
-        user = Usuarios.objects.get(email__iexact=email)
-    except Usuarios.DoesNotExist:
+    usuarios_coincidentes = Usuarios.objects.filter(email__iexact=email)
+    if not usuarios_coincidentes.exists():
         return Response({'error': 'Usuario no encontrado.'}, status=status.HTTP_404_NOT_FOUND)
     
-    codigo_guardado = cache.get(f'recuperacion_{email}')
+    email_key = email.lower()
+    codigo_guardado = cache.get(f'recuperacion_{email_key}') or cache.get(f'recuperacion_{email}')
     
-    if not codigo_guardado or codigo_guardado != codigo:
+    if not codigo_guardado or str(codigo_guardado).strip() != codigo:
         return Response({'error': 'El código de recuperación es incorrecto o ha expirado.'}, status=status.HTTP_400_BAD_REQUEST)
     
-    # Actualizar la contraseña con el hash seguro
-    user.password = make_password(nueva_password)
-    user.save(update_fields=['password'])
+    # Actualizar la contraseña con el hash seguro en todas las coincidencias de ese email
+    password_hash = make_password(nueva_password)
+    for u in usuarios_coincidentes:
+        u.password = password_hash
+        u.save(update_fields=['password'])
     
+    cache.delete(f'recuperacion_{email_key}')
     cache.delete(f'recuperacion_{email}')
     
     return Response({'mensaje': 'Contraseña actualizada exitosamente.'}, status=status.HTTP_200_OK)

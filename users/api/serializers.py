@@ -49,9 +49,9 @@ class LoginCustomSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate(self, data):
-        # 1. Buscamos al usuario por correo en nuestra tabla personalizada.
-        # Si usas User.objects.get(), fallará si el correo no existe, por eso usamos filter y .first().
-        user = Usuarios.objects.filter(email=data['email']).first()
+        # 1. Buscamos al usuario por correo en nuestra tabla personalizada (insensible a mayúsculas/espacios).
+        email_limpio = (data.get('email') or '').strip()
+        user = Usuarios.objects.filter(email__iexact=email_limpio).first()
 
         # 2. Validaciones encadenadas:
         # - ¿El usuario existe?
@@ -71,6 +71,9 @@ class UsuariosSerializer(serializers.ModelSerializer):
         source='id_rol.nombre_rol',
         read_only=True
     )
+    password = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
+    )
     telefono = serializers.CharField(
         required=False, allow_blank=True, allow_null=True
     )
@@ -87,6 +90,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'id_usuario',
             'email',
             'identificacion',
+            'password',
             'nombre',
             'apellido',
             'telefono',
@@ -99,10 +103,38 @@ class UsuariosSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'email': {'required': False},
             'identificacion': {'required': False},
+            'password': {'write_only': True, 'required': False},
             'id_rol': {'required': False},
             'matricula_profesional': {'required': False},
             'foto_perfil': {'required': False},
         }
+
+    def _generar_password_por_defecto(self, validated_data):
+        identificacion = (validated_data.get('identificacion') or '').strip()
+        nombre = (validated_data.get('nombre') or '').strip()
+        inicial = nombre[0].upper() if nombre else 'V'
+        if not inicial.isalpha():
+            inicial = 'V'
+        base_id = identificacion if identificacion else '12345678'
+        return f"{base_id}{inicial}"
+
+    def create(self, validated_data):
+        raw_password = (validated_data.pop('password', None) or '').strip()
+        if not raw_password:
+            raw_password = self._generar_password_por_defecto(validated_data)
+        validated_data['password'] = make_password(raw_password)
+
+        if not validated_data.get('id_rol'):
+            rol_peticionario, _ = Rol.objects.get_or_create(nombre_rol='Peticionario')
+            validated_data['id_rol'] = rol_peticionario
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        raw_password = (validated_data.pop('password', None) or '').strip()
+        if raw_password:
+            validated_data['password'] = make_password(raw_password)
+        return super().update(instance, validated_data)
 
     def validate_foto_perfil(self, value):
         if not value:
