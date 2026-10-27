@@ -2,6 +2,7 @@ from django.contrib import admin
 from django.urls import path, include
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
+from users.api.token_refresh import UsuariosTokenRefreshView
 
 schema_view = get_schema_view(
     openapi.Info(
@@ -21,6 +22,9 @@ urlpatterns = [
         schema_view.with_ui('swagger', cache_timeout=0),
         name='schema-swagger-ui'
     ),
+
+    # Autenticacion JWT (Refresh Token compatible con Usuarios)
+    path('api/token/refresh/', UsuariosTokenRefreshView.as_view(), name='token_refresh'),
 
     # Endpoints de Usuarios
     path('api/usuarios/', include('users.api.urls')),
