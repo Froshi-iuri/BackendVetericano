@@ -175,8 +175,12 @@ CORS_ALLOWED_ORIGINS = [
 SIMPLE_JWT = {
     # El token de acceso dura 60 minutos. Si expira, el frontend debe usar el token de refresco.
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    # El token de refresco dura 1 día. Sirve para obtener nuevos tokens de acceso sin volver a loguearse.
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    # El token de refresco dura 30 días. Sirve para mantener la sesión abierta sin volver a loguearse.
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+    # Al refrescar, se emite un nuevo refresh token para renovar la ventana de 30 días (rotación)
+    'ROTATE_REFRESH_TOKENS': True,
+    # No se usa blacklist para no requerir la app token_blacklist ni tablas adicionales
+    'BLACKLIST_AFTER_ROTATION': False,
     # Le indicamos a la librería cuál es el campo de tu llave primaria personalizada
     'USER_ID_FIELD': 'id_usuario',
     'USER_ID_CLAIM': 'user_id',
