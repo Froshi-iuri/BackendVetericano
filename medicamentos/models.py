@@ -8,6 +8,7 @@ class Medicamento(models.Model):
     cantidad_ml = models.CharField(max_length=50)
     tipo = models.CharField(max_length=100)
     estado = models.BooleanField(default=True)
+    via_administracion = models.TextField(blank=True, null=True)
 
     class Meta:
         db_table = 'medicamentos_medicamento'
