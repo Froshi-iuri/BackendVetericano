@@ -80,6 +80,17 @@ class UsuariosSerializer(serializers.ModelSerializer):
     foto_perfil = serializers.CharField(
         required=False, allow_blank=True, allow_null=True
     )
+    foto = serializers.SerializerMethodField(read_only=True)
+
+    def get_foto(self, obj):
+        return getattr(obj, 'foto_perfil', None) or ''
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            if 'foto' in data and ('foto_perfil' not in data or not data.get('foto_perfil')):
+                data['foto_perfil'] = data.get('foto')
+        return super().to_internal_value(data)
 
     class Meta:
         model = Usuarios
@@ -91,11 +102,9 @@ class UsuariosSerializer(serializers.ModelSerializer):
             'nombre',
             'apellido',
             'telefono',
-<<<<<<< HEAD
             'matricula_profesional',
-=======
             'foto_perfil',
->>>>>>> c76762c (fix: column foto_perfil in usuarios, seguimiento_petiicones_visita now have especies)
+            'foto',
             'id_rol',
             'nombre_rol',
             'activo',
@@ -146,6 +155,15 @@ class UsuariosSerializer(serializers.ModelSerializer):
 
         # Solo aplicamos estas restricciones cuando se está actualizando un usuario existente
         if instance and request and request.user and request.user.is_authenticated:
+            rol_req = getattr(request.user, 'id_rol', None)
+            nom_rol = getattr(rol_req, 'nombre_rol', '').strip().lower() if rol_req else ''
+            id_rol_req = getattr(rol_req, 'id_rol', None) if rol_req else None
+            es_admin_req = (nom_rol in ['administrador', 'admin'] or id_rol_req == 1)
+
+            if not es_admin_req:
+                data.pop('id_rol', None)
+                data.pop('activo', None)
+
             # -------------------------------------------------------------
             # REGLA 1: Anti Auto-Bloqueo
             # Un administrador no puede quitarse su propio rol ni auto-desactivarse

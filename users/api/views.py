@@ -47,9 +47,12 @@ class LoginView(generics.GenericAPIView):
         refresh = RefreshToken.for_user(user)
         
         # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
-        # Esto guarda el rol directamente dentro del código encriptado del token
+        foto_actual = getattr(user, 'foto_perfil', None)
+        # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
         refresh['id_rol'] = user.id_rol.id_rol
         refresh['nombre_rol'] = user.id_rol.nombre_rol
+        refresh['foto_perfil'] = foto_actual or ''
+        refresh['foto'] = foto_actual or ''
 
         return Response({
             "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
@@ -58,7 +61,9 @@ class LoginView(generics.GenericAPIView):
             "nombre": user.nombre,
             "apellido": user.apellido,
             "telefono": getattr(user, 'telefono', None),
-            "foto_perfil": getattr(user, 'foto_perfil', None),
+            "foto_perfil": foto_actual,
+            "foto": foto_actual,
+            "matricula_profesional": getattr(user, 'matricula_profesional', None),
             "id_rol": user.id_rol.id_rol,
             "tokens": {
                 "refresh": str(refresh),
