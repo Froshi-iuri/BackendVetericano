@@ -88,6 +88,7 @@ class IniciarPeticionView(generics.CreateAPIView):
         return Response({
             "mensaje": "Petición iniciada con éxito",
             "id_peticion": peticion.id_peticion,
+            "numero_radicado": peticion.numero_radicado,
             "id_tipo": peticion.id_tipo.id_tipo if peticion.id_tipo else None,
             "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None,
             "foto": peticion.foto,
