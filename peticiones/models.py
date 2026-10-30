@@ -227,3 +227,69 @@ class EvidenciaSeguimientoVisita(models.Model):
     def __str__(self):
         return f"Evidencia #{self.id_evidencia} (Visita #{self.id_seguimiento_id}) - {self.tipo_archivo}"
 
+
+
+class HistorialAsignacionPeticion(models.Model):
+    id_historial = models.AutoField(primary_key=True)
+    id_peticion = models.ForeignKey(
+        Peticiones,
+        on_delete=models.CASCADE,
+        db_column='id_peticion',
+        related_name='historial_asignaciones'
+    )
+    veterinario_anterior = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        db_column='veterinario_anterior_id',
+        null=True,
+        blank=True,
+        related_name='historial_reasignaciones_anteriores'
+    )
+    veterinario_nuevo = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.CASCADE,
+        db_column='veterinario_nuevo_id',
+        related_name='historial_reasignaciones_nuevas'
+    )
+    motivo = models.TextField(blank=True, null=True)
+    asignado_por = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        db_column='asignado_por_id',
+        null=True,
+        blank=True,
+        related_name='historial_asignaciones_realizadas'
+    )
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = True
+        db_table = 'historial_asignacion_peticion'
+        ordering = ['-fecha']
+
+    def __str__(self):
+        vet_ant = self.veterinario_anterior.nombre if self.veterinario_anterior else 'Sin asignar'
+        vet_nvo = self.veterinario_nuevo.nombre if self.veterinario_nuevo else 'N/A'
+        return f"Reasignación Petición #{self.id_peticion_id}: {vet_ant} -> {vet_nvo}"
+
+
+class NotificacionJuridico(models.Model):
+    id_notificacion = models.AutoField(primary_key=True)
+    id_peticion = models.ForeignKey(
+        Peticiones,
+        on_delete=models.CASCADE,
+        db_column='id_peticion',
+        related_name='notificaciones_juridico'
+    )
+    tipo = models.CharField(max_length=50)  # 'NUEVA_URGENTE', 'PLAZO_VENCIDO', 'ACTA_COMPLETADA'
+    mensaje = models.TextField()
+    leida = models.BooleanField(default=False)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = True
+        db_table = 'notificacion_juridico'
+        ordering = ['-fecha_creacion']
+
+    def __str__(self):
+        return f"Notificación #{self.id_notificacion} [{self.tipo}] - Petición #{self.id_peticion_id}"

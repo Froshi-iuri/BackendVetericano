@@ -1,19 +1,28 @@
 import unicodedata
 import logging
+from datetime import timedelta
+from django.db import transaction
+from django.db.models import Count, Q, F, Sum
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-from peticiones.models import TipoPeticion, Peticiones, EstadoPeticiones, SeguimientoPeticionesVisita
+from peticiones.models import (
+    TipoPeticion, Peticiones, EstadoPeticiones, SeguimientoPeticionesVisita,
+    HistorialAsignacionPeticion, NotificacionJuridico
+)
+from clinica.models import Consulta
 from users.models import Usuarios
 from users.api.serializers import UsuariosSerializer
 from django.utils import timezone
+from .permissions import IsJuridicoOrAdmin
 from .serializers import (
     TiposPeticionSerializer, IniciarPeticionSerializer,
     SeguimientoPeticionesVisitaSerializer, AsignarPeticionSerializer,
     ListarPeticionesSerializer, DetallePeticionSerializer,
     ListarSeguimientoPeticionesVisitaSerializer,
+    HistorialAsignacionPeticionSerializer, NotificacionJuridicoSerializer,
 )
 from peticiones.utils import obtener_fotos_acta_con_fallback, obtener_multimedia_acta
 from inventario.api.kit_views import KitErrorHandlingMixin
@@ -324,37 +333,63 @@ class ListarSeguimientosPorPeticionView(ListarSeguimientoPeticionesVisitaView):
 class AsignarPeticionView(generics.UpdateAPIView):
     """
     PATCH /api/peticiones/<id_peticion>/asignar/
-    Permite a un administrador asignar la petición a un veterinario.
+    Permite a un funcionario con rol Jurídico o Administrador asignar o reasignar
+    la petición a un veterinario.
+    - Transición automática: actualiza el estado de la petición a 'Asignada'.
+    - Trazabilidad (SCRUM-210): si ya existía un veterinario asignado, registra
+      la reasignación en HistorialAsignacionPeticion con el motivo enviado.
     """
     queryset = Peticiones.objects.all()
     serializer_class = AsignarPeticionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsJuridicoOrAdmin]
     lookup_field = 'id_peticion'
 
     def update(self, request, *args, **kwargs):
         kwargs['partial'] = True
         peticion = self.get_object()
-        
-        # Obtenemos los IDs y verificamos
+
+        # Obtenemos el ID del veterinario a asignar
         asignado_a_id = request.data.get('asignado_a')
         if not asignado_a_id:
             return Response({'error': 'Debe proveer el id del usuario asignado (asignado_a).'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         # Validar que el usuario a asignar sea un veterinario (rol 3)
         veterinario = Usuarios.objects.filter(id_usuario=asignado_a_id).first()
-        if not veterinario or veterinario.id_rol_id != 3:
+        if not veterinario or getattr(veterinario, 'id_rol_id', None) != 3:
             return Response({'error': 'El usuario asignado no es un veterinario válido.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Actualizar datos de asignación
-        serializer = self.get_serializer(peticion, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        
-        # Modificamos manualmente los campos que no vienen en el request
-        serializer.save(
-            asignado_por=request.user,
-            fecha_asignacion=timezone.now()
-        )
-        
+        veterinario_anterior = peticion.asignado_a
+        motivo = (request.data.get('motivo') or '').strip()
+
+        with transaction.atomic():
+            # Buscar el estado correspondiente a 'Asignada'
+            estado_asignada = EstadoPeticiones.objects.filter(nombre__iexact='Asignada').first()
+            if not estado_asignada:
+                estado_asignada = EstadoPeticiones.objects.filter(nombre__icontains='asignad').first()
+
+            # Actualizar datos de asignación
+            serializer = self.get_serializer(peticion, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+
+            save_kwargs = {
+                'asignado_por': request.user if request.user.is_authenticated else None,
+                'fecha_asignacion': timezone.now()
+            }
+            if estado_asignada:
+                save_kwargs['id_estado'] = estado_asignada
+
+            peticion_actualizada = serializer.save(**save_kwargs)
+
+            # Trazabilidad SCRUM-210: Si ya tenía veterinario asignado previamente o se envió motivo
+            if veterinario_anterior or motivo:
+                HistorialAsignacionPeticion.objects.create(
+                    id_peticion=peticion_actualizada,
+                    veterinario_anterior=veterinario_anterior,
+                    veterinario_nuevo=veterinario,
+                    motivo=motivo or ('Reasignación de funcionario veterinario' if veterinario_anterior else 'Asignación de funcionario veterinario'),
+                    asignado_por=request.user if request.user.is_authenticated else None
+                )
+
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
@@ -494,3 +529,291 @@ class ActualizarEstadoPeticionView(APIView):
             "estado": estado_obj.nombre
         }, status=status.HTTP_200_OK)
 
+
+
+
+# ============================================================================
+# MÓDULO JURÍDICO: DASHBOARD, NOTIFICACIONES Y REASIGNACIONES
+# ============================================================================
+
+class DashboardJuridicoView(APIView):
+    """
+    GET /api/peticiones/dashboard-juridico/
+    Consolida las métricas del módulo jurídico en una sola llamada:
+    - Peticiones y distribución por estado, casos urgentes y casos atrasados (>= 5 días)
+    - Casos por veterinario (totales, pendientes, en proceso, finalizadas, % resolución)
+    - Seres sintientes ingresados al CBA (observación, tratamiento, adopción y últimos 6 ingresos)
+    """
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def get(self, request, *args, **kwargs):
+        # ----------------------------------------------------
+        # 1. MÉTRICAS DE PETICIONES
+        # ----------------------------------------------------
+        total_peticiones = Peticiones.objects.count()
+
+        # Urgentes: prioridad alta o urgente
+        filtro_urgentes = (
+            Q(prioridad__iexact='alta') |
+            Q(prioridad__iexact='urgente') |
+            Q(prioridad__icontains='urg') |
+            Q(prioridad__icontains='alt')
+        )
+        total_urgentes = Peticiones.objects.filter(filtro_urgentes).count()
+
+        # Atrasadas: >= 5 días sin atención y no finalizadas
+        hace_5_dias = timezone.now() - timedelta(days=5)
+        filtro_no_finalizadas = (
+            ~Q(id_estado__nombre__icontains='atendid') &
+            ~Q(id_estado__nombre__icontains='finaliz') &
+            ~Q(id_estado__nombre__icontains='alta') &
+            ~Q(id_estado__nombre__icontains='cerrad') &
+            ~Q(id_estado__nombre__icontains='resuelt')
+        )
+        filtro_atrasadas = (
+            (Q(fecha_asignacion__lte=hace_5_dias) | (Q(fecha_asignacion__isnull=True) & Q(fecha__lte=hace_5_dias))) &
+            filtro_no_finalizadas
+        )
+        total_atrasadas = Peticiones.objects.filter(filtro_atrasadas).count()
+
+        # Distribución por estados
+        distribucion_estados = {}
+        estados_qs = Peticiones.objects.values('id_estado__nombre').annotate(total=Count('id_peticion'))
+        for item in estados_qs:
+            nombre = item['id_estado__nombre'] or 'Sin Estado'
+            distribucion_estados[nombre] = item['total']
+
+        # Conteo agrupado estandarizado para frontend
+        pendientes_count = 0
+        en_proceso_count = 0
+        finalizadas_count = 0
+        for est_nom, cant in distribucion_estados.items():
+            est_low = est_nom.lower()
+            if any(term in est_low for term in ['atendid', 'finaliz', 'cerrad', 'alta', 'resuelt']):
+                finalizadas_count += cant
+            elif any(term in est_low for term in ['proceso', 'atenci', 'curso', 'tratam']):
+                en_proceso_count += cant
+            else:
+                pendientes_count += cant
+
+        peticiones_data = {
+            "total": total_peticiones,
+            "urgentes": total_urgentes,
+            "atrasadas_mas_5dias": total_atrasadas,
+            "distribucion_estados": distribucion_estados,
+            "distribucionEstados": distribucion_estados,
+            "pendientes": pendientes_count,
+            "enProceso": en_proceso_count,
+            "en_proceso": en_proceso_count,
+            "finalizadas": finalizadas_count,
+        }
+
+        # ----------------------------------------------------
+        # 2. MÉTRICAS DE VETERINARIOS (id_rol = 3)
+        # ----------------------------------------------------
+        vets_qs = Usuarios.objects.filter(
+            id_rol_id=3,
+            activo=True
+        ).annotate(
+            total_asig=Count('peticiones_asignadas'),
+            pendientes_asig=Count('peticiones_asignadas', filter=(
+                Q(peticiones_asignadas__id_estado__nombre__icontains='pendiente') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='evalua') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='asignad') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='revis')
+            )),
+            en_proceso_asig=Count('peticiones_asignadas', filter=(
+                Q(peticiones_asignadas__id_estado__nombre__icontains='proceso') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='atenci') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='curso') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='tratam')
+            )),
+            finalizadas_asig=Count('peticiones_asignadas', filter=(
+                Q(peticiones_asignadas__id_estado__nombre__icontains='atendid') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='finaliz') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='alta') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='cerrad') |
+                Q(peticiones_asignadas__id_estado__nombre__icontains='resuelt')
+            ))
+        ).order_by('-total_asig', 'nombre')
+
+        veterinarios_data = []
+        for v in vets_qs:
+            tot = v.total_asig
+            fin = v.finalizadas_asig
+            pct = round((fin / tot) * 100, 1) if tot > 0 else 0
+            if isinstance(pct, float) and pct.is_integer():
+                pct = int(pct)
+            veterinarios_data.append({
+                "id_veterinario": v.id_usuario,
+                "nombre_completo": f"{v.nombre} {v.apellido}".strip(),
+                "total_asignados": tot,
+                "pendientes": v.pendientes_asig,
+                "en_proceso": v.en_proceso_asig,
+                "finalizadas": fin,
+                "porcentaje_completado": pct,
+            })
+
+        # ----------------------------------------------------
+        # 3. MÉTRICAS CBA (clinica.Consulta con ingresa_cba=True)
+        # ----------------------------------------------------
+        consultas_cba = Consulta.objects.filter(ingresa_cba=True)
+        total_cba = consultas_cba.count()
+
+        filtro_obs = (
+            Q(pronostico__icontains='observaci') |
+            Q(resultado_estado__icontains='observaci') |
+            Q(pronostico__icontains='evalua') |
+            Q(resultado_estado__icontains='evalua') |
+            Q(pronostico__icontains='reservad') |
+            Q(resultado_estado__icontains='reservad')
+        )
+        filtro_trat = (
+            Q(pronostico__icontains='tratam') |
+            Q(resultado_estado__icontains='tratam') |
+            Q(pronostico__icontains='hospit') |
+            Q(resultado_estado__icontains='hospit') |
+            Q(pronostico__icontains='grave') |
+            Q(resultado_estado__icontains='grave')
+        )
+        filtro_adop = (
+            Q(pronostico__icontains='favor') |
+            Q(resultado_estado__icontains='favor') |
+            Q(pronostico__icontains='recuperad') |
+            Q(resultado_estado__icontains='recuperad') |
+            Q(pronostico__icontains='adop') |
+            Q(resultado_estado__icontains='adop')
+        )
+
+        en_observacion = consultas_cba.filter(filtro_obs).count()
+        en_tratamiento = consultas_cba.filter(filtro_trat).count()
+        aptos_adopcion = consultas_cba.filter(filtro_adop).count()
+
+        if total_cba > 0 and (en_observacion + en_tratamiento + aptos_adopcion) == 0:
+            en_observacion = total_cba
+
+        # Fallback con catálogo de Animales si no hay consultas registradas en CBA
+        if total_cba == 0:
+            try:
+                from animales.models import Animal
+                aptos_adopcion = Animal.objects.filter(disponible_adopcion=True).count()
+                en_observacion = Animal.objects.filter(activo=True, disponible_adopcion=False).count()
+                total_cba = aptos_adopcion + en_observacion
+            except Exception:
+                pass
+
+        ultimos_qs = consultas_cba.order_by('-fecha_hora')[:6]
+        ultimos_ingresos = []
+        for c in ultimos_qs:
+            fecha_iso = c.fecha_hora.isoformat() if c.fecha_hora else ""
+            canil = c.canil_asignado or "Canil General"
+            func_recibe = c.funcionario_recibe_cba or "Personal de Turno CBA"
+            motivo_ingreso = c.motivo_ingreso_cba or c.motivo_consulta or "Ingreso CBA"
+            estado_diag = c.pronostico or c.resultado_estado or "En Observación"
+
+            ultimos_ingresos.append({
+                "id_consulta": c.id_consulta,
+                "fecha_ingreso": fecha_iso,
+                "canil": canil,
+                "funcionario_recibe": func_recibe,
+                "funcionario": func_recibe,
+                "motivo": motivo_ingreso,
+                "estado": estado_diag,
+            })
+
+        cba_data = {
+            "total_ingresados_cba": total_cba,
+            "totalIngresadosCBA": total_cba,
+            "en_observacion": en_observacion,
+            "enObservacion": en_observacion,
+            "en_tratamiento": en_tratamiento,
+            "enTratamiento": en_tratamiento,
+            "aptos_adopcion": aptos_adopcion,
+            "aptosAdopcion": aptos_adopcion,
+            "ultimos_ingresos": ultimos_ingresos,
+            "ultimosIngresos": ultimos_ingresos,
+        }
+
+        return Response({
+            "peticiones": peticiones_data,
+            "veterinarios": veterinarios_data,
+            "casosVeterinarios": veterinarios_data,
+            "cba": cba_data,
+        }, status=status.HTTP_200_OK)
+
+
+class NotificacionesJuridicoView(APIView):
+    """
+    GET /api/peticiones/notificaciones/
+    Lista notificaciones del rol jurídico. Por defecto retorna solo no leídas,
+    o todas si se incluye ?todas=true.
+    """
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def get(self, request, *args, **kwargs):
+        incluir_todas = request.query_params.get('todas', '').strip().lower() in ['true', '1', 'si']
+        queryset = NotificacionJuridico.objects.select_related('id_peticion').all()
+        if not incluir_todas:
+            queryset = queryset.filter(leida=False)
+        queryset = queryset.order_by('-fecha_creacion')
+        serializer = NotificacionJuridicoSerializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request, *args, **kwargs):
+        """Permite crear una notificación jurídica manual o programática."""
+        serializer = NotificacionJuridicoSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class MarcarNotificacionLeidaView(APIView):
+    """
+    PATCH /api/peticiones/notificaciones/<int:id>/marcar-leida/
+    Marca una notificación específica como leída.
+    Si se invoca sin id o con id=0 o ?todas=true, marca todas las notificaciones como leídas.
+    """
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def patch(self, request, id=None, *args, **kwargs):
+        marcar_todas = (
+            id is None or
+            id == 0 or
+            request.data.get('marcar_todas') is True or
+            request.query_params.get('todas', '').lower() in ['true', '1', 'si']
+        )
+        if marcar_todas:
+            actualizadas = NotificacionJuridico.objects.filter(leida=False).update(leida=True)
+            return Response({
+                "mensaje": "Todas las notificaciones han sido marcadas como leídas.",
+                "actualizadas": actualizadas
+            }, status=status.HTTP_200_OK)
+
+        notificacion = NotificacionJuridico.objects.filter(id_notificacion=id).first()
+        if not notificacion:
+            return Response({
+                "error": f"Notificación con id {id} no encontrada."
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        notificacion.leida = True
+        notificacion.save(update_fields=['leida'])
+        serializer = NotificacionJuridicoSerializer(notificacion)
+        return Response({
+            "mensaje": "Notificación marcada como leída exitosamente.",
+            "notificacion": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
+    """
+    GET /api/peticiones/<id_peticion>/historial-asignaciones/
+    Lista el historial cronológico de reasignaciones de una petición.
+    """
+    serializer_class = HistorialAsignacionPeticionSerializer
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def get_queryset(self):
+        id_peticion = self.kwargs.get('id_peticion')
+        return HistorialAsignacionPeticion.objects.filter(
+            id_peticion_id=id_peticion
+        ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
