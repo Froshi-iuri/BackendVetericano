@@ -67,3 +67,20 @@ class EvidenciaSeguimientoVisitaAdmin(admin.ModelAdmin):
     search_fields = ('descripcion', 'ruta_archivo')
 
 
+
+
+from .models import HistorialAsignacionPeticion, NotificacionJuridico
+
+
+@admin.register(HistorialAsignacionPeticion)
+class HistorialAsignacionPeticionAdmin(admin.ModelAdmin):
+    list_display = ('id_historial', 'id_peticion', 'veterinario_anterior', 'veterinario_nuevo', 'asignado_por', 'fecha')
+    list_filter = ('fecha',)
+    search_fields = ('motivo', 'veterinario_anterior__nombre', 'veterinario_nuevo__nombre')
+
+
+@admin.register(NotificacionJuridico)
+class NotificacionJuridicoAdmin(admin.ModelAdmin):
+    list_display = ('id_notificacion', 'id_peticion', 'tipo', 'leida', 'fecha_creacion')
+    list_filter = ('tipo', 'leida', 'fecha_creacion')
+    search_fields = ('mensaje',)

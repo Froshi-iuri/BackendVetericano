@@ -1,4 +1,5 @@
 from rest_framework import viewsets, status
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from clinica.models import (
@@ -73,7 +74,27 @@ class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
         id_historia = self.request.query_params.get('id_historia')
         if id_historia:
             queryset = queryset.filter(id_historia_id=id_historia)
+        ingresa_cba = self.request.query_params.get('ingresa_cba')
+        if ingresa_cba is not None:
+            if ingresa_cba.strip().lower() in ['true', '1', 't', 'si']:
+                queryset = queryset.filter(ingresa_cba=True)
+            elif ingresa_cba.strip().lower() in ['false', '0', 'f', 'no']:
+                queryset = queryset.filter(ingresa_cba=False)
         return queryset
+
+    @action(detail=False, methods=['get'], url_path='cba')
+    def cba(self, request):
+        """
+        GET /api/clinica/consultas/cba/
+        Retorna únicamente las atenciones clínicas con ingreso efectivo al CBA (ingresa_cba=True).
+        """
+        consultas_cba = self.get_queryset().filter(ingresa_cba=True)
+        page = self.paginate_queryset(consultas_cba)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(consultas_cba, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
