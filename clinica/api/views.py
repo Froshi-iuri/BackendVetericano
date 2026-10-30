@@ -1,4 +1,5 @@
-from rest_framework import viewsets
+from rest_framework import viewsets, status
+from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from clinica.models import (
     HistoriaClinica,
@@ -22,10 +23,31 @@ from .serializers import (
 )
 
 
+from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError, RestrictedError
 from animales.models import Animal
 
 
-class HistoriaClinicaViewSet(viewsets.ModelViewSet):
+class RestrictDeleteProtectionMixin:
+    """
+    Captura errores de restricción de integridad referencial al intentar eliminar
+    registros clínicos que poseen otros registros asociados que dependen de ellos.
+    """
+    def destroy(self, request, *args, **kwargs):
+        try:
+            with transaction.atomic():
+                return super().destroy(request, *args, **kwargs)
+        except (ProtectedError, RestrictedError, IntegrityError):
+            return Response(
+                {
+                    "error": "No se puede eliminar este registro porque tiene otros registros asociados que dependen de él.",
+                    "codigo": "REGISTRO_CON_DEPENDENCIAS",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+
+class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = HistoriaClinica.objects.all()
     serializer_class = HistoriaClinicaSerializer
     permission_classes = [IsAuthenticated]
@@ -38,7 +60,7 @@ class HistoriaClinicaViewSet(viewsets.ModelViewSet):
         return queryset
 
 
-class ConsultaViewSet(viewsets.ModelViewSet):
+class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
     permission_classes = [IsAuthenticated]
@@ -60,7 +82,7 @@ class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-class TratamientosViewSet(viewsets.ModelViewSet):
+class TratamientosViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Tratamientos.objects.all()
     serializer_class = TratamientosSerializer
     permission_classes = [IsAuthenticated]
@@ -91,14 +113,13 @@ class SeguimientoHospitalarioViewSet(viewsets.ModelViewSet):
 
 
 from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
 from .serializers import ExpedienteCompletoSerializer
+from inventario.api.kit_views import KitErrorHandlingMixin
 
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-class ExpedienteCompletoAPIView(APIView):
+class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     @swagger_auto_schema(
@@ -125,7 +146,7 @@ class ExpedienteCompletoAPIView(APIView):
                     'id_historia__id_animal__id_raza',
                     'id_historia__id_animal__id_raza__id_especie'
                 ).prefetch_related(
-                    'tratamientos_set',
+                    'tratamientos_set__tratamientomedicamentos_set__id_medicamento',
                     'diagnostico_set',
                     'id_historia__id_animal__animalresponsable_set__id_responsable'
                 ),
@@ -199,16 +220,21 @@ class ExpedienteCompletoAPIView(APIView):
             lista_problemas = diagnostico_obj.lista_problemas.split('; ') if diagnostico_obj and diagnostico_obj.lista_problemas else []
             diagnostico_final = diagnostico_obj.descripcion if diagnostico_obj else ""
 
-            tratamientos_data = [
-                {
+            tratamientos_data = []
+            for t in consulta.tratamientos_set.all():
+                tm = t.tratamientomedicamentos_set.first()
+                t_dict = {
+                    "id_tratamiento": t.id_tratamiento,
                     "productoBase": t.producto_base or "",
                     "dosisBasica": t.dosis_basica or "",
                     "presentacion": t.presentacion or "",
                     "via": t.via_administracion or "",
-                    "frecuenciaDuracion": t.frecuencia_duracion or ""
+                    "frecuenciaDuracion": t.frecuencia_duracion or "",
+                    "id_medicamento": tm.id_medicamento_id if tm else None,
+                    "medicamento_catalogo": tm.id_medicamento.nombre if (tm and tm.id_medicamento) else None,
+                    "suministrado_clinica": bool(tm and tm.fecha_aplicacion)
                 }
-                for t in consulta.tratamientos_set.all()
-            ]
+                tratamientos_data.append(t_dict)
 
             # Hoja 2
             hoja2_data = {
@@ -420,6 +446,22 @@ class ExpedienteCompletoAPIView(APIView):
         if not str(motivo_modificacion).strip():
             return Response({"detail": "Debe justificar el motivo de la modificación para el historial de auditoría."}, status=status.HTTP_400_BAD_REQUEST)
 
+        from inventario.constants import CONSUMO_ORIGEN_HISTORIA
+        from inventario.services.consumo_service import descontar_consumo_kit
+        from inventario.api.kit_serializers import (
+            validar_payload_consumo_kit,
+            verificar_idempotencia_consumo_clinico,
+            extraer_alertas_farmacia,
+        )
+
+        id_vet_kit = getattr(request.user, 'id_usuario', None)
+        consumos_kit, es_offline_kit = validar_payload_consumo_kit(
+            raw_meds=data.get('medicamentos_usados'),
+            raw_offline=data.get('sincronizacion_offline', False),
+            id_veterinario=id_vet_kit,
+            permitir_multipart=False,
+        )
+
         with transaction.atomic():
             # Actualizar peso del animal si fue suministrado
             nuevo_peso = data.get('peso')
@@ -586,14 +628,42 @@ class ExpedienteCompletoAPIView(APIView):
                         hallazgos_pruebas=diagnostico_diferencial
                     )
 
-            return Response({
-                "status": "success",
-                "mensaje": "Historia clínica actualizada con éxito. La evolución y diagnóstico fueron registrados en el expediente.",
-                "historia_id": historia.id_historia,
-                "consulta_id": consulta.id_consulta,
-                "auditoria": nuevo_registro,
-                "historial_modificaciones": historial
-            }, status=status.HTTP_200_OK)
+            alertas_farmacia = None
+            if consumos_kit:
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=consulta.id_consulta,
+                    post_descuento=False,
+                )
+                resultado_kit = descontar_consumo_kit(
+                    id_veterinario=id_vet_kit,
+                    consumos=consumos_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    origen_ids={'id_consulta': consulta.id_consulta},
+                    es_offline=es_offline_kit,
+                )
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=consulta.id_consulta,
+                    post_descuento=True,
+                )
+                alertas_farmacia = extraer_alertas_farmacia(resultado_kit)
+
+        respuesta_patch = {
+            "status": "success",
+            "mensaje": "Historia clínica actualizada con éxito. La evolución y diagnóstico fueron registrados en el expediente.",
+            "historia_id": historia.id_historia,
+            "consulta_id": consulta.id_consulta,
+            "auditoria": nuevo_registro,
+            "historial_modificaciones": historial
+        }
+        if alertas_farmacia:
+            respuesta_patch["alertas_farmacia"] = alertas_farmacia
+        return Response(respuesta_patch, status=status.HTTP_200_OK)
 
 
 class ExpedientePorAnimalAPIView(APIView):
@@ -676,17 +746,33 @@ class ExpedientePorAnimalAPIView(APIView):
             "fechaUltimoParto": historia.fecha_ultimo_parto.isoformat() if historia.fecha_ultimo_parto else ""
         }
 
-        consultas_qs = historia.consulta_set.all().prefetch_related('diagnostico_set', 'tratamientos_set').order_by('-fecha_hora')
+        consultas_qs = historia.consulta_set.all().prefetch_related(
+            'diagnostico_set',
+            'tratamientos_set__tratamientomedicamentos_set__id_medicamento'
+        ).order_by('-fecha_hora')
         consultas_anteriores = []
         historial_modificaciones = []
 
         for index, c in enumerate(consultas_qs):
             diag = c.diagnostico_set.last()
-            
             # Extraer auditoría persistente de la consulta más reciente
             if index == 0 and isinstance(c.evaluacion_sistemas, dict):
                 historial_modificaciones = c.evaluacion_sistemas.get('_historial_modificaciones', [])
 
+            tratamientos_list = []
+            for t in c.tratamientos_set.all():
+                tm = t.tratamientomedicamentos_set.first()
+                tratamientos_list.append({
+                    "id_tratamiento": t.id_tratamiento,
+                    "producto_base": t.producto_base or "",
+                    "dosis_basica": t.dosis_basica or "",
+                    "presentacion": t.presentacion or "",
+                    "via": t.via_administracion or "",
+                    "frecuencia": t.frecuencia_duracion or "",
+                    "id_medicamento": tm.id_medicamento_id if tm else None,
+                    "medicamento_catalogo": tm.id_medicamento.nombre if (tm and tm.id_medicamento) else None,
+                    "suministrado_clinica": bool(tm and tm.fecha_aplicacion)
+                })
             consultas_anteriores.append({
                 "id_consulta": c.id_consulta,
                 "fecha_hora": c.fecha_hora.isoformat() if c.fecha_hora else "",
@@ -697,16 +783,7 @@ class ExpedientePorAnimalAPIView(APIView):
                 "frecuencia_cardiaca": c.frecuencia_cardiaca,
                 "frecuencia_respiratoria": c.frecuencia_respiratoria,
                 "temperatura": float(c.temperatura) if c.temperatura else None,
-                "tratamientos": [
-                    {
-                        "producto_base": t.producto_base or "",
-                        "dosis_basica": t.dosis_basica or "",
-                        "presentacion": t.presentacion or "",
-                        "via": t.via_administracion or "",
-                        "frecuencia": t.frecuencia_duracion or ""
-                    }
-                    for t in c.tratamientos_set.all()
-                ]
+                "tratamientos": tratamientos_list
             })
 
         return Response({

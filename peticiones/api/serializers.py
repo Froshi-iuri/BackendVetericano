@@ -1,5 +1,7 @@
 from rest_framework import serializers
+from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from peticiones.models import (
     TipoPeticion, Peticiones, Ubicaciones,
     SeguimientoPeticionesVisita, VisitaAnimal,
@@ -14,6 +16,8 @@ from peticiones.utils import (
     detectar_tipo_archivo,
 )
 from animales.models import Animal, Responsables
+from inventario.api.kit_serializers import CampoPassthroughJSONField
+
 
 
 class TiposPeticionSerializer(serializers.ModelSerializer):
@@ -97,7 +101,8 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         
         # 3. Generar radicado único basado en el ID recién creado
         # Se rellena con ceros a la izquierda (ej. PET-2026-00055)
-        peticion.numero_radicado = f"PET-2026-{str(peticion.id_peticion).zfill(5)}"
+        anio_actual = timezone.localdate().year if getattr(settings, 'USE_TZ', False) else timezone.now().year
+        peticion.numero_radicado = f"PET-{anio_actual}-{str(peticion.id_peticion).zfill(5)}"
         peticion.save(update_fields=['numero_radicado'])
 
         # 4. Registrar todas las fotos en EvidenciaPeticiones
@@ -548,6 +553,8 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     evidencias_detalle = EvidenciaSeguimientoVisitaSerializer(
         many=True, read_only=True, source='evidencias'
     )
+    medicamentos_usados = CampoPassthroughJSONField(required=False, allow_null=True, write_only=True)
+    sincronizacion_offline = CampoPassthroughJSONField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = SeguimientoPeticionesVisita
@@ -595,10 +602,57 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'foto', 'fotos', 'video', 'videos', 'multimedia', 'evidencias_detalle',
             # Observaciones generales
             'observacion',
+            # Consumo del kit del veterinario (opcionales, write_only)
+            'medicamentos_usados', 'sincronizacion_offline',
             # Fecha de registro automática
             'fecha',
         ]
         read_only_fields = ['id_seguimiento', 'fecha', 'lugar_atencion_detalle', 'funcionarios_detalle', 'evidencias_detalle']
+
+    def validate(self, attrs):
+        raw_data = self.initial_data if hasattr(self.initial_data, 'get') else attrs
+        raw_meds = raw_data.get('medicamentos_usados')
+
+        if self.instance is None:
+            from inventario.api.kit_serializers import validar_payload_consumo_kit
+
+            request = self.context.get('request')
+            content_type = (getattr(request, 'content_type', '') or '').lower()
+            es_multipart = 'multipart/form-data' in content_type or hasattr(self.initial_data, 'getlist')
+
+            raw_offline = raw_data.get('sincronizacion_offline', False)
+            id_vet = getattr(getattr(request, 'user', None), 'id_usuario', None)
+
+            consumos_kit, es_offline = validar_payload_consumo_kit(
+                raw_meds=raw_meds,
+                raw_offline=raw_offline,
+                id_veterinario=id_vet,
+                permitir_multipart=es_multipart,
+            )
+            attrs['_consumos_kit_normalizados'] = consumos_kit
+            attrs['_es_offline_kit'] = es_offline
+            attrs['_id_veterinario_kit'] = id_vet
+            return attrs
+        else:
+            # En edición no se admite consumo del kit. No debe validarse veterinario ni sincronizacion_offline.
+            es_vacio = raw_meds in (None, '', [])
+            if not es_vacio and isinstance(raw_meds, str):
+                s = raw_meds.strip()
+                if not s or s in ('[]', 'null'):
+                    es_vacio = True
+                else:
+                    try:
+                        import json
+                        parsed = json.loads(s)
+                        if parsed in (None, '', []):
+                            es_vacio = True
+                    except Exception:
+                        es_vacio = False
+            if not es_vacio:
+                raise serializers.ValidationError({
+                    "medicamentos_usados": "No se admite consumo del kit al editar un acta."
+                })
+            return attrs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -630,6 +684,53 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        from inventario.constants import CONSUMO_ORIGEN_ACTA
+        from inventario.services.consumo_service import descontar_consumo_kit
+        from inventario.services.exceptions import ConflictoIdempotenciaConsumoError
+        from inventario.api.kit_serializers import (
+            verificar_idempotencia_consumo_clinico,
+            extraer_alertas_farmacia,
+        )
+
+        validated_data.pop('medicamentos_usados', None)
+        validated_data.pop('sincronizacion_offline', None)
+        consumos_kit = validated_data.pop('_consumos_kit_normalizados', None) or []
+        es_offline_kit = bool(validated_data.pop('_es_offline_kit', False))
+        id_vet_kit = validated_data.pop('_id_veterinario_kit', None)
+
+        if consumos_kit:
+            id_seguimiento_previo = verificar_idempotencia_consumo_clinico(
+                consumos=consumos_kit,
+                id_veterinario=id_vet_kit,
+                origen_tipo=CONSUMO_ORIGEN_ACTA,
+                id_origen_esperado=None,
+                post_descuento=False,
+            )
+            if id_seguimiento_previo is not None:
+                seguimiento_prev = SeguimientoPeticionesVisita.objects.filter(
+                    pk=id_seguimiento_previo
+                ).first()
+                if not seguimiento_prev:
+                    raise ConflictoIdempotenciaConsumoError(
+                        f"El acta de visita original #{id_seguimiento_previo} asociada a los client_uuid ya no existe."
+                    )
+                resultado_kit = descontar_consumo_kit(
+                    id_veterinario=id_vet_kit,
+                    consumos=consumos_kit,
+                    origen_tipo=CONSUMO_ORIGEN_ACTA,
+                    origen_ids={'id_seguimiento_visita': seguimiento_prev.id_seguimiento},
+                    es_offline=es_offline_kit,
+                )
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_ACTA,
+                    id_origen_esperado=seguimiento_prev.id_seguimiento,
+                    post_descuento=True,
+                )
+                seguimiento_prev._alertas_farmacia = extraer_alertas_farmacia(resultado_kit)
+                return seguimiento_prev
+
         lugar_atencion_data = validated_data.pop('lugar_atencion', None)
         funcionarios_data = validated_data.pop('funcionarios', []) or []
         animales_data = validated_data.pop('animales', []) or []
@@ -798,6 +899,25 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             multimedia_input=multimedia_input,
         )
 
+        # 6. Descuento del kit del veterinario y post-check de idempotencia (al final para no sostener locks durante subidas multimedia)
+        seguimiento._alertas_farmacia = None
+        if consumos_kit:
+            resultado_kit = descontar_consumo_kit(
+                id_veterinario=id_vet_kit,
+                consumos=consumos_kit,
+                origen_tipo=CONSUMO_ORIGEN_ACTA,
+                origen_ids={'id_seguimiento_visita': seguimiento.id_seguimiento},
+                es_offline=es_offline_kit,
+            )
+            verificar_idempotencia_consumo_clinico(
+                consumos=consumos_kit,
+                id_veterinario=id_vet_kit,
+                origen_tipo=CONSUMO_ORIGEN_ACTA,
+                id_origen_esperado=seguimiento.id_seguimiento,
+                post_descuento=True,
+            )
+            seguimiento._alertas_farmacia = extraer_alertas_farmacia(resultado_kit)
+
         return seguimiento
 
     @transaction.atomic
@@ -810,6 +930,11 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
         video_input = validated_data.pop('video', None)
         multimedia_input = validated_data.pop('multimedia', None)
         validated_data.pop('animales', None)  # No se reemplaza la lista de animales por PATCH
+        validated_data.pop('medicamentos_usados', None)
+        validated_data.pop('sincronizacion_offline', None)
+        validated_data.pop('_consumos_kit_normalizados', None)
+        validated_data.pop('_es_offline_kit', None)
+        validated_data.pop('_id_veterinario_kit', None)
 
         # Actualizar o crear ubicación de la visita
         if lugar_atencion_data:

@@ -16,6 +16,7 @@ from .serializers import (
     ListarSeguimientoPeticionesVisitaSerializer,
 )
 from peticiones.utils import obtener_fotos_acta_con_fallback, obtener_multimedia_acta
+from inventario.api.kit_views import KitErrorHandlingMixin
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ class IniciarPeticionView(generics.CreateAPIView):
         return Response({
             "mensaje": "Petición iniciada con éxito",
             "id_peticion": peticion.id_peticion,
+            "numero_radicado": peticion.numero_radicado,
             "id_tipo": peticion.id_tipo.id_tipo if peticion.id_tipo else None,
             "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None,
             "foto": peticion.foto,
@@ -148,7 +150,7 @@ class FuncionariosVisitaView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
 
-class SeguimientoPeticionesVisitaCreateView(generics.CreateAPIView):
+class SeguimientoPeticionesVisitaCreateView(KitErrorHandlingMixin, generics.CreateAPIView):
     """
     POST /api/peticiones/seguimiento/crear/
     Crea un acta de visita completa.
@@ -203,17 +205,21 @@ class SeguimientoPeticionesVisitaCreateView(generics.CreateAPIView):
         serializer.is_valid(raise_exception=True)
         seguimiento = serializer.save(id_veterinario=request.user)
         mm_data = obtener_multimedia_acta(seguimiento)
+        respuesta = {
+            "mensaje": "Acta de visita registrada exitosamente.",
+            "id_seguimiento": seguimiento.id_seguimiento,
+            "foto": mm_data['foto'],
+            "fotos": mm_data['fotos'],
+            "total_fotos": mm_data['total_fotos'],
+            "videos": mm_data['videos'],
+            "total_videos": mm_data['total_videos'],
+            "multimedia": mm_data['multimedia'],
+        }
+        alertas_farmacia = getattr(seguimiento, '_alertas_farmacia', None)
+        if alertas_farmacia:
+            respuesta["alertas_farmacia"] = alertas_farmacia
         return Response(
-            {
-                "mensaje": "Acta de visita registrada exitosamente.",
-                "id_seguimiento": seguimiento.id_seguimiento,
-                "foto": mm_data['foto'],
-                "fotos": mm_data['fotos'],
-                "total_fotos": mm_data['total_fotos'],
-                "videos": mm_data['videos'],
-                "total_videos": mm_data['total_videos'],
-                "multimedia": mm_data['multimedia'],
-            },
+            respuesta,
             status=status.HTTP_201_CREATED,
         )
 

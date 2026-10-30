@@ -64,6 +64,84 @@ from animales.models import Animal, Responsables, AnimalResponsable
 from especies.models import Especie, Raza
 from datetime import datetime
 
+
+# ---------------------------------------------------------------------------
+# Descuento de inventario desde consultas clínicas
+# Replica la misma lógica de lotes/FIFO de inventario.api.DetalleSalidaSerializer
+# sin modificar el módulo de inventario.
+# ---------------------------------------------------------------------------
+def _filtro_lotes_medicamento(id_medicamento):
+    from django.db.models import Q
+    from inventario.models import Inventarios
+    return Inventarios.objects.filter(
+        Q(id_detalle_compra__id_medicamento_id=id_medicamento) |
+        Q(id_detalle_salida__id_administracion__id_medicamento_id=id_medicamento),
+        cantidad_actual__gt=0
+    )
+
+
+def _stock_disponible(id_medicamento):
+    from django.db.models import Sum
+    return _filtro_lotes_medicamento(id_medicamento).aggregate(
+        total=Sum('cantidad_actual')
+    )['total'] or 0
+
+
+def _parse_cantidad_usada(valor):
+    """Devuelve un entero >= 0 o lanza ValueError si el valor no es un entero válido."""
+    if valor in (None, ''):
+        return 0
+    if isinstance(valor, bool):
+        raise ValueError
+    numero = float(valor)
+    if numero < 0 or not numero.is_integer():
+        raise ValueError
+    return int(numero)
+
+
+def _debe_descontar(item):
+    """Solo descuenta si trae id_medicamento, cantidad_usada > 0 y no se marcó descontar_inventario=false."""
+    if item.get('descontar_inventario') is False:
+        return False
+    return bool(item.get('id_medicamento')) and item.get('_cantidad_usada', 0) > 0
+
+
+def _descontar_fifo(id_medicamento, cantidad):
+    """
+    Descuenta `cantidad` de los lotes más antiguos. Debe ejecutarse dentro de transaction.atomic.
+    Usa select_for_update(no_key=True) (FOR NO KEY UPDATE) para evitar deadlock 40P01 con el
+    bloqueo FOR KEY SHARE que PostgreSQL adquiere sobre inventarios al insertar filas de kardex
+    en descontar_consumo_kit; alineado con el lock no_key de inventarios en solicitudes_service
+    y kit_service (la función solo actualiza cantidad_actual, sin alterar columnas clave/FK).
+    """
+    from inventario.models import Inventarios
+    ids_lotes = list(_filtro_lotes_medicamento(id_medicamento).values_list('id_inventario', flat=True))
+    # Bloqueo de filas para evitar descuentos concurrentes sobre el mismo lote (FOR NO KEY UPDATE)
+    lotes = list(
+        Inventarios.objects.select_for_update(no_key=True)
+        .filter(pk__in=ids_lotes, cantidad_actual__gt=0)
+        .order_by('id_inventario')
+    )
+    total = sum(lote.cantidad_actual for lote in lotes)
+    if cantidad > total:
+        return False, total
+
+    por_descontar = cantidad
+    for lote in lotes:
+        if por_descontar <= 0:
+            break
+        if lote.cantidad_actual >= por_descontar:
+            lote.cantidad_actual -= por_descontar
+            por_descontar = 0
+        else:
+            por_descontar -= lote.cantidad_actual
+            lote.cantidad_actual = 0
+        lote.save(update_fields=['cantidad_actual'])
+    return True, total
+
+from inventario.api.kit_serializers import CampoPassthroughJSONField
+
+
 class ExpedienteCompletoSerializer(serializers.Serializer):
     id_animal = serializers.IntegerField(required=False, allow_null=True)
     animal = serializers.JSONField(required=False, allow_null=True)
@@ -75,6 +153,8 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
     hoja2 = serializers.JSONField(required=False, allow_null=True)
     hoja3 = serializers.JSONField(required=False, allow_null=True)
     rescate = serializers.JSONField(required=False, allow_null=True)
+    medicamentos_usados = CampoPassthroughJSONField(required=False, allow_null=True)
+    sincronizacion_offline = CampoPassthroughJSONField(required=False, allow_null=True)
 
     def validate(self, attrs):
         id_animal = attrs.get('id_animal')
@@ -94,10 +174,174 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
                 "motivoConsulta": "El motivo de la consulta es obligatorio para registrar la atención médica."
             })
 
+        self._validar_medicamentos_tratamientos(attrs)
+        self._validar_consumo_kit(attrs)
+
         return attrs
 
+    def _validar_consumo_kit(self, attrs):
+        """
+        Valida fail-fast el bloque opcional 'medicamentos_usados' y 'sincronizacion_offline'
+        en la raíz del payload JSON y verifica que no exista doble descuento con hoja2.tratamientos.
+        """
+        from inventario.api.kit_serializers import validar_payload_consumo_kit
+        from inventario.services.exceptions import ConsumoInvalidoError
+
+        raw_data = self.initial_data if isinstance(self.initial_data, dict) else attrs
+        raw_meds = raw_data.get('medicamentos_usados')
+        raw_offline = raw_data.get('sincronizacion_offline', False)
+
+        request = self.context.get('request')
+        id_vet = getattr(getattr(request, 'user', None), 'id_usuario', None)
+
+        consumos_kit, es_offline = validar_payload_consumo_kit(
+            raw_meds=raw_meds,
+            raw_offline=raw_offline,
+            id_veterinario=id_vet,
+            permitir_multipart=False,
+        )
+
+        if consumos_kit:
+            hoja2 = attrs.get('hoja2') or {}
+            tratamientos = hoja2.get('tratamientos') if isinstance(hoja2, dict) else None
+            if isinstance(tratamientos, list):
+                meds_kit_ids = {c['id_medicamento'] for c in consumos_kit}
+                for idx, item in enumerate(tratamientos, start=1):
+                    if isinstance(item, dict) and _debe_descontar(item):
+                        id_med_trat = item.get('id_medicamento')
+                        if id_med_trat in meds_kit_ids:
+                            raise ConsumoInvalidoError(
+                                f"Doble descuento no permitido para el medicamento #{id_med_trat} "
+                                f"(tratamiento #{idx} tiene descuento de bodega general activo y "
+                                f"también está incluido en 'medicamentos_usados' del kit)."
+                            )
+
+        attrs['_consumos_kit_normalizados'] = consumos_kit
+        attrs['_es_offline_kit'] = es_offline
+        attrs['_id_veterinario_kit'] = id_vet
+
+    def _validar_medicamentos_tratamientos(self, attrs):
+        """
+        Valida los tratamientos que traen id_medicamento / cantidad_usada.
+        Los tratamientos solo-texto (flujo actual) no se validan ni descuentan.
+        """
+        from medicamentos.models import Medicamentos
+
+        hoja2 = attrs.get('hoja2') or {}
+        tratamientos = hoja2.get('tratamientos') if isinstance(hoja2, dict) else None
+        if not isinstance(tratamientos, list):
+            return
+
+        errores = []
+        solicitados = {}  # id_medicamento -> cantidad total a descontar
+
+        for idx, item in enumerate(tratamientos, start=1):
+            if not isinstance(item, dict):
+                continue
+            id_med = item.get('id_medicamento')
+
+            try:
+                item['_cantidad_usada'] = _parse_cantidad_usada(item.get('cantidad_usada'))
+            except (ValueError, TypeError):
+                errores.append(f"Tratamiento #{idx}: 'cantidad_usada' debe ser un número entero mayor o igual a 0.")
+                continue
+
+            if item.get('descontar_inventario') is True:
+                if not id_med:
+                    errores.append(f"Tratamiento #{idx}: para descontar inventario se requiere 'id_medicamento'.")
+                    continue
+                if item['_cantidad_usada'] <= 0:
+                    errores.append(f"Tratamiento #{idx}: para descontar inventario 'cantidad_usada' debe ser mayor a 0.")
+                    continue
+
+            if id_med:
+                try:
+                    id_med = int(id_med)
+                except (ValueError, TypeError):
+                    errores.append(f"Tratamiento #{idx}: 'id_medicamento' inválido.")
+                    continue
+                item['id_medicamento'] = id_med
+                if not Medicamentos.objects.filter(pk=id_med).exists():
+                    errores.append(f"Tratamiento #{idx}: el medicamento con id {id_med} no existe.")
+                    continue
+
+            if _debe_descontar(item):
+                solicitados[id_med] = solicitados.get(id_med, 0) + item['_cantidad_usada']
+
+        # Validación de stock (sumando si el mismo medicamento viene en varias líneas)
+        for id_med, cantidad in solicitados.items():
+            disponible = _stock_disponible(id_med)
+            if cantidad > disponible:
+                med = Medicamentos.objects.filter(pk=id_med).first()
+                nombre = med.nombre if med else id_med
+                errores.append(
+                    f"Stock insuficiente para '{nombre}'. Disponibles: {disponible}, solicitados: {cantidad}."
+                )
+
+        if errores:
+            raise serializers.ValidationError({"tratamientos": errores})
+
     def create(self, validated_data):
+        from inventario.constants import CONSUMO_ORIGEN_HISTORIA
+        from inventario.services.consumo_service import descontar_consumo_kit
+        from inventario.services.exceptions import ConflictoIdempotenciaConsumoError
+        from inventario.api.kit_serializers import (
+            verificar_idempotencia_consumo_clinico,
+            extraer_alertas_farmacia,
+        )
+
+        consumos_kit = validated_data.get('_consumos_kit_normalizados') or []
+        es_offline_kit = bool(validated_data.get('_es_offline_kit', False))
+        id_vet_kit = validated_data.get('_id_veterinario_kit')
+
         with transaction.atomic():
+            if consumos_kit:
+                id_consulta_previa = verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=None,
+                    post_descuento=False,
+                )
+                if id_consulta_previa is not None:
+                    consulta_prev = (
+                        Consulta.objects.select_related('id_historia', 'id_historia__id_animal')
+                        .filter(pk=id_consulta_previa)
+                        .first()
+                    )
+                    if not consulta_prev or not consulta_prev.id_historia or not consulta_prev.id_historia.id_animal:
+                        raise ConflictoIdempotenciaConsumoError(
+                            f"La consulta original #{id_consulta_previa} asociada a los client_uuid ya no existe."
+                        )
+                    resultado_kit = descontar_consumo_kit(
+                        id_veterinario=id_vet_kit,
+                        consumos=consumos_kit,
+                        origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                        origen_ids={'id_consulta': consulta_prev.id_consulta},
+                        es_offline=es_offline_kit,
+                    )
+                    verificar_idempotencia_consumo_clinico(
+                        consumos=consumos_kit,
+                        id_veterinario=id_vet_kit,
+                        origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                        id_origen_esperado=consulta_prev.id_consulta,
+                        post_descuento=True,
+                    )
+                    historia_prev = consulta_prev.id_historia
+                    animal_prev = historia_prev.id_animal
+                    respuesta_reintento = {
+                        'status': 'success',
+                        'id_animal': animal_prev.id_animal,
+                        'historia_id': historia_prev.id_historia,
+                        'consulta_id': consulta_prev.id_consulta,
+                        'numero_historia': historia_prev.numero_historia or f"HC-{animal_prev.id_animal}",
+                        'medicamentos_descontados': [],
+                    }
+                    alertas_reintento = extraer_alertas_farmacia(resultado_kit)
+                    if alertas_reintento:
+                        respuesta_reintento['alertas_farmacia'] = alertas_reintento
+                    return respuesta_reintento
+
             animal_data = validated_data.get('animal') or {}
             tenedor_data = validated_data.get('tenedor') or {}
             anamnesicos_data = validated_data.get('anamnesicos') or {}
@@ -303,22 +547,109 @@ class ExpedienteCompletoSerializer(serializers.Serializer):
 
             # 7. Tratamientos
             tratamientos_list = hoja2_data.get('tratamientos', [])
-            if tratamientos_list:
-                Tratamientos.objects.bulk_create([
-                    Tratamientos(
-                        id_consulta=consulta,
-                        producto_base=t.get('productoBase', ''),
-                        dosis_basica=t.get('dosisBasica', ''),
-                        presentacion=t.get('presentacion', ''),
-                        via_administracion=t.get('via', ''),
-                        frecuencia_duracion=t.get('frecuenciaDuracion', '')
-                    ) for t in tratamientos_list
-                ])
+            medicamentos_descontados = []
 
-        return {
+            def _nuevo_tratamiento(t):
+                return Tratamientos(
+                    id_consulta=consulta,
+                    producto_base=t.get('productoBase', ''),
+                    dosis_basica=t.get('dosisBasica', ''),
+                    presentacion=t.get('presentacion', ''),
+                    via_administracion=t.get('via', ''),
+                    frecuencia_duracion=t.get('frecuenciaDuracion', '')
+                )
+
+            vinculados = [t for t in tratamientos_list if isinstance(t, dict) and t.get('id_medicamento')]
+
+            if tratamientos_list and not vinculados:
+                # Flujo original: tratamientos solo texto, no se toca inventario
+                Tratamientos.objects.bulk_create([_nuevo_tratamiento(t) for t in tratamientos_list])
+
+            elif tratamientos_list:
+                from django.utils import timezone
+                from medicamentos.models import TratamientoMedicamentos
+                from inventario.models import Salidas
+
+                ahora = timezone.now()
+                if timezone.is_aware(ahora):
+                    ahora = timezone.localtime(ahora)
+
+                responsable = ""
+                user = getattr(request, 'user', None) if request else None
+                if user is not None and getattr(user, 'is_authenticated', False):
+                    responsable = " ".join(
+                        p for p in [getattr(user, 'nombre', ''), getattr(user, 'apellido', '')] if p
+                    ).strip() or veterinario_nombre
+
+                for t in tratamientos_list:
+                    tratamiento = _nuevo_tratamiento(t)
+                    tratamiento.save()
+
+                    id_med = t.get('id_medicamento')
+                    if not id_med:
+                        continue
+
+                    descontar = _debe_descontar(t)
+                    TratamientoMedicamentos.objects.create(
+                        id_tratamiento=tratamiento,
+                        id_medicamento_id=id_med,
+                        dosis=t.get('dosisBasica', ''),
+                        via=t.get('via', ''),
+                        fecha_aplicacion=ahora.date() if descontar else None,
+                        hora_administrada=ahora.time() if descontar else None,
+                        responsable_admin=responsable or None,
+                    )
+
+                    if descontar:
+                        cantidad = t['_cantidad_usada']
+                        ok, disponible = _descontar_fifo(id_med, cantidad)
+                        if not ok:
+                            # Puede ocurrir si otro usuario consumió stock entre la validación y el guardado.
+                            # Al lanzar la excepción la transacción completa se revierte.
+                            raise serializers.ValidationError({
+                                "tratamientos": [
+                                    f"Stock insuficiente para el medicamento {id_med}. "
+                                    f"Disponibles: {disponible}, solicitados: {cantidad}."
+                                ]
+                            })
+                        medicamentos_descontados.append({
+                            "id_medicamento": id_med,
+                            "cantidad": cantidad,
+                            "estado": "Descontado correctamente"
+                        })
+
+                if medicamentos_descontados:
+                    Salidas.objects.create(
+                        motivo=f"Uso en Consulta #{consulta.id_consulta} - Animal #{animal_obj.id_animal}"[:100]
+                    )
+
+            alertas_farmacia = None
+            if consumos_kit:
+                resultado_kit = descontar_consumo_kit(
+                    id_veterinario=id_vet_kit,
+                    consumos=consumos_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    origen_ids={'id_consulta': consulta.id_consulta},
+                    es_offline=es_offline_kit,
+                )
+                verificar_idempotencia_consumo_clinico(
+                    consumos=consumos_kit,
+                    id_veterinario=id_vet_kit,
+                    origen_tipo=CONSUMO_ORIGEN_HISTORIA,
+                    id_origen_esperado=consulta.id_consulta,
+                    post_descuento=True,
+                )
+                alertas_farmacia = extraer_alertas_farmacia(resultado_kit)
+
+        respuesta = {
             'status': 'success',
             'id_animal': animal_obj.id_animal,
             'historia_id': historia.id_historia,
             'consulta_id': consulta.id_consulta,
-            'numero_historia': historia.numero_historia or f"HC-{animal_obj.id_animal}"
+            'numero_historia': historia.numero_historia or f"HC-{animal_obj.id_animal}",
+            'medicamentos_descontados': medicamentos_descontados
         }
+        if alertas_farmacia:
+            respuesta['alertas_farmacia'] = alertas_farmacia
+        return respuesta
+
