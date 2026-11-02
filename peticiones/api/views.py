@@ -817,3 +817,468 @@ class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
         return HistorialAsignacionPeticion.objects.filter(
             id_peticion_id=id_peticion
         ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
+
+
+
+# ==============================================================================
+# VISTAS Y EXTENSIONES DEL MÓDULO JURÍDICO (ESTADOS, REASIGNACIÓN, HISTORIAL, NOTIFICACIONES Y CORREO)
+# ==============================================================================
+
+from peticiones.models import HistorialPeticiones, NotificacionPeticion
+from peticiones.utils import (
+    ESTADOS_FLUJO_JURIDICO,
+    DIAS_PARA_REASIGNAR,
+    normalizar_texto_juridico,
+    es_prioridad_urgente,
+    calcular_tiempos_peticion,
+    registrar_historial_peticion,
+    crear_notificaciones_nueva_peticion,
+    crear_notificacion_asignacion,
+    enviar_correo_peticion_urgente_juridico,
+)
+from .serializers import (
+    EstadoPeticionesSerializer,
+    HistorialPeticionesSerializer,
+    NotificacionPeticionSerializer,
+    construir_historial_peticion_lista,
+)
+
+
+def _obtener_estado_por_nombre(nombre_buscado: str):
+    """Busca un estado en EstadoPeticiones de forma insensible a mayúsculas y tildes."""
+    est = EstadoPeticiones.objects.filter(nombre__iexact=nombre_buscado).first()
+    if est:
+        return est
+    norm = normalizar_texto_juridico(nombre_buscado)
+    for item in EstadoPeticiones.objects.all():
+        if normalizar_texto_juridico(item.nombre) == norm:
+            return item
+    return None
+
+
+class ListarEstadosPeticionView(APIView):
+    """
+    GET /api/peticiones/estados/
+    Retorna los 6 estados requeridos del flujo de peticiones:
+    En revisión, Asignada, En proceso, Atendida, En tratamiento y Finalizada.
+    Si se envía ?todos=true, retorna todos los estados activos del catálogo.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        mostrar_todos = str(request.query_params.get('todos', '')).lower() in ('true', '1', 'si')
+        todos_activos = list(EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado'))
+
+        if mostrar_todos:
+            serializer = EstadoPeticionesSerializer(todos_activos, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        orden_norm = [normalizar_texto_juridico(n) for n in ESTADOS_FLUJO_JURIDICO]
+        mapa_por_norm = {}
+        for est in todos_activos:
+            n_est = normalizar_texto_juridico(est.nombre)
+            if n_est in orden_norm and n_est not in mapa_por_norm:
+                mapa_por_norm[n_est] = est
+
+        estados_resultado = [mapa_por_norm[n] for n in orden_norm if n in mapa_por_norm]
+        serializer = EstadoPeticionesSerializer(estados_resultado, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class HistorialPeticionView(APIView):
+    """
+    GET /api/peticiones/<id_peticion>/historial/
+    Retorna el historial completo de cambios de estado y asignaciones de una petición.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, id_peticion, *args, **kwargs):
+        peticion = (
+            Peticiones.objects
+            .select_related('id_estado', 'responsable', 'asignado_a', 'asignado_por')
+            .filter(pk=id_peticion)
+            .first()
+        )
+        if not peticion:
+            return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if getattr(user, 'id_rol_id', None) == 3 and peticion.asignado_a_id != user.id_usuario:
+            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
+        if getattr(user, 'id_rol_id', None) == 4 and peticion.responsable_id != user.id_usuario:
+            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
+
+        historial = construir_historial_peticion_lista(peticion)
+        return Response(historial, status=status.HTTP_200_OK)
+
+
+class NotificacionesPeticionesListView(generics.ListAPIView):
+    """
+    GET /api/peticiones/notificaciones/usuario/
+    Lista las notificaciones dentro de la aplicación web para el usuario autenticado.
+    Soporta filtro opcional ?leida=false o ?solo_no_leidas=true.
+    """
+    serializer_class = NotificacionPeticionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            NotificacionPeticion.objects
+            .select_related('id_peticion', 'id_peticion__id_tipo', 'id_peticion__id_estado')
+        )
+        if getattr(user, 'id_rol_id', None) in (1, 2):
+            qs = qs.filter(Q(id_usuario_destino=user) | Q(id_usuario_destino__isnull=True))
+        else:
+            qs = qs.filter(id_usuario_destino=user)
+
+        leida_param = self.request.query_params.get('leida')
+        solo_no_leidas = self.request.query_params.get('solo_no_leidas')
+        if str(solo_no_leidas).lower() in ('true', '1') or str(leida_param).lower() in ('false', '0'):
+            qs = qs.filter(leida=False)
+        elif str(leida_param).lower() in ('true', '1'):
+            qs = qs.filter(leida=True)
+
+        return qs.order_by('-fecha_creacion', '-id_notificacion')
+
+
+class MarcarNotificacionPeticionLeidaView(APIView):
+    """
+    PATCH/POST /api/peticiones/notificaciones/<id_notificacion>/leer/
+    Marca una notificación específica como leída.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id_notificacion, *args, **kwargs):
+        return self.patch(request, id_notificacion, *args, **kwargs)
+
+    def patch(self, request, id_notificacion, *args, **kwargs):
+        user = request.user
+        qs = NotificacionPeticion.objects.filter(pk=id_notificacion)
+        if getattr(user, 'id_rol_id', None) in (1, 2):
+            qs = qs.filter(Q(id_usuario_destino=user) | Q(id_usuario_destino__isnull=True))
+        else:
+            qs = qs.filter(id_usuario_destino=user)
+
+        notif = qs.first()
+        if not notif:
+            return Response({"error": "Notificación no encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not notif.leida:
+            notif.leida = True
+            notif.fecha_lectura = timezone.now()
+            notif.save(update_fields=['leida', 'fecha_lectura'])
+
+        return Response(NotificacionPeticionSerializer(notif).data, status=status.HTTP_200_OK)
+
+
+class MarcarTodasNotificacionesLeidasView(APIView):
+    """
+    PATCH/POST /api/peticiones/notificaciones/leer-todas/
+    Marca todas las notificaciones pendientes del usuario autenticado como leídas.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
+    def patch(self, request, *args, **kwargs):
+        user = request.user
+        qs = NotificacionPeticion.objects.filter(leida=False)
+        if getattr(user, 'id_rol_id', None) in (1, 2):
+            qs = qs.filter(Q(id_usuario_destino=user) | Q(id_usuario_destino__isnull=True))
+        else:
+            qs = qs.filter(id_usuario_destino=user)
+
+        actualizadas = qs.update(leida=True, fecha_lectura=timezone.now())
+        return Response({
+            "mensaje": "Notificaciones marcadas como leídas.",
+            "actualizadas": actualizadas,
+        }, status=status.HTTP_200_OK)
+
+
+# --- Extensión aditiva de ListarPeticionesView y DetallePeticionView ---
+
+_orig_listar_peticiones_get_qs = ListarPeticionesView.get_queryset
+
+
+def _juridico_listar_peticiones_get_queryset(self):
+    qs = _orig_listar_peticiones_get_qs(self).select_related('asignado_por').prefetch_related('historial_cambios')
+    params = self.request.query_params
+
+    estado = params.get('estado')
+    if estado:
+        qs = qs.filter(id_estado__nombre__iexact=estado.strip())
+
+    id_estado = params.get('id_estado')
+    if id_estado:
+        qs = qs.filter(id_estado_id=id_estado)
+
+    prioridad = params.get('prioridad')
+    if prioridad:
+        qs = qs.filter(prioridad__iexact=prioridad.strip())
+
+    asignado_a = params.get('asignado_a')
+    if asignado_a and getattr(self.request.user, 'id_rol_id', None) in (1, 2):
+        qs = qs.filter(asignado_a_id=asignado_a)
+
+    id_tipo = params.get('id_tipo')
+    if id_tipo:
+        qs = qs.filter(id_tipo_id=id_tipo)
+
+    return qs
+
+
+ListarPeticionesView.get_queryset = _juridico_listar_peticiones_get_queryset
+
+
+_orig_detalle_peticion_get_qs = DetallePeticionView.get_queryset
+
+
+def _juridico_detalle_peticion_get_queryset(self):
+    return (
+        _orig_detalle_peticion_get_qs(self)
+        .select_related('asignado_por')
+        .prefetch_related(
+            'historial_cambios',
+            'historial_cambios__id_estado_anterior',
+            'historial_cambios__id_estado_nuevo',
+            'historial_cambios__id_veterinario_anterior',
+            'historial_cambios__id_veterinario_nuevo',
+            'historial_cambios__id_usuario_accion',
+            'historial_cambios__id_usuario_accion__id_rol',
+        )
+    )
+
+
+DetallePeticionView.get_queryset = _juridico_detalle_peticion_get_queryset
+
+
+# --- Extensión aditiva de IniciarPeticionView (estado 'En revisión', asignación opcional, correo urgente, notificación web e historial) ---
+
+def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
+    estado_inicial = (
+        _obtener_estado_por_nombre('En revisión')
+        or EstadoPeticiones.objects.filter(nombre__iexact='Pendiente').first()
+        or EstadoPeticiones.objects.filter(nombre__iexact='Borrador').first()
+        or EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado').first()
+        or EstadoPeticiones.objects.first()
+    )
+    if not estado_inicial:
+        return Response(
+            {"error": "No existe ningún estado configurado en la base de datos (estado_peticiones)."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    veterinario_asignado = None
+    asignado_a_id = request.data.get('asignado_a')
+    if asignado_a_id and getattr(request.user, 'id_rol_id', None) in (1, 2):
+        veterinario_asignado = Usuarios.objects.filter(id_usuario=asignado_a_id, id_rol_id=3, activo=True).first()
+        if not veterinario_asignado:
+            return Response(
+                {"error": "El usuario asignado (asignado_a) no es un veterinario activo válido."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    serializer = self.get_serializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    save_kwargs = {
+        'responsable': request.user,
+        'id_estado': estado_inicial,
+    }
+    if veterinario_asignado:
+        estado_asignada = _obtener_estado_por_nombre('Asignada') or estado_inicial
+        save_kwargs['id_estado'] = estado_asignada
+        save_kwargs['asignado_a'] = veterinario_asignado
+        save_kwargs['asignado_por'] = request.user
+        save_kwargs['fecha_asignacion'] = timezone.now()
+
+    peticion = serializer.save(**save_kwargs)
+
+    # 1. Registrar creación en el historial
+    registrar_historial_peticion(
+        peticion=peticion,
+        tipo_cambio='CREACION',
+        estado_anterior=None,
+        estado_nuevo=estado_inicial,
+        veterinario_anterior=None,
+        veterinario_nuevo=None,
+        usuario_accion=request.user,
+        observacion="Petición registrada en el sistema.",
+    )
+
+    # 2. Si se asignó en el mismo acto de creación, registrar también la asignación
+    if veterinario_asignado:
+        registrar_historial_peticion(
+            peticion=peticion,
+            tipo_cambio='ASIGNACION',
+            estado_anterior=estado_inicial,
+            estado_nuevo=peticion.id_estado,
+            veterinario_anterior=None,
+            veterinario_nuevo=veterinario_asignado,
+            usuario_accion=request.user,
+            observacion=f"Asignada al veterinario {veterinario_asignado.nombre} {veterinario_asignado.apellido}".strip(),
+        )
+        crear_notificacion_asignacion(peticion, veterinario_asignado, es_reasignacion=False)
+
+    # 3. Crear notificaciones dentro de la aplicación web para Jurídico / Admin
+    crear_notificaciones_nueva_peticion(peticion)
+
+    # 4. Si es una petición urgente, enviar correo automático a Jurídico
+    info_correo = enviar_correo_peticion_urgente_juridico(peticion)
+
+    evidencias_urls = list(peticion.evidenciapeticiones_set.values_list('ruta_archivo', flat=True))
+    return Response({
+        "mensaje": "Petición iniciada con éxito",
+        "id_peticion": peticion.id_peticion,
+        "numero_radicado": peticion.numero_radicado,
+        "id_tipo": peticion.id_tipo.id_tipo if peticion.id_tipo else None,
+        "id_ubicacion": peticion.id_ubicacion.id_ubicacion if peticion.id_ubicacion else None,
+        "id_estado": peticion.id_estado_id,
+        "estado": peticion.id_estado.nombre if peticion.id_estado else None,
+        "prioridad": peticion.prioridad,
+        "asignado_a": peticion.asignado_a_id,
+        "correo_urgente_enviado": bool(info_correo.get("enviado")),
+        "foto": peticion.foto,
+        "fotos": evidencias_urls or ([peticion.foto] if peticion.foto else []),
+        "total_fotos": len(evidencias_urls) if evidencias_urls else (1 if peticion.foto else 0),
+    }, status=status.HTTP_201_CREATED)
+
+
+IniciarPeticionView.create = _juridico_iniciar_peticion_create
+
+
+# --- Extensión aditiva de AsignarPeticionView (compatibilidad con dev + regla de 5 días para reasignar + historial) ---
+
+_orig_asignar_peticion_update = AsignarPeticionView.update
+
+
+def _juridico_asignar_peticion_update(self, request, *args, **kwargs):
+    peticion = self.get_object()
+    es_modelo_real = isinstance(peticion, Peticiones)
+
+    veterinario_anterior = getattr(peticion, 'asignado_a', None)
+    estado_anterior = getattr(peticion, 'id_estado', None)
+    es_reasignacion = veterinario_anterior is not None
+
+    # Si es una instancia real en BD y ya tenía veterinario asignado, validar regla de 5 días sin avanzar
+    if es_modelo_real and es_reasignacion:
+        asignado_a_id = request.data.get('asignado_a')
+        if asignado_a_id:
+            tiempos = calcular_tiempos_peticion(peticion)
+            if not tiempos['puede_reasignar']:
+                estado_norm = normalizar_texto_juridico(getattr(estado_anterior, 'nombre', '') if estado_anterior else '')
+                if estado_norm in ('finalizada', 'resuelta', 'cancelada', 'rechazada', 'alta medica', 'fallecido'):
+                    return Response(
+                        {
+                            'error': f"No se puede reasignar una petición que ya se encuentra en estado '{estado_anterior.nombre}'.",
+                            'puede_reasignar': False,
+                            'dias_sin_avanzar': tiempos['dias_sin_avanzar'],
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                return Response(
+                    {
+                        'error': (
+                            f"Solo se puede reasignar una petición cuando lleve al menos {DIAS_PARA_REASIGNAR} días sin avanzar. "
+                            f"Actualmente lleva {tiempos['dias_sin_avanzar']} día(s) sin avance."
+                        ),
+                        'puede_reasignar': False,
+                        'dias_sin_avanzar': tiempos['dias_sin_avanzar'],
+                        'dias_requeridos': DIAS_PARA_REASIGNAR,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+    response = _orig_asignar_peticion_update(self, request, *args, **kwargs)
+
+    if response.status_code == status.HTTP_200_OK and es_modelo_real:
+        peticion_actualizada = (
+            Peticiones.objects
+            .select_related('id_estado', 'asignado_a', 'asignado_por')
+            .filter(pk=peticion.pk)
+            .first()
+        ) or peticion
+        veterinario_nuevo = getattr(peticion_actualizada, 'asignado_a', None)
+        tipo_cambio = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
+        observacion_input = request.data.get('observacion') or request.data.get('motivo')
+        if not observacion_input and veterinario_nuevo:
+            nombre_nuevo = f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+            if es_reasignacion and veterinario_anterior:
+                nombre_ant = f"{veterinario_anterior.nombre or ''} {veterinario_anterior.apellido or ''}".strip()
+                observacion_input = f"Reasignada de {nombre_ant} a {nombre_nuevo} tras {DIAS_PARA_REASIGNAR}+ días sin avance."
+            else:
+                observacion_input = f"Asignada al veterinario {nombre_nuevo}."
+
+        registrar_historial_peticion(
+            peticion=peticion_actualizada,
+            tipo_cambio=tipo_cambio,
+            estado_anterior=estado_anterior,
+            estado_nuevo=getattr(peticion_actualizada, 'id_estado', None),
+            veterinario_anterior=veterinario_anterior,
+            veterinario_nuevo=veterinario_nuevo,
+            usuario_accion=request.user,
+            observacion=observacion_input,
+        )
+        if veterinario_nuevo:
+            crear_notificacion_asignacion(peticion_actualizada, veterinario_nuevo, es_reasignacion=es_reasignacion)
+
+        if isinstance(response.data, dict):
+            response.data['tipo_operacion'] = tipo_cambio
+            response.data['estado'] = (
+                peticion_actualizada.id_estado.nombre
+                if getattr(peticion_actualizada, 'id_estado', None) else None
+            )
+            if veterinario_nuevo:
+                response.data['veterinario_responsable'] = (
+                    f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+                )
+
+    return response
+
+
+AsignarPeticionView.update = _juridico_asignar_peticion_update
+
+
+# --- Extensión aditiva de ActualizarEstadoPeticionView (registro automático en historial_peticiones) ---
+
+_orig_actualizar_estado_patch = ActualizarEstadoPeticionView.patch
+
+
+def _juridico_actualizar_estado_patch(self, request, id_peticion):
+    peticion_prev = (
+        Peticiones.objects
+        .select_related('id_estado', 'asignado_a')
+        .filter(pk=id_peticion)
+        .first()
+    )
+    estado_anterior = peticion_prev.id_estado if peticion_prev else None
+    vet_anterior = peticion_prev.asignado_a if peticion_prev else None
+
+    response = _orig_actualizar_estado_patch(self, request, id_peticion)
+
+    if response.status_code == status.HTTP_200_OK:
+        peticion_actual = (
+            Peticiones.objects
+            .select_related('id_estado', 'asignado_a')
+            .filter(pk=id_peticion)
+            .first()
+        )
+        if peticion_actual:
+            obs = request.data.get('observacion') or f"Cambio de estado a '{peticion_actual.id_estado.nombre}'."
+            registrar_historial_peticion(
+                peticion=peticion_actual,
+                tipo_cambio='CAMBIO_ESTADO',
+                estado_anterior=estado_anterior,
+                estado_nuevo=peticion_actual.id_estado,
+                veterinario_anterior=vet_anterior,
+                veterinario_nuevo=peticion_actual.asignado_a,
+                usuario_accion=request.user,
+                observacion=obs,
+            )
+
+    return response
+
+
+ActualizarEstadoPeticionView.patch = _juridico_actualizar_estado_patch

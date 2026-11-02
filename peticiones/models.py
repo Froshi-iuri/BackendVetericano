@@ -293,3 +293,101 @@ class NotificacionJuridico(models.Model):
 
     def __str__(self):
         return f"Notificación #{self.id_notificacion} [{self.tipo}] - Petición #{self.id_peticion_id}"
+
+
+
+class HistorialPeticiones(models.Model):
+    """
+    Historial de cambios de estado y asignaciones/reasignaciones de cada petición.
+    """
+    id_historial = models.AutoField(primary_key=True)
+    id_peticion = models.ForeignKey(
+        Peticiones,
+        models.CASCADE,
+        db_column='id_peticion',
+        related_name='historial_cambios'
+    )
+    tipo_cambio = models.CharField(max_length=30)  # 'CREACION', 'ASIGNACION', 'REASIGNACION', 'CAMBIO_ESTADO'
+    id_estado_anterior = models.ForeignKey(
+        EstadoPeticiones,
+        models.SET_NULL,
+        db_column='id_estado_anterior',
+        blank=True,
+        null=True,
+        related_name='+'
+    )
+    id_estado_nuevo = models.ForeignKey(
+        EstadoPeticiones,
+        models.SET_NULL,
+        db_column='id_estado_nuevo',
+        blank=True,
+        null=True,
+        related_name='+'
+    )
+    id_veterinario_anterior = models.ForeignKey(
+        'users.Usuarios',
+        models.SET_NULL,
+        db_column='id_veterinario_anterior',
+        blank=True,
+        null=True,
+        related_name='+'
+    )
+    id_veterinario_nuevo = models.ForeignKey(
+        'users.Usuarios',
+        models.SET_NULL,
+        db_column='id_veterinario_nuevo',
+        blank=True,
+        null=True,
+        related_name='+'
+    )
+    id_usuario_accion = models.ForeignKey(
+        'users.Usuarios',
+        models.SET_NULL,
+        db_column='id_usuario_accion',
+        blank=True,
+        null=True,
+        related_name='+'
+    )
+    observacion = models.TextField(blank=True, null=True)
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = 'historial_peticiones'
+
+    def __str__(self):
+        return f"Historial #{self.id_historial} ({self.tipo_cambio}) - Petición #{self.id_peticion_id}"
+
+
+class NotificacionPeticion(models.Model):
+    """
+    Notificaciones dentro de la aplicación web cuando llega o se asigna una petición.
+    """
+    id_notificacion = models.AutoField(primary_key=True)
+    id_peticion = models.ForeignKey(
+        Peticiones,
+        models.CASCADE,
+        db_column='id_peticion',
+        related_name='notificaciones'
+    )
+    id_usuario_destino = models.ForeignKey(
+        'users.Usuarios',
+        models.CASCADE,
+        db_column='id_usuario_destino',
+        blank=True,
+        null=True,
+        related_name='notificaciones_peticiones'
+    )
+    tipo = models.CharField(max_length=50, default='NUEVA_PETICION')
+    titulo = models.CharField(max_length=200)
+    mensaje = models.TextField()
+    leida = models.BooleanField(default=False)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_lectura = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = 'notificaciones_peticiones'
+
+    def __str__(self):
+        return f"Notificación #{self.id_notificacion} - {self.titulo}"
