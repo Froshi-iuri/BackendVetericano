@@ -1,5 +1,7 @@
 from rest_framework import serializers
+from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from peticiones.models import (
     TipoPeticion, Peticiones, Ubicaciones,
     SeguimientoPeticionesVisita, VisitaAnimal,
@@ -99,7 +101,8 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         
         # 3. Generar radicado único basado en el ID recién creado
         # Se rellena con ceros a la izquierda (ej. PET-2026-00055)
-        peticion.numero_radicado = f"PET-2026-{str(peticion.id_peticion).zfill(5)}"
+        anio_actual = timezone.localdate().year if getattr(settings, 'USE_TZ', False) else timezone.now().year
+        peticion.numero_radicado = f"PET-{anio_actual}-{str(peticion.id_peticion).zfill(5)}"
         peticion.save(update_fields=['numero_radicado'])
 
         # 4. Registrar todas las fotos en EvidenciaPeticiones
@@ -1245,6 +1248,52 @@ class NotificacionPeticionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = NotificacionPeticion
+from peticiones.models import HistorialAsignacionPeticion, NotificacionJuridico
+
+
+class HistorialAsignacionPeticionSerializer(serializers.ModelSerializer):
+    veterinario_anterior_nombre = serializers.SerializerMethodField()
+    veterinario_nuevo_nombre = serializers.SerializerMethodField()
+    asignado_por_nombre = serializers.SerializerMethodField()
+    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
+
+    class Meta:
+        model = HistorialAsignacionPeticion
+        fields = [
+            'id_historial',
+            'id_peticion',
+            'numero_radicado',
+            'veterinario_anterior',
+            'veterinario_anterior_nombre',
+            'veterinario_nuevo',
+            'veterinario_nuevo_nombre',
+            'motivo',
+            'asignado_por',
+            'asignado_por_nombre',
+            'fecha',
+        ]
+
+    def get_veterinario_anterior_nombre(self, obj):
+        if obj.veterinario_anterior:
+            return f"{obj.veterinario_anterior.nombre} {obj.veterinario_anterior.apellido}".strip()
+        return None
+
+    def get_veterinario_nuevo_nombre(self, obj):
+        if obj.veterinario_nuevo:
+            return f"{obj.veterinario_nuevo.nombre} {obj.veterinario_nuevo.apellido}".strip()
+        return None
+
+    def get_asignado_por_nombre(self, obj):
+        if obj.asignado_por:
+            return f"{obj.asignado_por.nombre} {obj.asignado_por.apellido}".strip()
+        return None
+
+
+class NotificacionJuridicoSerializer(serializers.ModelSerializer):
+    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
+
+    class Meta:
+        model = NotificacionJuridico
         fields = [
             'id_notificacion',
             'id_peticion',
@@ -1409,3 +1458,8 @@ def _detalle_peticion_to_representation(self, instance):
 
 
 DetallePeticionSerializer.to_representation = _detalle_peticion_to_representation
+            'tipo',
+            'mensaje',
+            'leida',
+            'fecha_creacion',
+        ]

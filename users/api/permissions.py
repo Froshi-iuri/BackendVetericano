@@ -24,8 +24,28 @@ class EsAdministradorOReadOnly(BasePermission):
         nombre_rol = getattr(rol, 'nombre_rol', '').strip().lower() if rol else ''
         id_rol = getattr(rol, 'id_rol', None) if rol else None
 
-        # Solo el Administrador tiene autorización
+        # Solo el Administrador tiene autorización total; cada usuario puede actualizar su propio perfil
         if nombre_rol not in ['administrador', 'admin'] and id_rol != 1:
+            if getattr(view, 'action', None) in ['update', 'partial_update']:
+                pk = view.kwargs.get('pk')
+                if pk and str(getattr(request.user, 'id_usuario', None)) == str(pk):
+                    return True
             raise PermissionDenied(self.message)
 
         return True
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in SAFE_METHODS:
+            return True
+
+        rol = getattr(request.user, 'id_rol', None)
+        nombre_rol = getattr(rol, 'nombre_rol', '').strip().lower() if rol else ''
+        id_rol = getattr(rol, 'id_rol', None) if rol else None
+
+        if nombre_rol in ['administrador', 'admin'] or id_rol == 1:
+            return True
+
+        if getattr(view, 'action', None) in ['update', 'partial_update']:
+            return getattr(obj, 'id_usuario', None) == getattr(request.user, 'id_usuario', None)
+
+        return False
