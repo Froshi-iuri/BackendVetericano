@@ -229,11 +229,8 @@ class EvidenciaSeguimientoVisita(models.Model):
 
 
 
-<<<<<<< HEAD
 class HistorialPeticiones(models.Model):
-    """
-    Historial de cambios de estado y asignaciones/reasignaciones de cada petición.
-    """
+   
     id_historial = models.AutoField(primary_key=True)
     id_peticion = models.ForeignKey(
         Peticiones,
@@ -325,7 +322,6 @@ class NotificacionPeticion(models.Model):
 
     def __str__(self):
         return f"Notificación #{self.id_notificacion} - {self.titulo}"
-=======
 class HistorialAsignacionPeticion(models.Model):
     id_historial = models.AutoField(primary_key=True)
     id_peticion = models.ForeignKey(
@@ -390,4 +386,3 @@ class NotificacionJuridico(models.Model):
 
     def __str__(self):
         return f"Notificación #{self.id_notificacion} [{self.tipo}] - Petición #{self.id_peticion_id}"
->>>>>>> da972c42d60ce2751dbb65c5c5ff9b0642eb2c19

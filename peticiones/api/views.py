@@ -531,7 +531,6 @@ class ActualizarEstadoPeticionView(APIView):
 
 
 
-<<<<<<< HEAD
 # ==============================================================================
 # VISTAS Y EXTENSIONES DEL MÓDULO JURÍDICO (ESTADOS, REASIGNACIÓN, HISTORIAL, NOTIFICACIONES Y CORREO)
 # ==============================================================================
@@ -654,7 +653,6 @@ class NotificacionesPeticionesListView(generics.ListAPIView):
             qs = qs.filter(leida=True)
 
         return qs.order_by('-fecha_creacion', '-id_notificacion')
-=======
 
 # ============================================================================
 # MÓDULO JURÍDICO: DASHBOARD, NOTIFICACIONES Y REASIGNACIONES
@@ -889,12 +887,10 @@ class NotificacionesJuridicoView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
->>>>>>> da972c42d60ce2751dbb65c5c5ff9b0642eb2c19
 
 
 class MarcarNotificacionLeidaView(APIView):
     """
-<<<<<<< HEAD
     PATCH/POST /api/peticiones/notificaciones/<id_notificacion>/leer/
     Marca una notificación específica como leída.
     """
@@ -1251,7 +1247,6 @@ def _juridico_actualizar_estado_patch(self, request, id_peticion):
 
 
 ActualizarEstadoPeticionView.patch = _juridico_actualizar_estado_patch
-=======
     PATCH /api/peticiones/notificaciones/<int:id>/marcar-leida/
     Marca una notificación específica como leída.
     Si se invoca sin id o con id=0 o ?todas=true, marca todas las notificaciones como leídas.
@@ -1300,4 +1295,3 @@ class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
         return HistorialAsignacionPeticion.objects.filter(
             id_peticion_id=id_peticion
         ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
->>>>>>> da972c42d60ce2751dbb65c5c5ff9b0642eb2c19
