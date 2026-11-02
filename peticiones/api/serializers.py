@@ -1176,3 +1176,236 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             return 1
         return 0
 
+
+
+# ==============================================================================
+# SERIALIZERS Y EXTENSIONES PARA EL MÓDULO DE JURÍDICO
+# ==============================================================================
+
+from peticiones.models import EstadoPeticiones, HistorialPeticiones, NotificacionPeticion
+from peticiones.utils import calcular_tiempos_peticion
+
+
+class EstadoPeticionesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EstadoPeticiones
+        fields = ['id_estado', 'nombre', 'descripcion', 'orden', 'activo']
+
+
+class HistorialPeticionesSerializer(serializers.ModelSerializer):
+    estado_anterior = serializers.CharField(source='id_estado_anterior.nombre', read_only=True, default=None)
+    estado_nuevo = serializers.CharField(source='id_estado_nuevo.nombre', read_only=True, default=None)
+    veterinario_anterior_nombre = serializers.SerializerMethodField()
+    veterinario_nuevo_nombre = serializers.SerializerMethodField()
+    usuario_accion_nombre = serializers.SerializerMethodField()
+    usuario_accion_rol = serializers.CharField(source='id_usuario_accion.id_rol.nombre_rol', read_only=True, default=None)
+
+    class Meta:
+        model = HistorialPeticiones
+        fields = [
+            'id_historial',
+            'id_peticion',
+            'tipo_cambio',
+            'id_estado_anterior',
+            'estado_anterior',
+            'id_estado_nuevo',
+            'estado_nuevo',
+            'id_veterinario_anterior',
+            'veterinario_anterior_nombre',
+            'id_veterinario_nuevo',
+            'veterinario_nuevo_nombre',
+            'id_usuario_accion',
+            'usuario_accion_nombre',
+            'usuario_accion_rol',
+            'observacion',
+            'fecha',
+        ]
+
+    def _nombre_usuario(self, user_obj):
+        if not user_obj:
+            return None
+        return f"{getattr(user_obj, 'nombre', '') or ''} {getattr(user_obj, 'apellido', '') or ''}".strip() or getattr(user_obj, 'email', None)
+
+    def get_veterinario_anterior_nombre(self, obj):
+        return self._nombre_usuario(getattr(obj, 'id_veterinario_anterior', None))
+
+    def get_veterinario_nuevo_nombre(self, obj):
+        return self._nombre_usuario(getattr(obj, 'id_veterinario_nuevo', None))
+
+    def get_usuario_accion_nombre(self, obj):
+        return self._nombre_usuario(getattr(obj, 'id_usuario_accion', None))
+
+
+class NotificacionPeticionSerializer(serializers.ModelSerializer):
+    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True, default='')
+    prioridad = serializers.CharField(source='id_peticion.prioridad', read_only=True, default='')
+    estado_peticion = serializers.CharField(source='id_peticion.id_estado.nombre', read_only=True, default='')
+    tipo_peticion = serializers.CharField(source='id_peticion.id_tipo.nombre', read_only=True, default='')
+    tiempo_transcurrido = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotificacionPeticion
+        fields = [
+            'id_notificacion',
+            'id_peticion',
+            'numero_radicado',
+            'tipo_peticion',
+            'prioridad',
+            'estado_peticion',
+            'id_usuario_destino',
+            'tipo',
+            'titulo',
+            'mensaje',
+            'leida',
+            'fecha_creacion',
+            'fecha_lectura',
+            'tiempo_transcurrido',
+        ]
+        read_only_fields = fields
+
+    def get_tiempo_transcurrido(self, obj):
+        from peticiones.utils import formatear_duracion_humana
+        return formatear_duracion_humana(getattr(obj, 'fecha_creacion', None))
+
+
+def construir_historial_peticion_lista(peticion) -> list:
+    """
+    Obtiene el historial de cambios de estado y asignaciones de una petición.
+    Si es una petición previa que aún no tenía registros en historial_peticiones,
+    reconstruye los eventos base de creación y asignación para mantener compatibilidad.
+    """
+    if not peticion or not getattr(peticion, 'pk', None):
+        return []
+
+    prefetched = getattr(peticion, '_prefetched_objects_cache', {}).get('historial_cambios')
+    if prefetched is not None:
+        registros = list(prefetched)
+    else:
+        registros = list(
+            HistorialPeticiones.objects
+            .filter(id_peticion_id=peticion.pk)
+            .select_related(
+                'id_estado_anterior',
+                'id_estado_nuevo',
+                'id_veterinario_anterior',
+                'id_veterinario_nuevo',
+                'id_usuario_accion',
+                'id_usuario_accion__id_rol',
+            )
+            .order_by('-fecha', '-id_historial')
+        )
+
+    data = list(HistorialPeticionesSerializer(registros, many=True).data)
+
+    # Si no existe ningún registro en la tabla para una petición antigua, reconstruir base
+    if not data:
+        if getattr(peticion, 'asignado_a', None):
+            vet = peticion.asignado_a
+            vet_nombre = f"{getattr(vet, 'nombre', '') or ''} {getattr(vet, 'apellido', '') or ''}".strip()
+            asig_por = getattr(peticion, 'asignado_por', None)
+            asig_por_nombre = (
+                f"{getattr(asig_por, 'nombre', '') or ''} {getattr(asig_por, 'apellido', '') or ''}".strip()
+                if asig_por else None
+            )
+            data.append({
+                'id_historial': None,
+                'id_peticion': peticion.id_peticion,
+                'tipo_cambio': 'ASIGNACION',
+                'id_estado_anterior': None,
+                'estado_anterior': None,
+                'id_estado_nuevo': peticion.id_estado_id,
+                'estado_nuevo': getattr(getattr(peticion, 'id_estado', None), 'nombre', None),
+                'id_veterinario_anterior': None,
+                'veterinario_anterior_nombre': None,
+                'id_veterinario_nuevo': peticion.asignado_a_id,
+                'veterinario_nuevo_nombre': vet_nombre,
+                'id_usuario_accion': peticion.asignado_por_id,
+                'usuario_accion_nombre': asig_por_nombre,
+                'usuario_accion_rol': None,
+                'observacion': f"Asignada al veterinario {vet_nombre}",
+                'fecha': peticion.fecha_asignacion or peticion.fecha,
+            })
+
+        resp = getattr(peticion, 'responsable', None)
+        resp_nombre = (
+            f"{getattr(resp, 'nombre', '') or ''} {getattr(resp, 'apellido', '') or ''}".strip()
+            if resp else "Ciudadano"
+        )
+        data.append({
+            'id_historial': None,
+            'id_peticion': peticion.id_peticion,
+            'tipo_cambio': 'CREACION',
+            'id_estado_anterior': None,
+            'estado_anterior': None,
+            'id_estado_nuevo': peticion.id_estado_id,
+            'estado_nuevo': getattr(getattr(peticion, 'id_estado', None), 'nombre', None),
+            'id_veterinario_anterior': None,
+            'veterinario_anterior_nombre': None,
+            'id_veterinario_nuevo': None,
+            'veterinario_nuevo_nombre': None,
+            'id_usuario_accion': getattr(peticion, 'responsable_id', None),
+            'usuario_accion_nombre': resp_nombre,
+            'usuario_accion_rol': None,
+            'observacion': "Registro inicial de la petición",
+            'fecha': peticion.fecha,
+        })
+
+    return data
+
+
+def _enriquecer_datos_juridico_peticion(instance, data: dict, incluir_historial: bool = False) -> dict:
+    """
+    Agrega de forma aditiva los campos requeridos por Jurídico (veterinario responsable,
+    tiempo transcurrido, días sin avanzar, indicador de reasignación e historial)
+    conservando intactos todos los campos originales del serializer.
+    """
+    vet = getattr(instance, 'asignado_a', None)
+    vet_nombre_completo = (
+        f"{getattr(vet, 'nombre', '') or ''} {getattr(vet, 'apellido', '') or ''}".strip()
+        if vet else None
+    )
+    asig_por = getattr(instance, 'asignado_por', None)
+    asig_por_nombre = (
+        f"{getattr(asig_por, 'nombre', '') or ''} {getattr(asig_por, 'apellido', '') or ''}".strip()
+        if asig_por else None
+    )
+
+    tiempos = calcular_tiempos_peticion(instance)
+
+    data['id_estado'] = getattr(instance, 'id_estado_id', None)
+    data['asignado_a'] = getattr(instance, 'asignado_a_id', None)
+    data['veterinario_responsable'] = vet_nombre_completo or "Sin asignar"
+    data['asignado_por'] = getattr(instance, 'asignado_por_id', None)
+    data['asignado_por_nombre'] = asig_por_nombre
+    data['tiempo_transcurrido'] = tiempos['tiempo_transcurrido']
+    data['tiempo_desde_asignacion'] = tiempos['tiempo_desde_asignacion']
+    data['dias_transcurridos'] = tiempos['dias_transcurridos']
+    data['dias_sin_avanzar'] = tiempos['dias_sin_avanzar']
+    data['puede_reasignar'] = tiempos['puede_reasignar']
+
+    if incluir_historial:
+        data['historial'] = construir_historial_peticion_lista(instance)
+
+    return data
+
+
+_orig_listar_peticiones_to_rep = ListarPeticionesSerializer.to_representation
+
+
+def _listar_peticiones_to_representation(self, instance):
+    data = _orig_listar_peticiones_to_rep(self, instance)
+    return _enriquecer_datos_juridico_peticion(instance, data, incluir_historial=False)
+
+
+ListarPeticionesSerializer.to_representation = _listar_peticiones_to_representation
+
+
+_orig_detalle_peticion_to_rep = DetallePeticionSerializer.to_representation
+
+
+def _detalle_peticion_to_representation(self, instance):
+    data = _orig_detalle_peticion_to_rep(self, instance)
+    return _enriquecer_datos_juridico_peticion(instance, data, incluir_historial=True)
+
+
+DetallePeticionSerializer.to_representation = _detalle_peticion_to_representation
