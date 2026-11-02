@@ -531,128 +531,6 @@ class ActualizarEstadoPeticionView(APIView):
 
 
 
-# ==============================================================================
-# VISTAS Y EXTENSIONES DEL MÓDULO JURÍDICO (ESTADOS, REASIGNACIÓN, HISTORIAL, NOTIFICACIONES Y CORREO)
-# ==============================================================================
-
-from django.db.models import Q, Case, When, Value, IntegerField
-from peticiones.models import HistorialPeticiones, NotificacionPeticion
-from peticiones.utils import (
-    ESTADOS_FLUJO_JURIDICO,
-    DIAS_PARA_REASIGNAR,
-    normalizar_texto_juridico,
-    es_prioridad_urgente,
-    calcular_tiempos_peticion,
-    registrar_historial_peticion,
-    crear_notificaciones_nueva_peticion,
-    crear_notificacion_asignacion,
-    enviar_correo_peticion_urgente_juridico,
-)
-from .serializers import (
-    EstadoPeticionesSerializer,
-    HistorialPeticionesSerializer,
-    NotificacionPeticionSerializer,
-    construir_historial_peticion_lista,
-)
-
-
-def _obtener_estado_por_nombre(nombre_buscado: str):
-    """Busca un estado en EstadoPeticiones de forma insensible a mayúsculas y tildes."""
-    est = EstadoPeticiones.objects.filter(nombre__iexact=nombre_buscado).first()
-    if est:
-        return est
-    norm = normalizar_texto_juridico(nombre_buscado)
-    for item in EstadoPeticiones.objects.all():
-        if normalizar_texto_juridico(item.nombre) == norm:
-            return item
-    return None
-
-
-class ListarEstadosPeticionView(APIView):
-    """
-    GET /api/peticiones/estados/
-    Retorna los 6 estados requeridos del flujo de peticiones:
-    En revisión, Asignada, En proceso, Atendida, En tratamiento y Finalizada.
-    Si se envía ?todos=true, retorna todos los estados activos del catálogo.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, *args, **kwargs):
-        mostrar_todos = str(request.query_params.get('todos', '')).lower() in ('true', '1', 'si')
-        todos_activos = list(EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado'))
-
-        if mostrar_todos:
-            serializer = EstadoPeticionesSerializer(todos_activos, many=True)
-            return Response(serializer.data, status=status.HTTP_200_OK)
-
-        # Seleccionar y ordenar exactamente los 6 estados del flujo oficial
-        orden_norm = [normalizar_texto_juridico(n) for n in ESTADOS_FLUJO_JURIDICO]
-        mapa_por_norm = {}
-        for est in todos_activos:
-            n_est = normalizar_texto_juridico(est.nombre)
-            if n_est in orden_norm and n_est not in mapa_por_norm:
-                mapa_por_norm[n_est] = est
-
-        estados_resultado = [mapa_por_norm[n] for n in orden_norm if n in mapa_por_norm]
-        serializer = EstadoPeticionesSerializer(estados_resultado, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-
-
-class HistorialPeticionView(APIView):
-    """
-    GET /api/peticiones/<id_peticion>/historial/
-    Retorna el historial completo de cambios de estado y asignaciones de una petición.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, id_peticion, *args, **kwargs):
-        peticion = (
-            Peticiones.objects
-            .select_related('id_estado', 'responsable', 'asignado_a', 'asignado_por')
-            .filter(pk=id_peticion)
-            .first()
-        )
-        if not peticion:
-            return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
-
-        user = request.user
-        if getattr(user, 'id_rol_id', None) == 3 and peticion.asignado_a_id != user.id_usuario:
-            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
-        if getattr(user, 'id_rol_id', None) == 4 and peticion.responsable_id != user.id_usuario:
-            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
-
-        historial = construir_historial_peticion_lista(peticion)
-        return Response(historial, status=status.HTTP_200_OK)
-
-
-class NotificacionesPeticionesListView(generics.ListAPIView):
-    """
-    GET /api/peticiones/notificaciones/
-    Lista las notificaciones dentro de la aplicación web para el usuario autenticado.
-    Soporta filtro opcional ?leida=false o ?solo_no_leidas=true.
-    """
-    serializer_class = NotificacionPeticionSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        qs = (
-            NotificacionPeticion.objects
-            .select_related('id_peticion', 'id_peticion__id_tipo', 'id_peticion__id_estado')
-        )
-        if getattr(user, 'id_rol_id', None) in (1, 2):
-            qs = qs.filter(Q(id_usuario_destino=user) | Q(id_usuario_destino__isnull=True))
-        else:
-            qs = qs.filter(id_usuario_destino=user)
-
-        leida_param = self.request.query_params.get('leida')
-        solo_no_leidas = self.request.query_params.get('solo_no_leidas')
-        if str(solo_no_leidas).lower() in ('true', '1') or str(leida_param).lower() in ('false', '0'):
-            qs = qs.filter(leida=False)
-        elif str(leida_param).lower() in ('true', '1'):
-            qs = qs.filter(leida=True)
-
-        return qs.order_by('-fecha_creacion', '-id_notificacion')
 
 # ============================================================================
 # MÓDULO JURÍDICO: DASHBOARD, NOTIFICACIONES Y REASIGNACIONES
@@ -891,6 +769,181 @@ class NotificacionesJuridicoView(APIView):
 
 class MarcarNotificacionLeidaView(APIView):
     """
+    PATCH /api/peticiones/notificaciones/<int:id>/marcar-leida/
+    Marca una notificación específica como leída.
+    Si se invoca sin id o con id=0 o ?todas=true, marca todas las notificaciones como leídas.
+    """
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def patch(self, request, id=None, *args, **kwargs):
+        marcar_todas = (
+            id is None or
+            id == 0 or
+            request.data.get('marcar_todas') is True or
+            request.query_params.get('todas', '').lower() in ['true', '1', 'si']
+        )
+        if marcar_todas:
+            actualizadas = NotificacionJuridico.objects.filter(leida=False).update(leida=True)
+            return Response({
+                "mensaje": "Todas las notificaciones han sido marcadas como leídas.",
+                "actualizadas": actualizadas
+            }, status=status.HTTP_200_OK)
+
+        notificacion = NotificacionJuridico.objects.filter(id_notificacion=id).first()
+        if not notificacion:
+            return Response({
+                "error": f"Notificación con id {id} no encontrada."
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        notificacion.leida = True
+        notificacion.save(update_fields=['leida'])
+        serializer = NotificacionJuridicoSerializer(notificacion)
+        return Response({
+            "mensaje": "Notificación marcada como leída exitosamente.",
+            "notificacion": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
+    """
+    GET /api/peticiones/<id_peticion>/historial-asignaciones/
+    Lista el historial cronológico de reasignaciones de una petición.
+    """
+    serializer_class = HistorialAsignacionPeticionSerializer
+    permission_classes = [IsJuridicoOrAdmin]
+
+    def get_queryset(self):
+        id_peticion = self.kwargs.get('id_peticion')
+        return HistorialAsignacionPeticion.objects.filter(
+            id_peticion_id=id_peticion
+        ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
+
+
+
+# ==============================================================================
+# VISTAS Y EXTENSIONES DEL MÓDULO JURÍDICO (ESTADOS, REASIGNACIÓN, HISTORIAL, NOTIFICACIONES Y CORREO)
+# ==============================================================================
+
+from peticiones.models import HistorialPeticiones, NotificacionPeticion
+from peticiones.utils import (
+    ESTADOS_FLUJO_JURIDICO,
+    DIAS_PARA_REASIGNAR,
+    normalizar_texto_juridico,
+    es_prioridad_urgente,
+    calcular_tiempos_peticion,
+    registrar_historial_peticion,
+    crear_notificaciones_nueva_peticion,
+    crear_notificacion_asignacion,
+    enviar_correo_peticion_urgente_juridico,
+)
+from .serializers import (
+    EstadoPeticionesSerializer,
+    HistorialPeticionesSerializer,
+    NotificacionPeticionSerializer,
+    construir_historial_peticion_lista,
+)
+
+
+def _obtener_estado_por_nombre(nombre_buscado: str):
+    """Busca un estado en EstadoPeticiones de forma insensible a mayúsculas y tildes."""
+    est = EstadoPeticiones.objects.filter(nombre__iexact=nombre_buscado).first()
+    if est:
+        return est
+    norm = normalizar_texto_juridico(nombre_buscado)
+    for item in EstadoPeticiones.objects.all():
+        if normalizar_texto_juridico(item.nombre) == norm:
+            return item
+    return None
+
+
+class ListarEstadosPeticionView(APIView):
+    """
+    GET /api/peticiones/estados/
+    Retorna los 6 estados requeridos del flujo de peticiones:
+    En revisión, Asignada, En proceso, Atendida, En tratamiento y Finalizada.
+    Si se envía ?todos=true, retorna todos los estados activos del catálogo.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        mostrar_todos = str(request.query_params.get('todos', '')).lower() in ('true', '1', 'si')
+        todos_activos = list(EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado'))
+
+        if mostrar_todos:
+            serializer = EstadoPeticionesSerializer(todos_activos, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        orden_norm = [normalizar_texto_juridico(n) for n in ESTADOS_FLUJO_JURIDICO]
+        mapa_por_norm = {}
+        for est in todos_activos:
+            n_est = normalizar_texto_juridico(est.nombre)
+            if n_est in orden_norm and n_est not in mapa_por_norm:
+                mapa_por_norm[n_est] = est
+
+        estados_resultado = [mapa_por_norm[n] for n in orden_norm if n in mapa_por_norm]
+        serializer = EstadoPeticionesSerializer(estados_resultado, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class HistorialPeticionView(APIView):
+    """
+    GET /api/peticiones/<id_peticion>/historial/
+    Retorna el historial completo de cambios de estado y asignaciones de una petición.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, id_peticion, *args, **kwargs):
+        peticion = (
+            Peticiones.objects
+            .select_related('id_estado', 'responsable', 'asignado_a', 'asignado_por')
+            .filter(pk=id_peticion)
+            .first()
+        )
+        if not peticion:
+            return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if getattr(user, 'id_rol_id', None) == 3 and peticion.asignado_a_id != user.id_usuario:
+            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
+        if getattr(user, 'id_rol_id', None) == 4 and peticion.responsable_id != user.id_usuario:
+            return Response({"error": "No tiene permiso para consultar esta petición."}, status=status.HTTP_403_FORBIDDEN)
+
+        historial = construir_historial_peticion_lista(peticion)
+        return Response(historial, status=status.HTTP_200_OK)
+
+
+class NotificacionesPeticionesListView(generics.ListAPIView):
+    """
+    GET /api/peticiones/notificaciones/usuario/
+    Lista las notificaciones dentro de la aplicación web para el usuario autenticado.
+    Soporta filtro opcional ?leida=false o ?solo_no_leidas=true.
+    """
+    serializer_class = NotificacionPeticionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            NotificacionPeticion.objects
+            .select_related('id_peticion', 'id_peticion__id_tipo', 'id_peticion__id_estado')
+        )
+        if getattr(user, 'id_rol_id', None) in (1, 2):
+            qs = qs.filter(Q(id_usuario_destino=user) | Q(id_usuario_destino__isnull=True))
+        else:
+            qs = qs.filter(id_usuario_destino=user)
+
+        leida_param = self.request.query_params.get('leida')
+        solo_no_leidas = self.request.query_params.get('solo_no_leidas')
+        if str(solo_no_leidas).lower() in ('true', '1') or str(leida_param).lower() in ('false', '0'):
+            qs = qs.filter(leida=False)
+        elif str(leida_param).lower() in ('true', '1'):
+            qs = qs.filter(leida=True)
+
+        return qs.order_by('-fecha_creacion', '-id_notificacion')
+
+
+class MarcarNotificacionPeticionLeidaView(APIView):
+    """
     PATCH/POST /api/peticiones/notificaciones/<id_notificacion>/leer/
     Marca una notificación específica como leída.
     """
@@ -1017,7 +1070,6 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-    # Si Jurídico (2) o Administrador (1) envía asignado_a al crear la petición, validarlo
     veterinario_asignado = None
     asignado_a_id = request.data.get('asignado_a')
     if asignado_a_id and getattr(request.user, 'id_rol_id', None) in (1, 2):
@@ -1097,110 +1149,93 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
 IniciarPeticionView.create = _juridico_iniciar_peticion_create
 
 
-# --- Extensión aditiva de AsignarPeticionView (permiso Jurídico/Admin, estado 'Asignada', regla de 5 días para reasignar e historial) ---
+# --- Extensión aditiva de AsignarPeticionView (compatibilidad con dev + regla de 5 días para reasignar + historial) ---
+
+_orig_asignar_peticion_update = AsignarPeticionView.update
+
 
 def _juridico_asignar_peticion_update(self, request, *args, **kwargs):
-    # Solo Administrador (1) y Jurídico (2) pueden asignar o reasignar peticiones
-    if getattr(request.user, 'id_rol_id', None) not in (1, 2):
-        return Response(
-            {'error': 'Solo el personal de Jurídico o Administración puede asignar o reasignar peticiones.'},
-            status=status.HTTP_403_FORBIDDEN
-        )
-
-    kwargs['partial'] = True
     peticion = self.get_object()
+    es_modelo_real = isinstance(peticion, Peticiones)
 
-    asignado_a_id = request.data.get('asignado_a')
-    if not asignado_a_id:
-        return Response(
-            {'error': 'Debe proveer el id del usuario asignado (asignado_a).'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    veterinario = Usuarios.objects.filter(id_usuario=asignado_a_id).first()
-    if not veterinario or veterinario.id_rol_id != 3:
-        return Response(
-            {'error': 'El usuario asignado no es un veterinario válido.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    veterinario_anterior = peticion.asignado_a
-    estado_anterior = peticion.id_estado
+    veterinario_anterior = getattr(peticion, 'asignado_a', None)
+    estado_anterior = getattr(peticion, 'id_estado', None)
     es_reasignacion = veterinario_anterior is not None
 
-    # Si ya tenía un veterinario asignado, validar la regla de 5 días sin avanzar
-    if es_reasignacion:
-        tiempos = calcular_tiempos_peticion(peticion)
-        if not tiempos['puede_reasignar']:
-            estado_norm = normalizar_texto_juridico(getattr(estado_anterior, 'nombre', '') if estado_anterior else '')
-            if estado_norm in ('finalizada', 'resuelta', 'cancelada', 'rechazada', 'alta medica', 'fallecido'):
+    # Si es una instancia real en BD y ya tenía veterinario asignado, validar regla de 5 días sin avanzar
+    if es_modelo_real and es_reasignacion:
+        asignado_a_id = request.data.get('asignado_a')
+        if asignado_a_id:
+            tiempos = calcular_tiempos_peticion(peticion)
+            if not tiempos['puede_reasignar']:
+                estado_norm = normalizar_texto_juridico(getattr(estado_anterior, 'nombre', '') if estado_anterior else '')
+                if estado_norm in ('finalizada', 'resuelta', 'cancelada', 'rechazada', 'alta medica', 'fallecido'):
+                    return Response(
+                        {
+                            'error': f"No se puede reasignar una petición que ya se encuentra en estado '{estado_anterior.nombre}'.",
+                            'puede_reasignar': False,
+                            'dias_sin_avanzar': tiempos['dias_sin_avanzar'],
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
                 return Response(
                     {
-                        'error': f"No se puede reasignar una petición que ya se encuentra en estado '{estado_anterior.nombre}'.",
+                        'error': (
+                            f"Solo se puede reasignar una petición cuando lleve al menos {DIAS_PARA_REASIGNAR} días sin avanzar. "
+                            f"Actualmente lleva {tiempos['dias_sin_avanzar']} día(s) sin avance."
+                        ),
                         'puede_reasignar': False,
                         'dias_sin_avanzar': tiempos['dias_sin_avanzar'],
+                        'dias_requeridos': DIAS_PARA_REASIGNAR,
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            return Response(
-                {
-                    'error': (
-                        f"Solo se puede reasignar una petición cuando lleve al menos {DIAS_PARA_REASIGNAR} días sin avanzar. "
-                        f"Actualmente lleva {tiempos['dias_sin_avanzar']} día(s) sin avance."
-                    ),
-                    'puede_reasignar': False,
-                    'dias_sin_avanzar': tiempos['dias_sin_avanzar'],
-                    'dias_requeridos': DIAS_PARA_REASIGNAR,
-                },
-                status=status.HTTP_400_BAD_REQUEST
+
+    response = _orig_asignar_peticion_update(self, request, *args, **kwargs)
+
+    if response.status_code == status.HTTP_200_OK and es_modelo_real:
+        peticion_actualizada = (
+            Peticiones.objects
+            .select_related('id_estado', 'asignado_a', 'asignado_por')
+            .filter(pk=peticion.pk)
+            .first()
+        ) or peticion
+        veterinario_nuevo = getattr(peticion_actualizada, 'asignado_a', None)
+        tipo_cambio = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
+        observacion_input = request.data.get('observacion') or request.data.get('motivo')
+        if not observacion_input and veterinario_nuevo:
+            nombre_nuevo = f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+            if es_reasignacion and veterinario_anterior:
+                nombre_ant = f"{veterinario_anterior.nombre or ''} {veterinario_anterior.apellido or ''}".strip()
+                observacion_input = f"Reasignada de {nombre_ant} a {nombre_nuevo} tras {DIAS_PARA_REASIGNAR}+ días sin avance."
+            else:
+                observacion_input = f"Asignada al veterinario {nombre_nuevo}."
+
+        registrar_historial_peticion(
+            peticion=peticion_actualizada,
+            tipo_cambio=tipo_cambio,
+            estado_anterior=estado_anterior,
+            estado_nuevo=getattr(peticion_actualizada, 'id_estado', None),
+            veterinario_anterior=veterinario_anterior,
+            veterinario_nuevo=veterinario_nuevo,
+            usuario_accion=request.user,
+            observacion=observacion_input,
+        )
+        if veterinario_nuevo:
+            crear_notificacion_asignacion(peticion_actualizada, veterinario_nuevo, es_reasignacion=es_reasignacion)
+
+        if isinstance(response.data, dict):
+            response.data['tipo_operacion'] = tipo_cambio
+            response.data['estado'] = (
+                peticion_actualizada.id_estado.nombre
+                if getattr(peticion_actualizada, 'id_estado', None) else None
             )
+            if veterinario_nuevo:
+                response.data['veterinario_responsable'] = (
+                    f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+                )
 
-    # Preparar datos y estado 'Asignada' por defecto si no se especificó otro id_estado
-    datos_update = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-    if not datos_update.get('id_estado'):
-        estado_asignada = _obtener_estado_por_nombre('Asignada')
-        if estado_asignada:
-            datos_update['id_estado'] = estado_asignada.id_estado
-
-    serializer = self.get_serializer(peticion, data=datos_update, partial=True)
-    serializer.is_valid(raise_exception=True)
-
-    ahora = timezone.now()
-    peticion_actualizada = serializer.save(
-        asignado_por=request.user,
-        fecha_asignacion=ahora
-    )
-
-    # Registrar en el historial de la petición
-    tipo_cambio = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
-    observacion_input = request.data.get('observacion') or request.data.get('motivo')
-    if not observacion_input:
-        nombre_nuevo = f"{veterinario.nombre or ''} {veterinario.apellido or ''}".strip()
-        if es_reasignacion and veterinario_anterior:
-            nombre_ant = f"{veterinario_anterior.nombre or ''} {veterinario_anterior.apellido or ''}".strip()
-            observacion_input = f"Reasignada de {nombre_ant} a {nombre_nuevo} tras {DIAS_PARA_REASIGNAR}+ días sin avance."
-        else:
-            observacion_input = f"Asignada al veterinario {nombre_nuevo}."
-
-    registrar_historial_peticion(
-        peticion=peticion_actualizada,
-        tipo_cambio=tipo_cambio,
-        estado_anterior=estado_anterior,
-        estado_nuevo=peticion_actualizada.id_estado,
-        veterinario_anterior=veterinario_anterior,
-        veterinario_nuevo=veterinario,
-        usuario_accion=request.user,
-        observacion=observacion_input,
-    )
-
-    # Notificar al veterinario asignado
-    crear_notificacion_asignacion(peticion_actualizada, veterinario, es_reasignacion=es_reasignacion)
-
-    respuesta_data = dict(serializer.data)
-    respuesta_data['tipo_operacion'] = tipo_cambio
-    respuesta_data['estado'] = peticion_actualizada.id_estado.nombre if peticion_actualizada.id_estado else None
-    respuesta_data['veterinario_responsable'] = f"{veterinario.nombre or ''} {veterinario.apellido or ''}".strip()
-    return Response(respuesta_data, status=status.HTTP_200_OK)
+    return response
 
 
 AsignarPeticionView.update = _juridico_asignar_peticion_update
@@ -1247,51 +1282,3 @@ def _juridico_actualizar_estado_patch(self, request, id_peticion):
 
 
 ActualizarEstadoPeticionView.patch = _juridico_actualizar_estado_patch
-    PATCH /api/peticiones/notificaciones/<int:id>/marcar-leida/
-    Marca una notificación específica como leída.
-    Si se invoca sin id o con id=0 o ?todas=true, marca todas las notificaciones como leídas.
-    """
-    permission_classes = [IsJuridicoOrAdmin]
-
-    def patch(self, request, id=None, *args, **kwargs):
-        marcar_todas = (
-            id is None or
-            id == 0 or
-            request.data.get('marcar_todas') is True or
-            request.query_params.get('todas', '').lower() in ['true', '1', 'si']
-        )
-        if marcar_todas:
-            actualizadas = NotificacionJuridico.objects.filter(leida=False).update(leida=True)
-            return Response({
-                "mensaje": "Todas las notificaciones han sido marcadas como leídas.",
-                "actualizadas": actualizadas
-            }, status=status.HTTP_200_OK)
-
-        notificacion = NotificacionJuridico.objects.filter(id_notificacion=id).first()
-        if not notificacion:
-            return Response({
-                "error": f"Notificación con id {id} no encontrada."
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        notificacion.leida = True
-        notificacion.save(update_fields=['leida'])
-        serializer = NotificacionJuridicoSerializer(notificacion)
-        return Response({
-            "mensaje": "Notificación marcada como leída exitosamente.",
-            "notificacion": serializer.data
-        }, status=status.HTTP_200_OK)
-
-
-class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
-    """
-    GET /api/peticiones/<id_peticion>/historial-asignaciones/
-    Lista el historial cronológico de reasignaciones de una petición.
-    """
-    serializer_class = HistorialAsignacionPeticionSerializer
-    permission_classes = [IsJuridicoOrAdmin]
-
-    def get_queryset(self):
-        id_peticion = self.kwargs.get('id_peticion')
-        return HistorialAsignacionPeticion.objects.filter(
-            id_peticion_id=id_peticion
-        ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
