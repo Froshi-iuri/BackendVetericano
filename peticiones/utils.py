@@ -239,3 +239,391 @@ def obtener_multimedia_acta(seguimiento) -> dict:
         'multimedia': multimedia_lista,
     }
 
+
+
+# ==============================================================================
+# UTILIDADES DEL MÓDULO JURÍDICO: ESTADOS, TIEMPOS, HISTORIAL, NOTIFICACIONES Y CORREO
+# ==============================================================================
+
+import unicodedata
+from datetime import datetime, timezone as dt_timezone, timedelta
+from django.utils import timezone
+
+
+ESTADOS_FLUJO_JURIDICO = [
+    'En revisión',
+    'Asignada',
+    'En Proceso',
+    'Atendida',
+    'En tratamiento',
+    'Finalizada',
+]
+
+ESTADOS_TERMINALES_NORM = {
+    'finalizada',
+    'resuelta',
+    'cancelada',
+    'rechazada',
+    'alta medica',
+    'fallecido',
+}
+
+DIAS_PARA_REASIGNAR = 5
+
+
+def normalizar_texto_juridico(texto) -> str:
+    if not texto:
+        return ""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', str(texto))
+        if unicodedata.category(c) != 'Mn'
+    ).lower().strip()
+
+
+def es_prioridad_urgente(prioridad) -> bool:
+    """
+    Determina si la prioridad de una petición corresponde a una petición urgente.
+    Soporta valores como 'Urgente', 'Alta', 'Crítica', 'Emergencia' (insensible a mayúsculas/tildes).
+    """
+    norm = normalizar_texto_juridico(prioridad)
+    if not norm:
+        return False
+    return norm in ('urgente', 'alta', 'critica', 'emergencia') or 'urgent' in norm or 'critic' in norm
+
+
+def _a_naive_local(dt):
+    """
+    Convierte cualquier datetime (con o sin tzinfo) a datetime naive en hora local (America/Bogota, UTC-5)
+    para evitar errores al restar fechas con USE_TZ=False y columnas timestamptz en PostgreSQL.
+    """
+    if dt is None:
+        return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is not None:
+        bogota_tz = dt_timezone(timedelta(hours=-5))
+        return dt.astimezone(bogota_tz).replace(tzinfo=None)
+    return dt
+
+
+def formatear_duracion_humana(fecha_inicio, ahora=None) -> str:
+    """
+    Devuelve una representación legible del tiempo transcurrido desde fecha_inicio hasta ahora.
+    """
+    inicio = _a_naive_local(fecha_inicio)
+    if not inicio:
+        return "Sin registro"
+    fin = _a_naive_local(ahora or timezone.now())
+    delta = fin - inicio
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 60:
+        return "Hace unos segundos"
+
+    dias = total_seconds // 86400
+    horas = (total_seconds % 86400) // 3600
+    minutos = (total_seconds % 3600) // 60
+
+    partes = []
+    if dias > 0:
+        partes.append(f"{dias} {'día' if dias == 1 else 'días'}")
+    if horas > 0:
+        partes.append(f"{horas} {'hora' if horas == 1 else 'horas'}")
+    if dias == 0 and minutos > 0:
+        partes.append(f"{minutos} min")
+
+    return ", ".join(partes) if partes else "Hace unos minutos"
+
+
+def calcular_tiempos_peticion(peticion, ahora=None) -> dict:
+    """
+    Calcula para una petición:
+    - tiempo_transcurrido: texto legible desde la creación (fecha)
+    - tiempo_desde_asignacion: texto legible desde fecha_asignacion (si existe)
+    - dias_transcurridos: entero de días desde la creación
+    - dias_sin_avanzar: entero de días desde el último avance (asignación, cambio de estado o creación)
+    - fecha_ultimo_avance: datetime del último movimiento registrado
+    - puede_reasignar: True si tiene veterinario asignado, no está en estado terminal y lleva >= 5 días sin avanzar
+    """
+    fin = _a_naive_local(ahora or timezone.now())
+    fecha_creacion = _a_naive_local(getattr(peticion, 'fecha', None))
+    fecha_asig = _a_naive_local(getattr(peticion, 'fecha_asignacion', None))
+
+    if fecha_creacion:
+        dias_transcurridos = max(0, (fin - fecha_creacion).days)
+        tiempo_transcurrido = formatear_duracion_humana(fecha_creacion, fin)
+    else:
+        dias_transcurridos = 0
+        tiempo_transcurrido = "Sin registro"
+
+    tiempo_desde_asignacion = formatear_duracion_humana(fecha_asig, fin) if fecha_asig else None
+
+    # Determinar la fecha del último avance (asignación, cambio de estado en historial o creación)
+    fechas_candidatas = [f for f in (fecha_creacion, fecha_asig) if f is not None]
+
+    try:
+        prefetched_hist = getattr(peticion, '_prefetched_objects_cache', {}).get('historial_cambios')
+        if prefetched_hist is not None:
+            for h in prefetched_hist:
+                fh = _a_naive_local(getattr(h, 'fecha', None))
+                if fh:
+                    fechas_candidatas.append(fh)
+        elif getattr(peticion, 'pk', None):
+            from peticiones.models import HistorialPeticiones
+            ultimo_hist = (
+                HistorialPeticiones.objects
+                .filter(id_peticion_id=peticion.pk)
+                .order_by('-fecha', '-id_historial')
+                .values_list('fecha', flat=True)
+                .first()
+            )
+            fh = _a_naive_local(ultimo_hist)
+            if fh:
+                fechas_candidatas.append(fh)
+    except Exception as exc:
+        logger.debug(f"No se pudo consultar historial_cambios para tiempos de petición #{getattr(peticion, 'pk', None)}: {exc}")
+
+    fecha_ultimo_avance = max(fechas_candidatas) if fechas_candidatas else fin
+    dias_sin_avanzar = max(0, (fin - fecha_ultimo_avance).days)
+
+    estado_obj = getattr(peticion, 'id_estado', None)
+    estado_norm = normalizar_texto_juridico(getattr(estado_obj, 'nombre', '') if estado_obj else '')
+    es_terminal = estado_norm in ESTADOS_TERMINALES_NORM
+    tiene_veterinario = bool(getattr(peticion, 'asignado_a_id', None))
+
+    puede_reasignar = bool(
+        tiene_veterinario
+        and not es_terminal
+        and dias_sin_avanzar >= DIAS_PARA_REASIGNAR
+    )
+
+    return {
+        'tiempo_transcurrido': tiempo_transcurrido,
+        'tiempo_desde_asignacion': tiempo_desde_asignacion,
+        'dias_transcurridos': dias_transcurridos,
+        'dias_sin_avanzar': dias_sin_avanzar,
+        'fecha_ultimo_avance': fecha_ultimo_avance,
+        'puede_reasignar': puede_reasignar,
+    }
+
+
+def registrar_historial_peticion(
+    peticion,
+    tipo_cambio: str,
+    estado_anterior=None,
+    estado_nuevo=None,
+    veterinario_anterior=None,
+    veterinario_nuevo=None,
+    usuario_accion=None,
+    observacion: str = None,
+):
+    """
+    Registra un evento en la tabla historial_peticiones de manera segura.
+    """
+    try:
+        from peticiones.models import HistorialPeticiones
+        user_obj = usuario_accion if (usuario_accion and getattr(usuario_accion, 'id_usuario', None)) else None
+        return HistorialPeticiones.objects.create(
+            id_peticion=peticion,
+            tipo_cambio=tipo_cambio,
+            id_estado_anterior=estado_anterior,
+            id_estado_nuevo=estado_nuevo,
+            id_veterinario_anterior=veterinario_anterior,
+            id_veterinario_nuevo=veterinario_nuevo,
+            id_usuario_accion=user_obj,
+            observacion=observacion,
+            fecha=timezone.now(),
+        )
+    except Exception as exc:
+        logger.warning(f"Error al registrar historial de petición #{getattr(peticion, 'pk', None)}: {exc}")
+        return None
+
+
+def crear_notificaciones_nueva_peticion(peticion):
+    """
+    Crea notificaciones dentro de la aplicación web para los usuarios activos de Jurídico (rol 2)
+    y Administrador (rol 1) cuando se registra una nueva petición.
+    """
+    try:
+        from peticiones.models import NotificacionPeticion
+        from users.models import Usuarios
+
+        es_urgente = es_prioridad_urgente(getattr(peticion, 'prioridad', None))
+        radicado = getattr(peticion, 'numero_radicado', None) or f"#{peticion.id_peticion}"
+        tipo_nombre = getattr(getattr(peticion, 'id_tipo', None), 'nombre', 'Petición') or 'Petición'
+        prioridad_txt = getattr(peticion, 'prioridad', None) or 'Normal'
+
+        tipo_notif = 'PETICION_URGENTE' if es_urgente else 'NUEVA_PETICION'
+        prefijo = "URGENTE - " if es_urgente else ""
+        titulo = f"{prefijo}Nueva petición registrada ({radicado})"
+        mensaje = (
+            f"Se ha registrado una nueva petición de tipo '{tipo_nombre.strip()}' "
+            f"con prioridad '{prioridad_txt}' y radicado {radicado}."
+        )
+
+        destinatarios = list(
+            Usuarios.objects.filter(id_rol_id__in=[1, 2], activo=True)
+        )
+        notificaciones_creadas = []
+        ahora = timezone.now()
+        if destinatarios:
+            for u in destinatarios:
+                notificaciones_creadas.append(
+                    NotificacionPeticion.objects.create(
+                        id_peticion=peticion,
+                        id_usuario_destino=u,
+                        tipo=tipo_notif,
+                        titulo=titulo,
+                        mensaje=mensaje,
+                        leida=False,
+                        fecha_creacion=ahora,
+                    )
+                )
+        else:
+            notificaciones_creadas.append(
+                NotificacionPeticion.objects.create(
+                    id_peticion=peticion,
+                    id_usuario_destino=None,
+                    tipo=tipo_notif,
+                    titulo=titulo,
+                    mensaje=mensaje,
+                    leida=False,
+                    fecha_creacion=ahora,
+                )
+            )
+        return notificaciones_creadas
+    except Exception as exc:
+        logger.warning(f"Error al crear notificaciones web para petición #{getattr(peticion, 'pk', None)}: {exc}")
+        return []
+
+
+def crear_notificacion_asignacion(peticion, veterinario, es_reasignacion: bool = False):
+    """
+    Crea una notificación en la aplicación web para el veterinario cuando se le asigna o reasigna una petición.
+    """
+    if not veterinario or not getattr(veterinario, 'id_usuario', None):
+        return None
+    try:
+        from peticiones.models import NotificacionPeticion
+        radicado = getattr(peticion, 'numero_radicado', None) or f"#{peticion.id_peticion}"
+        accion = "reasignada" if es_reasignacion else "asignada"
+        tipo_notif = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
+        titulo = f"Petición {accion}: {radicado}"
+        mensaje = f"Se te ha {accion[:-1]}o la petición {radicado} con prioridad '{getattr(peticion, 'prioridad', None) or 'Normal'}'."
+        return NotificacionPeticion.objects.create(
+            id_peticion=peticion,
+            id_usuario_destino=veterinario,
+            tipo=tipo_notif,
+            titulo=titulo,
+            mensaje=mensaje,
+            leida=False,
+            fecha_creacion=timezone.now(),
+        )
+    except Exception as exc:
+        logger.warning(f"Error al crear notificación de asignación para petición #{getattr(peticion, 'pk', None)}: {exc}")
+        return None
+
+
+def enviar_correo_peticion_urgente_juridico(peticion) -> dict:
+    """
+    Envía un correo automático a todos los usuarios activos del rol Jurídico (id_rol = 2)
+    cuando se registra una petición urgente.
+    Reutiliza enviar_correo_transaccional_brevo y hace fallback a send_mail de Django.
+    """
+    if not es_prioridad_urgente(getattr(peticion, 'prioridad', None)):
+        return {"enviado": False, "motivo": "La petición no es urgente."}
+
+    try:
+        from users.models import Usuarios
+        from users.services.email_service import enviar_correo_transaccional_brevo
+        from django.core.mail import send_mail
+        from django.conf import settings
+
+        juridicos = list(
+            Usuarios.objects.filter(id_rol_id=2, activo=True)
+            .exclude(email__isnull=True)
+            .exclude(email='')
+        )
+        destinatarios = [
+            (u.email.strip(), f"{u.nombre or ''} {u.apellido or ''}".strip() or "Equipo Jurídico")
+            for u in juridicos if u.email and u.email.strip()
+        ]
+        if not destinatarios:
+            correo_fallback = os.environ.get('JURIDICO_EMAIL', 'juridico@vetericano.com')
+            destinatarios = [(correo_fallback, "Área Jurídica Vetericano")]
+
+        radicado = getattr(peticion, 'numero_radicado', None) or f"PET-{peticion.id_peticion}"
+        tipo_nombre = getattr(getattr(peticion, 'id_tipo', None), 'nombre', 'No especificado') or 'No especificado'
+        direccion = getattr(getattr(peticion, 'id_ubicacion', None), 'direccion', None) or 'No especificada'
+        prioridad_val = getattr(peticion, 'prioridad', 'Urgente')
+        descripcion = getattr(peticion, 'descripcion', '') or 'Sin descripción adicional.'
+        solicitante = "Anónimo"
+        if getattr(peticion, 'responsable', None):
+            solicitante = f"{peticion.responsable.nombre or ''} {peticion.responsable.apellido or ''}".strip() or peticion.responsable.email
+
+        asunto = f"[URGENTE] Nueva Petición Registrada - {radicado}"
+        contenido_html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #222;">
+            <h2 style="color: #c62828;">Alerta de Petición Urgente - Vetericano</h2>
+            <p>Hola equipo de <strong>Jurídico</strong>,</p>
+            <p>Se ha registrado una nueva petición marcada con prioridad <strong>{prioridad_val}</strong> que requiere atención prioritaria:</p>
+            <ul>
+                <li><strong>Número de radicado:</strong> {radicado}</li>
+                <li><strong>Tipo de petición:</strong> {tipo_nombre.strip()}</li>
+                <li><strong>Prioridad:</strong> {prioridad_val}</li>
+                <li><strong>Dirección / Ubicación:</strong> {direccion}</li>
+                <li><strong>Reportado por:</strong> {solicitante}</li>
+                <li><strong>Descripción:</strong> {descripcion}</li>
+            </ul>
+            <p>Por favor ingresa al módulo de Jurídico en la aplicación web de Vetericano para revisarla y asignarla a un veterinario.</p>
+        </body>
+        </html>
+        """
+        mensaje_texto = (
+            f"ALERTA DE PETICIÓN URGENTE - VETERICANO\n\n"
+            f"Radicado: {radicado}\n"
+            f"Tipo: {tipo_nombre.strip()}\n"
+            f"Prioridad: {prioridad_val}\n"
+            f"Ubicación: {direccion}\n"
+            f"Reportado por: {solicitante}\n"
+            f"Descripción: {descripcion}\n"
+        )
+
+        enviados = 0
+        errores = []
+        api_key_brevo = os.environ.get("BREVO_API_KEY")
+
+        for email_dest, nombre_dest in destinatarios:
+            exito_individual = False
+            if api_key_brevo:
+                res_brevo = enviar_correo_transaccional_brevo(
+                    destinatario_email=email_dest,
+                    destinatario_nombre=nombre_dest,
+                    asunto=asunto,
+                    contenido_html=contenido_html,
+                )
+                if res_brevo.get("exito"):
+                    exito_individual = True
+                    enviados += 1
+                else:
+                    errores.append(res_brevo.get("error"))
+
+            if not exito_individual:
+                try:
+                    remitente = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or os.environ.get('DEFAULT_FROM_EMAIL', 'vetericano@gmail.com')
+                    send_mail(
+                        subject=asunto,
+                        message=mensaje_texto,
+                        from_email=remitente,
+                        recipient_list=[email_dest],
+                        html_message=contenido_html,
+                        fail_silently=False,
+                    )
+                    enviados += 1
+                except Exception as mail_exc:
+                    errores.append(str(mail_exc))
+
+        return {"enviado": enviados > 0, "destinatarios_enviados": enviados, "errores": errores}
+    except Exception as exc:
+        logger.error(f"Excepción al enviar correo de petición urgente #{getattr(peticion, 'pk', None)}: {exc}")
+        return {"enviado": False, "error": str(exc)}
