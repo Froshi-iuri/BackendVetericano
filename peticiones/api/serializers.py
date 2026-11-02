@@ -1181,6 +1181,64 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
 
 
 
+from peticiones.models import HistorialAsignacionPeticion, NotificacionJuridico
+
+
+class HistorialAsignacionPeticionSerializer(serializers.ModelSerializer):
+    veterinario_anterior_nombre = serializers.SerializerMethodField()
+    veterinario_nuevo_nombre = serializers.SerializerMethodField()
+    asignado_por_nombre = serializers.SerializerMethodField()
+    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
+
+    class Meta:
+        model = HistorialAsignacionPeticion
+        fields = [
+            'id_historial',
+            'id_peticion',
+            'numero_radicado',
+            'veterinario_anterior',
+            'veterinario_anterior_nombre',
+            'veterinario_nuevo',
+            'veterinario_nuevo_nombre',
+            'motivo',
+            'asignado_por',
+            'asignado_por_nombre',
+            'fecha',
+        ]
+
+    def get_veterinario_anterior_nombre(self, obj):
+        if obj.veterinario_anterior:
+            return f"{obj.veterinario_anterior.nombre} {obj.veterinario_anterior.apellido}".strip()
+        return None
+
+    def get_veterinario_nuevo_nombre(self, obj):
+        if obj.veterinario_nuevo:
+            return f"{obj.veterinario_nuevo.nombre} {obj.veterinario_nuevo.apellido}".strip()
+        return None
+
+    def get_asignado_por_nombre(self, obj):
+        if obj.asignado_por:
+            return f"{obj.asignado_por.nombre} {obj.asignado_por.apellido}".strip()
+        return None
+
+
+class NotificacionJuridicoSerializer(serializers.ModelSerializer):
+    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
+
+    class Meta:
+        model = NotificacionJuridico
+        fields = [
+            'id_notificacion',
+            'id_peticion',
+            'numero_radicado',
+            'tipo',
+            'mensaje',
+            'leida',
+            'fecha_creacion',
+        ]
+
+
+
 # ==============================================================================
 # SERIALIZERS Y EXTENSIONES PARA EL MÓDULO DE JURÍDICO
 # ==============================================================================
@@ -1275,60 +1333,6 @@ class NotificacionPeticionSerializer(serializers.ModelSerializer):
     def get_tiempo_transcurrido(self, obj):
         from peticiones.utils import formatear_duracion_humana
         return formatear_duracion_humana(getattr(obj, 'fecha_creacion', None))
-
-
-class HistorialAsignacionPeticionSerializer(serializers.ModelSerializer):
-    veterinario_anterior_nombre = serializers.SerializerMethodField()
-    veterinario_nuevo_nombre = serializers.SerializerMethodField()
-    asignado_por_nombre = serializers.SerializerMethodField()
-    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
-
-    class Meta:
-        model = HistorialAsignacionPeticion
-        fields = [
-            'id_historial',
-            'id_peticion',
-            'numero_radicado',
-            'veterinario_anterior',
-            'veterinario_anterior_nombre',
-            'veterinario_nuevo',
-            'veterinario_nuevo_nombre',
-            'motivo',
-            'asignado_por',
-            'asignado_por_nombre',
-            'fecha',
-        ]
-
-    def get_veterinario_anterior_nombre(self, obj):
-        if obj.veterinario_anterior:
-            return f"{obj.veterinario_anterior.nombre} {obj.veterinario_anterior.apellido}".strip()
-        return None
-
-    def get_veterinario_nuevo_nombre(self, obj):
-        if obj.veterinario_nuevo:
-            return f"{obj.veterinario_nuevo.nombre} {obj.veterinario_nuevo.apellido}".strip()
-        return None
-
-    def get_asignado_por_nombre(self, obj):
-        if obj.asignado_por:
-            return f"{obj.asignado_por.nombre} {obj.asignado_por.apellido}".strip()
-        return None
-
-
-class NotificacionJuridicoSerializer(serializers.ModelSerializer):
-    numero_radicado = serializers.CharField(source='id_peticion.numero_radicado', read_only=True)
-
-    class Meta:
-        model = NotificacionJuridico
-        fields = [
-            'id_notificacion',
-            'id_peticion',
-            'numero_radicado',
-            'tipo',
-            'mensaje',
-            'leida',
-            'fecha_creacion',
-        ]
 
 
 def construir_historial_peticion_lista(peticion) -> list:

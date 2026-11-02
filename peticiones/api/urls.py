@@ -49,19 +49,20 @@ urlpatterns = [
 ]
 
 
-# Rutas adicionales del módulo de Jurídico (estados, notificaciones web e historial)
+
+# Rutas adicionales del módulo de Jurídico (estados, notificaciones por usuario e historial completo)
 from .views import (
     ListarEstadosPeticionView,
     HistorialPeticionView,
     NotificacionesPeticionesListView,
-    MarcarNotificacionLeidaView,
+    MarcarNotificacionPeticionLeidaView,
     MarcarTodasNotificacionesLeidasView,
 )
 
 urlpatterns += [
     path('estados/', ListarEstadosPeticionView.as_view(), name='estados-peticion'),
-    path('notificaciones/', NotificacionesPeticionesListView.as_view(), name='notificaciones-peticiones'),
+    path('notificaciones/usuario/', NotificacionesPeticionesListView.as_view(), name='notificaciones-peticiones'),
     path('notificaciones/leer-todas/', MarcarTodasNotificacionesLeidasView.as_view(), name='leer-todas-notificaciones'),
-    path('notificaciones/<int:id_notificacion>/leer/', MarcarNotificacionLeidaView.as_view(), name='leer-notificacion'),
+    path('notificaciones/<int:id_notificacion>/leer/', MarcarNotificacionPeticionLeidaView.as_view(), name='leer-notificacion'),
     path('<int:id_peticion>/historial/', HistorialPeticionView.as_view(), name='historial-peticion'),
 ]
