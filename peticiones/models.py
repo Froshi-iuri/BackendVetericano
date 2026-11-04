@@ -132,6 +132,10 @@ class SeguimientoPeticionesVisita(models.Model):
     # Firmas digitales (URL o base64 del trazo capturado en móvil)
     firma_notificador = models.TextField(blank=True, null=True)
     firma_notificado = models.TextField(blank=True, null=True)
+    test_distemper = models.BooleanField(default=False)
+    test_parvovirus = models.BooleanField(default=False)
+    test_parvovirus_coronavirus = models.BooleanField(default=False)
+    test_sida_leucemia_felinos = models.BooleanField(default=False)
 
     class Meta:
         managed = False
