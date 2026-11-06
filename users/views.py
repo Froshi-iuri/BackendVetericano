@@ -9,7 +9,8 @@ from email.mime.multipart import MIMEMultipart
 from .services.email_service import enviar_correo_transaccional_brevo
 from django.core.cache import cache
 from django.contrib.auth.hashers import make_password
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Usuarios
@@ -20,6 +21,7 @@ load_dotenv()
 
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def solicitar_recuperacion(request):
     email = (request.data.get('email') or '').strip()
     
@@ -60,6 +62,7 @@ def solicitar_recuperacion(request):
 
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def confirmar_recuperacion(request):
     email = (request.data.get('email') or '').strip()
     codigo = (request.data.get('codigo') or '').strip()

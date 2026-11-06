@@ -1,10 +1,12 @@
 from rest_framework import viewsets
 from examenes_clinicos.models import Examen, ProcedimientoRealizado
+from users.api.permissions import EsAdminOReadOnlyParaStaff, PermisoClinica
 from .serializers import ExamenSerializer, ProcedimientoRealizadoSerializer
 
 class ExamenViewSet(viewsets.ModelViewSet):
     queryset = Examen.objects.all().order_by('-id_examen')
     serializer_class = ExamenSerializer
+    permission_classes = [EsAdminOReadOnlyParaStaff]
 
     def perform_create(self, serializer):
         print("--- CREANDO EXAMEN ---")
@@ -22,3 +24,4 @@ class ExamenViewSet(viewsets.ModelViewSet):
 class ProcedimientoRealizadoViewSet(viewsets.ModelViewSet):
     queryset = ProcedimientoRealizado.objects.all()
     serializer_class = ProcedimientoRealizadoSerializer
+    permission_classes = [PermisoClinica]

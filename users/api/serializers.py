@@ -2,6 +2,7 @@
 import re # AnaC
 from django.db.models import Q
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 # Importamos el hash de contraseñas de Django. 
 # Esto es CRÍTICO: nunca guardes contraseñas en texto plano.
 from django.contrib.auth.hashers import make_password, check_password
@@ -131,6 +132,16 @@ class UsuariosSerializer(serializers.ModelSerializer):
         return f"{base_id}{inicial}"
 
     def create(self, validated_data):
+        request = self.context.get('request')
+        rol_req = getattr(getattr(request, 'user', None), 'id_rol', None)
+        id_rol_req = getattr(rol_req, 'id_rol', None) if rol_req else getattr(getattr(request, 'user', None), 'id_rol_id', None)
+        es_admin_req = (id_rol_req == 1)
+
+        # Si quien crea NO es administrador o no está autenticado, forzar Peticionario (rol 4)
+        if not es_admin_req:
+            rol_peticionario, _ = Rol.objects.get_or_create(nombre_rol='Peticionario')
+            validated_data['id_rol'] = rol_peticionario
+
         raw_password = (validated_data.pop('password', None) or '').strip()
         if not raw_password:
             raw_password = self._generar_password_por_defecto(validated_data)
@@ -158,13 +169,23 @@ class UsuariosSerializer(serializers.ModelSerializer):
         instance = getattr(self, 'instance', None)
 
         # Solo aplicamos estas restricciones cuando se está actualizando un usuario existente
-        if instance and request and request.user and request.user.is_authenticated:
-            rol_req = getattr(request.user, 'id_rol', None)
-            nom_rol = getattr(rol_req, 'nombre_rol', '').strip().lower() if rol_req else ''
-            id_rol_req = getattr(rol_req, 'id_rol', None) if rol_req else None
-            es_admin_req = (nom_rol in ['administrador', 'admin'] or id_rol_req == 1)
+        if instance is not None:
+            es_admin_req = False
+            if request and request.user and getattr(request.user, 'is_authenticated', False):
+                rol_req = getattr(request.user, 'id_rol', None)
+                nom_rol = getattr(rol_req, 'nombre_rol', '').strip().lower() if rol_req else ''
+                id_rol_req = getattr(rol_req, 'id_rol', None) if rol_req else getattr(request.user, 'id_rol_id', None)
+                es_admin_req = (nom_rol in ['administrador', 'admin'] or id_rol_req == 1)
 
             if not es_admin_req:
+                if 'id_rol' in data:
+                    nuevo_rol_obj = data.get('id_rol')
+                    nuevo_rol_id = getattr(nuevo_rol_obj, 'id_rol', getattr(nuevo_rol_obj, 'pk', None))
+                    rol_actual_id = getattr(instance, 'id_rol_id', getattr(getattr(instance, 'id_rol', None), 'id_rol', None))
+                    if nuevo_rol_id is not None and nuevo_rol_id != rol_actual_id:
+                        raise PermissionDenied("No cuenta con privilegios para modificar el rol del usuario.")
+                if 'activo' in data and data.get('activo') != getattr(instance, 'activo', True):
+                    raise PermissionDenied("No cuenta con privilegios para modificar el estado activo de la cuenta.")
                 data.pop('id_rol', None)
                 data.pop('activo', None)
 
@@ -172,7 +193,7 @@ class UsuariosSerializer(serializers.ModelSerializer):
             # REGLA 1: Anti Auto-Bloqueo
             # Un administrador no puede quitarse su propio rol ni auto-desactivarse
             # -------------------------------------------------------------
-            if request.user.id_usuario == instance.id_usuario:
+            if request and request.user and getattr(request.user, 'id_usuario', None) == instance.id_usuario:
                 if 'id_rol' in data:
                     nuevo_rol_id = getattr(data['id_rol'], 'pk', None)
                     rol_actual_id = getattr(instance, 'id_rol_id', None)
