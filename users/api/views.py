@@ -1,5 +1,6 @@
 from django.db.models import Q
 from rest_framework import generics, status, viewsets
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from .serializers import RegisterCustomSerializer, LoginCustomSerializer, UsuariosSerializer, RolSerializer
@@ -13,6 +14,7 @@ class RegisterView(generics.GenericAPIView):
     # Esto es lo que le dice a Swagger:
     # "Usa este serializador para dibujar los campos".
     serializer_class = RegisterCustomSerializer
+    permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
 
@@ -36,6 +38,7 @@ class LoginView(generics.GenericAPIView):
 
     # Configura los campos 'email' y 'password' en Swagger.
     serializer_class = LoginCustomSerializer
+    permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
 
@@ -76,6 +79,15 @@ class UsuariosViewSet(viewsets.ModelViewSet):
     queryset = Usuarios.objects.all()
     serializer_class = UsuariosSerializer
     permission_classes = [EsAdministradorOReadOnly]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = getattr(self.request, 'user', None)
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id != 1:
+            # Cualquier rol distinto de Administrador únicamente puede acceder a su propio registro
+            return queryset.filter(id_usuario=getattr(user, 'id_usuario', None))
+        return queryset
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()

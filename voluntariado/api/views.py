@@ -2,6 +2,7 @@ from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+from users.api.permissions import PermisoVoluntariado, EsAdminOReadOnlyParaStaff
 from voluntariado.models import (
     EventoVoluntariado,
     PostulacionVoluntariado,
@@ -22,9 +23,9 @@ from .serializers import (
 class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
     queryset = EventoVoluntariado.objects.all().order_by('-fecha')
     serializer_class = EventoVoluntariadoSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [PermisoVoluntariado]
 
-    @action(detail=True, methods=['get'], url_path='postulados', permission_classes=[AllowAny])
+    @action(detail=True, methods=['get'], url_path='postulados', permission_classes=[PermisoVoluntariado])
     def postulados(self, request, pk=None):
         """
         Retorna la lista de voluntarios postulados a esta jornada específica.
@@ -83,7 +84,7 @@ class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
 class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
     queryset = PostulacionVoluntariado.objects.all().order_by('-fecha_postulacion')
     serializer_class = PostulacionVoluntariadoSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [PermisoVoluntariado]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -96,13 +97,16 @@ class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
 class TiposEventosViewSet(viewsets.ModelViewSet):
     queryset = TiposEventos.objects.all()
     serializer_class = TiposEventosSerializer
+    permission_classes = [PermisoVoluntariado]
 
 
 class EventosViewSet(viewsets.ModelViewSet):
     queryset = Eventos.objects.all()
     serializer_class = EventosSerializer
+    permission_classes = [PermisoVoluntariado]
 
 
 class VoluntarioEventoViewSet(viewsets.ModelViewSet):
     queryset = VoluntarioEvento.objects.all()
     serializer_class = VoluntarioEventoSerializer
+    permission_classes = [PermisoVoluntariado]

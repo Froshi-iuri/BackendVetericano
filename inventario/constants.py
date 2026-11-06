@@ -8,15 +8,21 @@ Proyecto VETERICANO - Centro de Bienestar Animal (CBA) Popayán.
 # 1. ROLES DE USUARIO (R10)
 # ----------------------------------------------------------------------------
 # Roles autorizados para gestionar inventario (asignar, retirar, resolver solicitudes)
-# Actualmente Rol 1: Administrador. A futuro: Rol 2: Jurídico.
-INVENTARIO_GESTOR_ROLES = [1]
-ROL_VETERINARIO = 3
+# Rol 1: Administrador, Rol 2: Jurídico.
+from users.constants import (
+    ROL_ADMINISTRADOR,
+    ROL_JURIDICO,
+    ROL_VETERINARIO,
+    ROL_PETICIONARIO,
+    ROLES_GESTION_INVENTARIO,
+    ROLES_STAFF,
+)
 
-# Roles autorizados para lectura en viewsets antiguos de inventario (Administrador, Juridico, Veterinario)
-INVENTARIO_LECTURA_LEGACY_ROLES = [1, 2, 3]
+INVENTARIO_GESTOR_ROLES = ROLES_GESTION_INVENTARIO
+INVENTARIO_LECTURA_LEGACY_ROLES = ROLES_GESTION_INVENTARIO
 
-# Roles autorizados para PATCH limitado de cantidad_actual y estado en inventarios (acta web)
-INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES = [2, 3]
+# Roles autorizados para PATCH de cantidad_actual y estado en inventarios generales
+INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES = ROLES_GESTION_INVENTARIO
 
 # ----------------------------------------------------------------------------
 # 2. UMBRALES DE ALERTA DE STOCK Y VENCIMIENTO (R11)
