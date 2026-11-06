@@ -111,12 +111,12 @@ class PerfilUsuarioView(generics.RetrieveUpdateAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        serializer = UsuariosSerializer(request.user)
+        serializer = UsuariosSerializer(request.user, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def patch(self, request):
         serializer = UsuariosSerializer(
-            request.user, data=request.data, partial=True
+            request.user, data=request.data, partial=True, context={'request': request}
         )
         if serializer.is_valid():
             serializer.save()
@@ -133,11 +133,14 @@ class FuncionariosVisitaView(APIView):
     GET /api/peticiones/seguimiento/funcionarios/
     Lista los usuarios habilitados para participar en una visita:
     Veterinarios (id_rol=3), Jurídicos (id_rol=2) y Administradores (id_rol=1).
-    Excluye estrictamente a Peticionarios (id_rol=4).
+    Excluye estrictamente a Peticionarios (id_rol=4) tanto en respuesta como en permiso de consulta.
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
+        rol_id = getattr(request.user, 'id_rol_id', None)
+        if rol_id == 4:
+            return Response({"error": "No cuenta con permisos para consultar el directorio de funcionarios."}, status=status.HTTP_403_FORBIDDEN)
         ROLES_PERMITIDOS = [1, 2, 3]  # Administrador, Juridico, Veterinario
         funcionarios = Usuarios.objects.filter(
             id_rol__id_rol__in=ROLES_PERMITIDOS,
@@ -210,6 +213,15 @@ class SeguimientoPeticionesVisitaCreateView(KitErrorHandlingMixin, generics.Crea
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def create(self, request, *args, **kwargs):
+        user = request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id not in (1, 3):
+            return Response({"error": "Solo administradores y veterinarios pueden crear actas de visita."}, status=status.HTTP_403_FORBIDDEN)
+        id_pet_req = request.data.get('id_peticion')
+        if rol_id == 3 and id_pet_req:
+            pet_obj = Peticiones.objects.filter(pk=id_pet_req).first()
+            if pet_obj and pet_obj.asignado_a_id != user.id_usuario:
+                return Response({"error": "No puede crear un acta de visita para una petición asignada a otro veterinario."}, status=status.HTTP_403_FORBIDDEN)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         seguimiento = serializer.save(id_veterinario=request.user)
@@ -247,7 +259,23 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
     ).prefetch_related('funcionarios', 'id_peticion__evidenciapeticiones_set', 'evidencias')
     lookup_field = 'id_seguimiento'
 
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id == 3 and obj.id_veterinario_id != user.id_usuario:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Solo el veterinario responsable puede acceder a esta acta de visita.")
+        if rol_id == 4 and obj.id_peticion and obj.id_peticion.responsable_id != user.id_usuario:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No tiene permiso para acceder a esta acta de visita.")
+        return obj
+
     def update(self, request, *args, **kwargs):
+        user = self.request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id not in (1, 3):
+            return Response({"error": "No cuenta con permisos para modificar un acta de visita."}, status=status.HTTP_403_FORBIDDEN)
         kwargs['partial'] = True  # Siempre parcial (PATCH)
         return super().update(request, *args, **kwargs)
 
@@ -326,8 +354,19 @@ class ListarSeguimientosPorPeticionView(ListarSeguimientoPeticionesVisitaView):
     más control de acceso por rol sobre esa petición).
     """
     def get_queryset(self):
+        id_pet = self.kwargs['id_peticion']
+        user = self.request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        peticion = Peticiones.objects.filter(pk=id_pet).first()
+        if peticion:
+            if rol_id == 3 and peticion.asignado_a_id != user.id_usuario:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("No tiene permiso para consultar los seguimientos de esta petición.")
+            if rol_id == 4 and peticion.responsable_id != user.id_usuario:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("No tiene permiso para consultar los seguimientos de esta petición.")
         queryset = super().get_queryset()
-        return queryset.filter(id_peticion_id=self.kwargs['id_peticion'])
+        return queryset.filter(id_peticion_id=id_pet)
 
 
 class AsignarPeticionView(generics.UpdateAPIView):
@@ -397,11 +436,27 @@ class DetallePeticionView(generics.RetrieveAPIView):
     """
     GET /api/peticiones/<id_peticion>/
     Retorna el detalle completo de la petición para visualización móvil y web.
+    Restricción por rol:
+    - Admin y Jurídico: acceso completo a cualquier petición.
+    - Veterinario: solo su petición asignada.
+    - Peticionario: solo su petición radicada.
     """
     queryset = Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable', 'asignado_a').prefetch_related('evidenciapeticiones_set').all()
     serializer_class = DetallePeticionSerializer
     permission_classes = [IsAuthenticated]
     lookup_field = 'id_peticion'
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id == 3 and obj.asignado_a_id != user.id_usuario:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No tiene permiso para consultar esta petición.")
+        if rol_id == 4 and obj.responsable_id != user.id_usuario:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No tiene permiso para consultar esta petición.")
+        return obj
 
 
 class ActualizarEstadoPeticionView(APIView):
@@ -429,6 +484,15 @@ class ActualizarEstadoPeticionView(APIView):
             peticion = Peticiones.objects.get(pk=id_peticion)
         except Peticiones.DoesNotExist:
             return Response({"error": "Petición no encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        # Validar permisos: Peticionario NO puede cambiar estado
+        if rol_id == 4:
+            return Response({"error": "No cuenta con permisos para modificar el estado de la petición."}, status=status.HTTP_403_FORBIDDEN)
+        # Veterinario solo si está asignado a él
+        if rol_id == 3 and peticion.asignado_a_id != user.id_usuario:
+            return Response({"error": "Solo puede actualizar el estado de las peticiones asignadas a usted."}, status=status.HTTP_403_FORBIDDEN)
 
         nuevo_estado_nombre = request.data.get('estado') or request.data.get('nuevo_estado')
         nuevo_estado_id = request.data.get('id_estado')
@@ -1057,6 +1121,13 @@ DetallePeticionView.get_queryset = _juridico_detalle_peticion_get_queryset
 # --- Extensión aditiva de IniciarPeticionView (estado 'En revisión', asignación opcional, correo urgente, notificación web e historial) ---
 
 def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
+    rol_id = getattr(request.user, 'id_rol_id', None)
+    if rol_id == 3:
+        return Response(
+            {"error": "Los veterinarios no están autorizados para radicar nuevas peticiones."},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
     estado_inicial = (
         _obtener_estado_por_nombre('En revisión')
         or EstadoPeticiones.objects.filter(nombre__iexact='Pendiente').first()

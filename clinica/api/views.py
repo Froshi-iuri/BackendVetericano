@@ -2,6 +2,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from users.api.permissions import PermisoClinica
 from clinica.models import (
     HistoriaClinica,
     Consulta,
@@ -51,7 +52,7 @@ class RestrictDeleteProtectionMixin:
 class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = HistoriaClinica.objects.all()
     serializer_class = HistoriaClinicaSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -64,7 +65,7 @@ class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSe
 class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
     def get_queryset(self):
         queryset = super().get_queryset().order_by('-fecha_hora')
@@ -100,37 +101,37 @@ class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
 class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
     queryset = HospitalizacionSeresSintientes.objects.all()
     serializer_class = HospitalizacionSeresSintientesSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 class TratamientosViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Tratamientos.objects.all()
     serializer_class = TratamientosSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 class DiagnosticoViewSet(viewsets.ModelViewSet):
     queryset = Diagnostico.objects.all()
     serializer_class = DiagnosticoSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 class SeguimientosClinicosViewSet(viewsets.ModelViewSet):
     queryset = SeguimientosClinicos.objects.all()
     serializer_class = SeguimientosClinicosSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 class DiagnosticoPatologiaViewSet(viewsets.ModelViewSet):
     queryset = DiagnosticoPatologia.objects.all()
     serializer_class = DiagnosticoPatologiaSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 class SeguimientoHospitalarioViewSet(viewsets.ModelViewSet):
     queryset = SeguimientoHospitalario.objects.all()
     serializer_class = SeguimientoHospitalarioSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
 
 from rest_framework.views import APIView
@@ -141,7 +142,7 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
 class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
     @swagger_auto_schema(
         operation_description="Lista todas las historias clínicas consolidadas con datos del paciente, tutor y última consulta (si no se envía id_consulta), u obtiene el expediente de una consulta específica (si se envía id_consulta en la URL).",
@@ -694,7 +695,7 @@ class ExpedientePorAnimalAPIView(APIView):
     Si ya tiene historia, retorna sus datos anamnésicos y consultas previas ordenadas por fecha.
     Si no tiene historia, retorna los datos conocidos del animal y del tenedor listos para precargar.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [PermisoClinica]
 
     @swagger_auto_schema(
         operation_description="Obtiene el expediente médico consolidado y antecedentes de un animal por su id_animal.",
