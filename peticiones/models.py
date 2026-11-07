@@ -134,8 +134,9 @@ class SeguimientoPeticionesVisita(models.Model):
     firma_notificado = models.TextField(blank=True, null=True)
     test_distemper = models.BooleanField(default=False)
     test_parvovirus = models.BooleanField(default=False)
-    test_parvovirus_coronavirus = models.BooleanField(default=False)
-    test_sida_leucemia_felinos = models.BooleanField(default=False)
+    test_coronavirus = models.BooleanField(default=False)
+    test_sida = models.BooleanField(default=False)
+    test_leucemia = models.BooleanField(default=False)
 
     class Meta:
         managed = False
