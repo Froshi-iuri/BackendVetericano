@@ -587,7 +587,7 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             # Pruebas complementarias
             'pruebas_complementarias', 'resultado_pruebas',
             'test_distemper', 'test_parvovirus',
-            'test_parvovirus_coronavirus', 'test_sida_leucemia_felinos',
+            'test_coronavirus', 'test_sida', 'test_leucemia',
             # Compromisos y fundamento legal
             'compromisos', 'fundamento_legal', 'plazo_dias_cumplimiento',
             # Funcionarios (write y read)
@@ -1066,7 +1066,7 @@ class ListarSeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             'descripcion_paciente', 'esterilizacion_paciente', 'desparasitacion',
             'anamnesis_descripcion_queja', 'tratamiento_realizado',
             'test_distemper', 'test_parvovirus',
-            'test_parvovirus_coronavirus', 'test_sida_leucemia_felinos',
+            'test_coronavirus', 'test_sida', 'test_leucemia',
             'compromisos', 'plazo_dias_cumplimiento',
             'lugar_atencion',
             'nombre_funcionario', 'funcionario_cargo',
