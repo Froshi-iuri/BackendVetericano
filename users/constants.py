@@ -7,12 +7,14 @@ ROL_ADMINISTRADOR = 1
 ROL_JURIDICO = 2
 ROL_VETERINARIO = 3
 ROL_PETICIONARIO = 4
+ROL_SUPER_ADMINISTRADOR = 5
 
 ROLES_CHOICES = (
     (ROL_ADMINISTRADOR, 'Administrador'),
     (ROL_JURIDICO, 'Jurídico'),
     (ROL_VETERINARIO, 'Veterinario'),
     (ROL_PETICIONARIO, 'Peticionario'),
+    (ROL_SUPER_ADMINISTRADOR, 'super_administrador'),
 )
 
 # Grupos de conveniencia institucional

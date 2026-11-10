@@ -5,7 +5,8 @@ from .views import (
     LoginView,
     RegisterView,
     UsuariosViewSet,
-    RolViewSet
+    RolViewSet,
+    SedeViewSet,
 )
 
 from users.views import solicitar_recuperacion, confirmar_recuperacion
@@ -14,6 +15,7 @@ router = DefaultRouter()
 # Esto genera automáticamente las rutas GET, POST, PATCH y DELETE para /usuarios/
 router.register(r'usuarios', UsuariosViewSet, basename='usuarios')
 router.register(r'roles', RolViewSet, basename='roles')
+router.register(r'sedes', SedeViewSet, basename='usuarios-sedes')
 
 urlpatterns = [
     path('login/', LoginView.as_view(), name='login'),
