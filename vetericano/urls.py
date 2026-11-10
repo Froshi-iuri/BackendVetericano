@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.urls import path, include
+from rest_framework.permissions import AllowAny
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
 from users.api.token_refresh import UsuariosTokenRefreshView
@@ -10,7 +11,8 @@ schema_view = get_schema_view(
         default_version='v1',
         description="API para la aplicación Vetericano",
     ),
-    public=True
+    public=True,
+    permission_classes=(AllowAny,),
 )
 
 urlpatterns = [
@@ -28,6 +30,12 @@ urlpatterns = [
 
     # Endpoints de Usuarios
     path('api/usuarios/', include('users.api.urls')),
+
+    # Endpoints de Sedes (Super Administrador)
+    path('api/', include('users.api.sedes_urls')),
+
+    # Endpoints de Super Administrador (Administradores y Reportes)
+    path('api/super-administrador/', include('users.api.super_admin_urls')),
 
     # Endpoints de Especies y Razas
     path('api/especies/', include('especies.api.urls')),

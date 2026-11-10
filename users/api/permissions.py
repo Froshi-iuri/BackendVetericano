@@ -7,6 +7,7 @@ Roles:
 2: Jurídico - Gestión de peticiones (asignación/reasignación), gestión de inventario de medicamentos.
 3: Veterinario - Atención clínica, historias clínicas, su propio maletín/kit, peticiones asignadas, catálogos.
 4: Peticionario - Aplicación móvil: registro de peticiones, consulta de sus propias peticiones y perfil.
+5: super_administrador (Super Administrador) - Gestión de administradores, sedes y reportes globales.
 """
 
 from typing import Any, Tuple
@@ -18,10 +19,27 @@ from users.constants import (
     ROL_JURIDICO,
     ROL_VETERINARIO,
     ROL_PETICIONARIO,
+    ROL_SUPER_ADMINISTRADOR,
     ROLES_GESTION_PETICIONES,
     ROLES_GESTION_INVENTARIO,
     ROLES_ATENCION_CLINICA,
     ROLES_STAFF,
+)
+
+NOMBRES_ROL_SUPER_ADMIN = {
+    'super administrador',
+    'superadministrador',
+    'super_administrador',
+    'super-administrador',
+    'super admin',
+    'superadmin',
+}
+
+ROLES_NO_SUPER_ADMIN = (
+    ROL_ADMINISTRADOR,
+    ROL_JURIDICO,
+    ROL_VETERINARIO,
+    ROL_PETICIONARIO,
 )
 
 
@@ -51,6 +69,28 @@ def resolver_usuario_activo_y_rol(user: Any) -> Tuple[bool, Any]:
 def es_administrador(user: Any) -> bool:
     es_activo, rol_id = resolver_usuario_activo_y_rol(user)
     return es_activo and rol_id == ROL_ADMINISTRADOR
+
+
+def es_super_administrador(user: Any) -> bool:
+    """
+    Verifica que el usuario autenticado esté activo y posea el rol
+    Super Administrador (ROL_SUPER_ADMINISTRADOR = 5 o nombre_rol equivalente).
+    Bloquea explícitamente a los roles Administrador (1), Jurídico (2),
+    Veterinario (3) y Peticionario (4).
+    """
+    es_activo, rol_id = resolver_usuario_activo_y_rol(user)
+    if not es_activo:
+        return False
+
+    if rol_id in ROLES_NO_SUPER_ADMIN:
+        return False
+
+    if rol_id == ROL_SUPER_ADMINISTRADOR:
+        return True
+
+    rol_obj = getattr(user, 'id_rol', None)
+    nombre_rol = (getattr(rol_obj, 'nombre_rol', '') or '').strip().lower()
+    return nombre_rol in NOMBRES_ROL_SUPER_ADMIN
 
 
 def es_juridico(user: Any) -> bool:
@@ -95,6 +135,21 @@ class EsAdministrador(BasePermission):
         return es_administrador(request.user)
 
 
+class EsSuperAdministrador(BasePermission):
+    """
+    Acceso exclusivo al Super Administrador del sistema (Rol 5: super_administrador).
+    Los usuarios con roles Administrador (1), Jurídico (2), Veterinario (3) y Peticionario (4)
+    no pueden acceder a endpoints exclusivos del Super Administrador (administradores, reportes, sedes).
+    """
+    message = "Esta operación está reservada exclusivamente para el Super Administrador del sistema."
+
+    def has_permission(self, request, view):
+        return es_super_administrador(request.user)
+
+    def has_object_permission(self, request, view, obj):
+        return es_super_administrador(request.user)
+
+
 class EsJuridicoOAdmin(BasePermission):
     """Acceso para Administrador (Rol 1) o Jurídico (Rol 2)."""
     message = "Se requieren permisos de Administrador o Jurídico para realizar esta acción."
@@ -134,7 +189,7 @@ class EsAdministradorOGestionUsuarios(BasePermission):
         if not es_activo:
             return False
 
-        if es_administrador(request.user):
+        if es_administrador(request.user) or es_super_administrador(request.user):
             return True
 
         # Para roles distintos de Administrador, el endpoint de roles está completamente restringido
@@ -152,7 +207,7 @@ class EsAdministradorOGestionUsuarios(BasePermission):
         raise PermissionDenied(self.message)
 
     def has_object_permission(self, request, view, obj):
-        if es_administrador(request.user):
+        if es_administrador(request.user) or es_super_administrador(request.user):
             return True
 
         es_activo, _ = resolver_usuario_activo_y_rol(request.user)
