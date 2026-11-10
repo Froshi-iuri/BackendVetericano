@@ -18,9 +18,35 @@ class Rol(models.Model):
         return self.nombre_rol
 
 
+class Sede(models.Model):
+    id_sede = models.AutoField(primary_key=True)
+    nombre = models.CharField(max_length=150, unique=True)
+    direccion = models.CharField(max_length=255)
+    ciudad = models.CharField(max_length=100)
+    telefono = models.CharField(max_length=30)
+    codigo = models.CharField(max_length=50, unique=True, blank=True, null=True)
+    activo = models.BooleanField(default=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = True
+        db_table = 'sedes'
+
+    def __str__(self):
+        return self.nombre
+
+
 class Usuarios(models.Model):
     id_usuario = models.AutoField(primary_key=True)
     id_rol = models.ForeignKey(Rol, models.DO_NOTHING, db_column='id_rol')
+    id_sede = models.ForeignKey(
+        Sede,
+        models.SET_NULL,
+        db_column='id_sede',
+        blank=True,
+        null=True,
+        related_name='usuarios',
+    )
     nombre = models.CharField(max_length=150)
     apellido = models.CharField(max_length=100, blank=True, default='')
     identificacion = models.CharField(unique=True, max_length=20, blank=True, null=True)
