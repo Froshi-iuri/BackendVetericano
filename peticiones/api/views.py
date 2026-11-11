@@ -1353,3 +1353,108 @@ def _juridico_actualizar_estado_patch(self, request, id_peticion):
 
 
 ActualizarEstadoPeticionView.patch = _juridico_actualizar_estado_patch
+
+
+# =============================================================================
+# FORMULARIOS DINÁMICOS INTELIGENTES Y DICTADO POR VOZ (GEMINI AI)
+# =============================================================================
+
+from ..services.acta_schema import (
+    obtener_schema_formulario_acta,
+    FORM_ID_ACTA,
+    FORM_VERSION_ACTA,
+)
+from ..services.gemini_dictado_service import procesar_audio_con_gemini
+
+
+class FormularioActaSchemaView(APIView):
+    """
+    GET /api/peticiones/seguimiento/formulario-schema/
+    Retorna la definición centralizada, versionada y canónica del formulario de acta
+    de atención, incluyendo sus secciones, campos, tipos y reglas condicionales.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        schema = obtener_schema_formulario_acta()
+        return Response(schema, status=status.HTTP_200_OK)
+
+
+class DictadoVozActaView(APIView):
+    """
+    POST /api/peticiones/seguimiento/dictado-voz/
+    Recibe la narración en audio del veterinario, la procesa mediante Google Gemini
+    y retorna la estructura de datos extraída para autocompletar el acta en el móvil.
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        rol_id = getattr(user, 'id_rol_id', None)
+        if rol_id not in (1, 3):
+            return Response(
+                {"error": "Solo administradores y médicos veterinarios pueden utilizar el dictado por voz."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        form_id = request.data.get('form_id') or FORM_ID_ACTA
+        try:
+            form_version = int(request.data.get('form_version', FORM_VERSION_ACTA))
+        except (ValueError, TypeError):
+            form_version = FORM_VERSION_ACTA
+
+        audio_bytes = None
+        mime_type = "audio/m4a"
+
+        # 1. Comprobar si se subió como archivo multipart
+        archivo_audio = request.FILES.get('audio') or request.FILES.get('file')
+        if archivo_audio:
+            audio_bytes = archivo_audio.read()
+            mime_type = archivo_audio.content_type or "audio/m4a"
+        else:
+            # 2. Comprobar si se envió como cadena base64 en JSON
+            audio_raw = request.data.get('audio') or request.data.get('audio_base64')
+            if isinstance(audio_raw, str) and len(audio_raw) > 20:
+                import base64
+                cadena_b64 = audio_raw
+                if ',' in cadena_b64:
+                    encabezado, cadena_b64 = cadena_b64.split(',', 1)
+                    if 'data:' in encabezado and ';base64' in encabezado:
+                        mime_type = encabezado.replace('data:', '').replace(';base64', '')
+                try:
+                    audio_bytes = base64.b64decode(cadena_b64)
+                except Exception as b64_err:
+                    return Response(
+                        {"error": f"Formato base64 de audio inválido: {b64_err}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        if not audio_bytes:
+            return Response(
+                {
+                    "error": "Debe enviar un archivo de audio o una cadena en base64 bajo la clave 'audio'.",
+                    "form_id": form_id,
+                    "form_version": form_version,
+                    "requires_review": True
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Limitar tamaño de archivo (máximo 25 MB)
+        if len(audio_bytes) > 25 * 1024 * 1024:
+            return Response(
+                {"error": "El audio supera el límite máximo permitido de 25 MB."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Procesar con Gemini AI
+        resultado, http_status = procesar_audio_con_gemini(
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            form_id=form_id,
+            form_version=form_version
+        )
+
+        return Response(resultado, status=http_status)
+

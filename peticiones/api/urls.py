@@ -14,6 +14,8 @@ from .views import (
     NotificacionesJuridicoView,
     MarcarNotificacionLeidaView,
     HistorialAsignacionesPorPeticionView,
+    FormularioActaSchemaView,
+    DictadoVozActaView,
 )
 
 urlpatterns = [
@@ -33,7 +35,9 @@ urlpatterns = [
 
     # Rutas del acta de visita
     # IMPORTANTE: las rutas fijas van ANTES de <int:id_seguimiento>/ para
-    # que 'funcionarios', 'crear' y 'listar' no se confundan con un ID.
+    # que 'funcionarios', 'crear', 'formulario-schema', 'dictado-voz' y 'listar' no se confundan con un ID.
+    path('seguimiento/formulario-schema/', FormularioActaSchemaView.as_view(), name='formulario-acta-schema'),
+    path('seguimiento/dictado-voz/', DictadoVozActaView.as_view(), name='dictado-voz-acta'),
     path('seguimiento/funcionarios/', FuncionariosVisitaView.as_view(), name='funcionarios-visita'),
     path('seguimiento/crear/', SeguimientoPeticionesVisitaCreateView.as_view(), name='crear-seguimiento'),
     path('seguimiento/listar/', ListarSeguimientoPeticionesVisitaView.as_view(), name='listar-seguimientos'),
