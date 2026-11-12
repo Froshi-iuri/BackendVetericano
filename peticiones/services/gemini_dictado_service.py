@@ -16,11 +16,11 @@ from .acta_schema import FORM_ID_ACTA, FORM_VERSION_ACTA, obtener_campos_extract
 logger = logging.getLogger(__name__)
 
 GEMINI_API_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
-    "gemini-3.5-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-flash",
 ]
 
 def obtener_gemini_api_key() -> str:
