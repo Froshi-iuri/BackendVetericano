@@ -16,9 +16,11 @@ from .acta_schema import FORM_ID_ACTA, FORM_VERSION_ACTA, obtener_campos_extract
 logger = logging.getLogger(__name__)
 
 GEMINI_API_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
 
 def obtener_gemini_api_key() -> str:
@@ -159,7 +161,8 @@ def procesar_audio_con_gemini(
     }
 
     headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
     }
 
     last_error_msg = ""
@@ -207,8 +210,8 @@ def procesar_audio_con_gemini(
                     last_error_msg = f"Respuesta de IA no tiene formato JSON válido."
                     continue
 
-            elif resp.status_code in (404, 400):
-                # Puede ser que el modelo no esté disponible en la región o versión, intentar siguiente modelo
+            elif resp.status_code in (404, 400, 429, 503):
+                # Puede ser que el modelo no esté disponible en la región o versión, o esté saturado temporalmente; probar siguiente modelo
                 last_error_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.info(f"Modelo {model_name} respondió {resp.status_code}, probando fallback...")
                 continue
