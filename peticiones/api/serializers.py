@@ -1474,3 +1474,101 @@ def _detalle_peticion_to_representation(self, instance):
 
 
 DetallePeticionSerializer.to_representation = _detalle_peticion_to_representation
+
+
+class _CoordenadaOpcionalField(serializers.FloatField):
+    """
+    Campo de coordenada GPS tolerante para detección de duplicados:
+    permite que valores nulos, vacíos o no numéricos sean ignorados sin bloquear
+    la comparación textual.
+    """
+    def to_internal_value(self, data):
+        if data is None or isinstance(data, bool):
+            return None
+        if isinstance(data, str) and not data.strip():
+            return None
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError:
+            return None
+
+
+class DetectarDuplicadosRequestSerializer(serializers.Serializer):
+    """
+    Serializer de entrada para POST /api/peticiones/detectar-duplicados/ (Fases 1, 2 y 3).
+    Acepta descripción, coordenadas GPS (latitud/longitud), fotografías Cloudinary
+    (`foto` / `fotos`) y/o un `id_peticion` existente.
+    """
+    descripcion = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=10000,
+        trim_whitespace=False,
+    )
+    latitud = _CoordenadaOpcionalField(required=False, allow_null=True)
+    longitud = _CoordenadaOpcionalField(required=False, allow_null=True)
+    foto = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=2048,
+        trim_whitespace=True,
+    )
+    fotos = serializers.ListField(
+        child=serializers.CharField(allow_blank=True, max_length=2048, trim_whitespace=True),
+        required=False,
+        allow_null=True,
+        allow_empty=True,
+        max_length=10,
+    )
+    id_peticion = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+    )
+    excluir_id_peticion = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+    )
+    umbral = serializers.FloatField(
+        required=False,
+        min_value=0.01,
+        max_value=1.0,
+    )
+    radio_metros = serializers.FloatField(
+        required=False,
+        min_value=1.0,
+        max_value=50000.0,
+    )
+    umbral_hamming = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        max_value=64,
+    )
+    dias = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=3650,
+    )
+    limite = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=50,
+    )
+
+    def validate(self, attrs):
+        tiene_descripcion = 'descripcion' in attrs
+        tiene_id = (
+            attrs.get('id_peticion') is not None
+            or attrs.get('excluir_id_peticion') is not None
+        )
+        tiene_coordenadas = 'latitud' in attrs or 'longitud' in attrs
+        tiene_fotos = 'foto' in attrs or 'fotos' in attrs
+        if not tiene_descripcion and not tiene_id and not tiene_coordenadas and not tiene_fotos:
+            raise serializers.ValidationError(
+                "Debe enviar 'descripcion', coordenadas GPS ('latitud'/'longitud'), fotografías o 'id_peticion'."
+            )
+        return attrs
+

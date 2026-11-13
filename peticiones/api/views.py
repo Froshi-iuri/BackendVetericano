@@ -1458,3 +1458,60 @@ class DictadoVozActaView(APIView):
 
         return Response(resultado, status=http_status)
 
+
+# =============================================================================
+# DETECCIÓN DE POSIBLES REPORTES DUPLICADOS (FASE 1: pg_trgm)
+# =============================================================================
+
+from .serializers import DetectarDuplicadosRequestSerializer
+from ..services.duplicados_service import (
+    detectar_duplicados_desde_solicitud,
+    PeticionNoEncontradaError,
+)
+
+
+class DetectarDuplicadosPeticionView(generics.GenericAPIView):
+    """
+    POST /api/peticiones/detectar-duplicados/
+    Compara descripción (`pg_trgm` / `similarity()`), coordenadas GPS (`Ubicaciones` +
+    bounding box + Haversine en metros) y fotografías Cloudinary (`dHash` 64-bit con Pillow
+    y distancia de Hamming sobre candidatos preseleccionados).
+    Devuelve únicamente advertencias y posibles candidatos para revisión humana.
+    """
+    serializer_class = DetectarDuplicadosRequestSerializer
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        datos = serializer.validated_data
+
+        descripcion = datos['descripcion'] if 'descripcion' in datos else None
+        coordenadas_proporcionadas = 'latitud' in datos or 'longitud' in datos
+        fotos_proporcionadas = 'foto' in datos or 'fotos' in datos
+        try:
+            resultado = detectar_duplicados_desde_solicitud(
+                descripcion=descripcion,
+                latitud=datos.get('latitud'),
+                longitud=datos.get('longitud'),
+                coordenadas_proporcionadas=coordenadas_proporcionadas,
+                foto=datos.get('foto'),
+                fotos=datos.get('fotos'),
+                fotos_proporcionadas=fotos_proporcionadas,
+                id_peticion=datos.get('id_peticion'),
+                excluir_id_peticion=datos.get('excluir_id_peticion'),
+                umbral=datos.get('umbral'),
+                radio_metros=datos.get('radio_metros'),
+                umbral_hamming=datos.get('umbral_hamming'),
+                dias=datos.get('dias'),
+                limite=datos.get('limite'),
+            )
+        except PeticionNoEncontradaError:
+            return Response(
+                {"error": "La petición de referencia no fue encontrada."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(resultado, status=status.HTTP_200_OK)
+
+
