@@ -16,6 +16,7 @@ from .views import (
     HistorialAsignacionesPorPeticionView,
     FormularioActaSchemaView,
     DictadoVozActaView,
+    DetectarDuplicadosPeticionView,
 )
 
 urlpatterns = [
@@ -23,6 +24,7 @@ urlpatterns = [
     path('tipos/', ListarTiposPeticionView.as_view(), name='tipos-peticion'),
     path('listar/', ListarPeticionesView.as_view(), name='listar-peticiones'),
     path('iniciar/', IniciarPeticionView.as_view(), name='iniciar-peticion'),
+    path('detectar-duplicados/', DetectarDuplicadosPeticionView.as_view(), name='detectar-duplicados-peticion'),
     path('perfil/', PerfilUsuarioView.as_view(), name='perfil-usuario'),
 
     # Dashboard consolidado del rol Jurídico (Requerimiento 1)
