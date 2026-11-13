@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from typing import Optional
 import dj_database_url
 from dotenv import load_dotenv
 from datetime import timedelta
@@ -231,3 +232,82 @@ SWAGGER_SETTINGS = {
         }
     }
 }
+
+
+# ==============================================================================
+# CONFIGURACIÓN DE DETECCIÓN AUTOMÁTICA DE PETICIONES DUPLICADAS
+# ==============================================================================
+
+_DUPLICADOS_BOOL_TRUTHY = frozenset({'true', '1', 'yes', 'si', 'sí', 'on'})
+_DUPLICADOS_BOOL_FALSY = frozenset({'false', '0', 'no', 'off'})
+_DUPLICADOS_AUTO_TIMEOUT_MS_DEFAULT = 1500
+_DUPLICADOS_AUTO_TIMEOUT_MS_MIN = 100
+_DUPLICADOS_AUTO_TIMEOUT_MS_MAX = 10000
+_DUPLICADOS_AUTO_MAX_CANDIDATOS_TOPE = 50
+
+
+def _leer_env_bool(nombre_var: str, default: bool = False) -> bool:
+    """Convierte una variable de entorno a bool seguro sin tratar 'False' como True."""
+    raw = os.environ.get(nombre_var)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    valor = str(raw).strip().lower()
+    if not valor:
+        return default
+    if valor in _DUPLICADOS_BOOL_TRUTHY:
+        return True
+    if valor in _DUPLICADOS_BOOL_FALSY:
+        return False
+    return default
+
+
+def _leer_env_duplicados_timeout_ms(default: int = _DUPLICADOS_AUTO_TIMEOUT_MS_DEFAULT) -> int:
+    """
+    Lee DUPLICADOS_AUTO_STATEMENT_TIMEOUT_MS conservando los límites de
+    `alertas_duplicados_service.py` (100..10000 ms, 0 para deshabilitar, default 1500).
+    """
+    raw = os.environ.get('DUPLICADOS_AUTO_STATEMENT_TIMEOUT_MS')
+    if raw is None or isinstance(raw, bool):
+        return default
+    texto = str(raw).strip()
+    if not texto:
+        return default
+    try:
+        valor = int(texto)
+    except (TypeError, ValueError):
+        return default
+    if valor < 0:
+        return default
+    if valor == 0:
+        return 0
+    return max(_DUPLICADOS_AUTO_TIMEOUT_MS_MIN, min(valor, _DUPLICADOS_AUTO_TIMEOUT_MS_MAX))
+
+
+def _leer_env_duplicados_max_candidatos() -> Optional[int]:
+    """
+    Lee DUPLICADOS_AUTO_MAX_CANDIDATOS opcional respetando los límites de
+    `alertas_duplicados_service.py` (entero >= 1 acotado a 50, o None si ausente/inválido).
+    """
+    raw = os.environ.get('DUPLICADOS_AUTO_MAX_CANDIDATOS')
+    if raw is None or isinstance(raw, bool):
+        return None
+    texto = str(raw).strip()
+    if not texto:
+        return None
+    try:
+        valor = int(texto)
+    except (TypeError, ValueError):
+        return None
+    if valor < 1:
+        return None
+    return min(valor, _DUPLICADOS_AUTO_MAX_CANDIDATOS_TOPE)
+
+
+DUPLICADOS_DETECCION_AUTOMATICA_ACTIVA = _leer_env_bool(
+    'DUPLICADOS_DETECCION_AUTOMATICA_ACTIVA',
+    default=False,
+)
+DUPLICADOS_AUTO_STATEMENT_TIMEOUT_MS = _leer_env_duplicados_timeout_ms()
+DUPLICADOS_AUTO_MAX_CANDIDATOS = _leer_env_duplicados_max_candidatos()
