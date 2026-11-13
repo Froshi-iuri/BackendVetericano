@@ -352,13 +352,17 @@ def _serializar_candidato(
     distancia_hamming: Optional[int],
     similitud_imagen: Optional[float],
     score_combinado: float,
+    incluir_evidencias: bool = True,
 ) -> Dict[str, Any]:
     """Construye la representación JSON de una petición candidata a duplicado."""
     similitud_float = max(0.0, min(1.0, float(similitud_texto or 0.0)))
     similitud_redondeada = round(similitud_float, 4)
     estado_obj = getattr(peticion, 'id_estado', None)
     ubicacion_obj = getattr(peticion, 'id_ubicacion', None)
-    foto_principal, fotos_disponibles = extraer_fotografias_peticion(peticion)
+    if incluir_evidencias:
+        foto_principal, fotos_disponibles = extraer_fotografias_peticion(peticion)
+    else:
+        foto_principal, fotos_disponibles = None, []
     fecha_val = getattr(peticion, 'fecha', None)
 
     criterios: List[str] = []
@@ -455,6 +459,8 @@ def buscar_peticiones_similares_por_descripcion(
     dias: Optional[int] = None,
     min_longitud: Optional[int] = None,
     limite: Optional[int] = None,
+    incluir_imagenes: bool = True,
+    incluir_evidencias: bool = True,
 ) -> Dict[str, Any]:
     """
     Busca peticiones existentes candidatas a duplicado combinando:
@@ -462,11 +468,13 @@ def buscar_peticiones_similares_por_descripcion(
     2. Proximidad GPS sobre `Ubicaciones` (prefiltro *bounding box* + Haversine en metros,
        radio configurable default `200` m).
     3. Comparación visual perceptual dHash 64-bit (`imagen_hash_service`, umbral configurable
-       default `10` bits Hamming) ejecutada exclusivamente sobre candidatos preseleccionados.
+       default `10` bits Hamming) ejecutada exclusivamente sobre candidatos preseleccionados
+       cuando `incluir_imagenes=True`.
 
     - Ignora descripciones vacías o cortas, manteniendo activa la búsqueda GPS si hay coordenadas.
     - Ignora coordenadas nulas, inválidas o `(0,0)`, manteniendo activa la búsqueda textual.
     - Si falla o falta una fotografía, las fases de texto y GPS continúan operando normalmente.
+    - Con `incluir_imagenes=False` omite por completo las descargas y comparaciones dHash.
     """
     config = obtener_config_duplicados()
     umbral_val = float(umbral) if umbral is not None else config['umbral']
@@ -487,7 +495,7 @@ def buscar_peticiones_similares_por_descripcion(
     texto_activo = es_descripcion_valida_para_comparacion(descripcion_norm, min_longitud=min_len)
     coords_origen = normalizar_coordenadas(latitud, longitud)
     gps_activo = coords_origen is not None
-    urls_origen = _normalizar_lista_urls_origen(foto=foto, fotos=fotos)
+    urls_origen = _normalizar_lista_urls_origen(foto=foto, fotos=fotos) if incluir_imagenes else []
 
     if not texto_activo and not gps_activo:
         mensaje_omitido = (
@@ -516,10 +524,11 @@ def buscar_peticiones_similares_por_descripcion(
 
     # Etapa 1: Candidatos por similitud textual en PostgreSQL (pg_trgm)
     if texto_activo:
+        qs_texto = Peticiones.objects.select_related('id_estado', 'id_ubicacion')
+        if incluir_evidencias:
+            qs_texto = qs_texto.prefetch_related('evidenciapeticiones_set')
         qs_texto = (
-            Peticiones.objects
-            .select_related('id_estado', 'id_ubicacion')
-            .prefetch_related('evidenciapeticiones_set')
+            qs_texto
             .filter(fecha__gte=fecha_corte)
             .exclude(descripcion__isnull=True)
             .annotate(_longitud_descripcion=Length(Trim('descripcion')))
@@ -561,10 +570,11 @@ def buscar_peticiones_similares_por_descripcion(
             filtros_bbox['id_ubicacion__longitud__gte'] = bbox['lon_min']
             filtros_bbox['id_ubicacion__longitud__lte'] = bbox['lon_max']
 
+        qs_gps = Peticiones.objects.select_related('id_estado', 'id_ubicacion')
+        if incluir_evidencias:
+            qs_gps = qs_gps.prefetch_related('evidenciapeticiones_set')
         qs_gps = (
-            Peticiones.objects
-            .select_related('id_estado', 'id_ubicacion')
-            .prefetch_related('evidenciapeticiones_set')
+            qs_gps
             .filter(fecha__gte=fecha_corte)
             .filter(**filtros_bbox)
         )
@@ -738,6 +748,7 @@ def buscar_peticiones_similares_por_descripcion(
             distancia_hamming=dist_hamming,
             similitud_imagen=sim_img,
             score_combinado=score,
+            incluir_evidencias=incluir_evidencias,
         )
 
         fecha_obj = getattr(pet, 'fecha', None)
@@ -800,6 +811,8 @@ def detectar_duplicados_desde_solicitud(
     dias: Optional[int] = None,
     min_longitud: Optional[int] = None,
     limite: Optional[int] = None,
+    incluir_imagenes: bool = True,
+    incluir_evidencias: bool = True,
 ) -> Dict[str, Any]:
     """
     Orquesta la consulta combinada (Fase 1 + Fase 2 + Fase 3) a partir de la entrada del endpoint.
@@ -810,11 +823,16 @@ def detectar_duplicados_desde_solicitud(
     descripcion_a_evaluar = descripcion
     lat_a_evaluar = latitud
     lon_a_evaluar = longitud
-    urls_fotos_a_evaluar = _normalizar_lista_urls_origen(foto=foto, fotos=fotos)
+    urls_fotos_a_evaluar = _normalizar_lista_urls_origen(foto=foto, fotos=fotos) if incluir_imagenes else []
 
     necesita_desc = descripcion_a_evaluar is None
     necesita_gps = (not coordenadas_proporcionadas) and lat_a_evaluar is None and lon_a_evaluar is None
-    necesita_fotos = (not fotos_proporcionadas) and not urls_fotos_a_evaluar and id_peticion is not None
+    necesita_fotos = (
+        incluir_imagenes
+        and (not fotos_proporcionadas)
+        and not urls_fotos_a_evaluar
+        and id_peticion is not None
+    )
 
     if id_excluir is not None and (necesita_desc or necesita_gps or necesita_fotos):
         referencia = (
@@ -870,4 +888,6 @@ def detectar_duplicados_desde_solicitud(
         dias=dias,
         min_longitud=min_longitud,
         limite=limite,
+        incluir_imagenes=incluir_imagenes,
+        incluir_evidencias=incluir_evidencias,
     )

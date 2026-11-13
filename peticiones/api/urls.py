@@ -17,6 +17,10 @@ from .views import (
     FormularioActaSchemaView,
     DictadoVozActaView,
     DetectarDuplicadosPeticionView,
+    AlertasDuplicadosListView,
+    AlertaDuplicadoDetailView,
+    ResolverAlertaDuplicadoView,
+    PeticionAlertasDuplicadosView,
 )
 
 urlpatterns = [
@@ -25,6 +29,9 @@ urlpatterns = [
     path('listar/', ListarPeticionesView.as_view(), name='listar-peticiones'),
     path('iniciar/', IniciarPeticionView.as_view(), name='iniciar-peticion'),
     path('detectar-duplicados/', DetectarDuplicadosPeticionView.as_view(), name='detectar-duplicados-peticion'),
+    path('duplicados/alertas/', AlertasDuplicadosListView.as_view(), name='alertas-duplicados-listar'),
+    path('duplicados/alertas/<int:id_alerta>/', AlertaDuplicadoDetailView.as_view(), name='alerta-duplicado-detalle'),
+    path('duplicados/alertas/<int:id_alerta>/resolver/', ResolverAlertaDuplicadoView.as_view(), name='alerta-duplicado-resolver'),
     path('perfil/', PerfilUsuarioView.as_view(), name='perfil-usuario'),
 
     # Dashboard consolidado del rol Jurídico (Requerimiento 1)
@@ -51,6 +58,7 @@ urlpatterns = [
     path('<int:id_peticion>/asignar/', AsignarPeticionView.as_view(), name='asignar-peticion'),
     path('<int:id_peticion>/historial-asignaciones/', HistorialAsignacionesPorPeticionView.as_view(), name='historial-asignaciones-peticion'),
     path('<int:id_peticion>/seguimientos/', ListarSeguimientosPorPeticionView.as_view(), name='seguimientos-por-peticion'),
+    path('<int:id_peticion>/duplicados/', PeticionAlertasDuplicadosView.as_view(), name='peticion-alertas-duplicados'),
     path('<int:id_peticion>/', DetallePeticionView.as_view(), name='detalle-peticion'),
 ]
 
