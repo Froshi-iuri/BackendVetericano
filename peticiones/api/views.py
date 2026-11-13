@@ -25,6 +25,7 @@ from .serializers import (
     HistorialAsignacionPeticionSerializer, NotificacionJuridicoSerializer,
 )
 from peticiones.utils import obtener_fotos_acta_con_fallback, obtener_multimedia_acta
+from peticiones.services.alertas_duplicados_service import detectar_y_registrar_duplicados_al_iniciar
 from inventario.api.kit_views import KitErrorHandlingMixin
 
 logger = logging.getLogger(__name__)
@@ -1120,6 +1121,14 @@ DetallePeticionView.get_queryset = _juridico_detalle_peticion_get_queryset
 
 # --- Extensión aditiva de IniciarPeticionView (estado 'En revisión', asignación opcional, correo urgente, notificación web e historial) ---
 
+def _debe_ejecutar_deteccion_automatica(peticion) -> bool:
+    return (
+        isinstance(peticion, Peticiones)
+        and getattr(peticion, 'id_peticion', None) is not None
+        and not getattr(getattr(peticion, '_state', None), 'adding', False)
+    )
+
+
 def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
     rol_id = getattr(request.user, 'id_rol_id', None)
     if rol_id == 3:
@@ -1198,6 +1207,25 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
 
     # 4. Si es una petición urgente, enviar correo automático a Jurídico
     info_correo = enviar_correo_peticion_urgente_juridico(peticion)
+
+    # 5. Ejecutar detección automática no bloqueante de posibles duplicados tras confirmar en BD
+    if _debe_ejecutar_deteccion_automatica(peticion):
+        peticion_para_deteccion = peticion
+        usuario_para_deteccion = request.user
+
+        def _ejecutar_deteccion_post_commit():
+            try:
+                detectar_y_registrar_duplicados_al_iniciar(
+                    peticion_para_deteccion,
+                    usuario_accion=usuario_para_deteccion,
+                )
+            except Exception:
+                logger.exception(
+                    "Error no bloqueante al ejecutar detección automática de duplicados para petición #%s.",
+                    getattr(peticion_para_deteccion, 'id_peticion', None),
+                )
+
+        transaction.on_commit(_ejecutar_deteccion_post_commit)
 
     evidencias_urls = list(peticion.evidenciapeticiones_set.values_list('ruta_archivo', flat=True))
     return Response({
@@ -1513,5 +1541,427 @@ class DetectarDuplicadosPeticionView(generics.GenericAPIView):
             )
 
         return Response(resultado, status=status.HTTP_200_OK)
+
+
+# ==============================================================================
+# FASE 4C: ENDPOINTS DE CONSULTA Y RESOLUCIÓN DE ALERTAS DE DUPLICADOS (JURÍDICO)
+# ==============================================================================
+
+from django.db import OperationalError
+from django.db.models import QuerySet, prefetch_related_objects
+from drf_yasg import openapi
+from drf_yasg.utils import swagger_auto_schema
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.pagination import PageNumberPagination
+
+from peticiones.models import PeticionPosibleDuplicado
+from peticiones.api.serializers import (
+    PeticionPosibleDuplicadoDetailSerializer,
+    PeticionPosibleDuplicadoListSerializer,
+    ResolverAlertaDuplicadoSerializer,
+)
+from peticiones.services.alertas_duplicados_service import (
+    AlertaNoEncontradaError,
+    ParDuplicadoInvalidoError,
+    SeleccionPrincipalInvalidaError,
+    TransicionAlertaInvalidaError,
+    UsuarioRevisionInvalidoError,
+    confirmar_duplicado,
+    descartar_duplicado,
+    listar_alertas_duplicados,
+    obtener_alerta_por_id,
+    obtener_resumen_alertas_duplicados,
+)
+
+
+class AlertasDuplicadosPagination(PageNumberPagination):
+    """Paginación estándar para listados de alertas de posibles duplicados."""
+
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+    def get_paginated_response(self, data, resumen=None, extra=None):
+        payload = {
+            'count': self.page.paginator.count,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'total_pages': self.page.paginator.num_pages,
+        }
+        if resumen is not None:
+            payload['resumen'] = resumen
+        if extra:
+            payload.update(extra)
+        payload['results'] = data
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+def _parsear_entero_positivo_query(valor_raw, nombre_param):
+    if valor_raw is None or str(valor_raw).strip() == '':
+        return None
+    try:
+        valor = int(str(valor_raw).strip())
+    except (TypeError, ValueError):
+        raise DRFValidationError({nombre_param: f"El parámetro '{nombre_param}' debe ser un entero positivo."})
+    if valor <= 0:
+        raise DRFValidationError({nombre_param: f"El parámetro '{nombre_param}' debe ser mayor que 0."})
+    return valor
+
+
+def _parsear_booleano_query(valor_raw, nombre_param):
+    if valor_raw is None or str(valor_raw).strip() == '':
+        return False
+    texto = str(valor_raw).strip().lower()
+    if texto in ('true', '1', 'si', 'sí', 'yes'):
+        return True
+    if texto in ('false', '0', 'no'):
+        return False
+    raise DRFValidationError({nombre_param: f"El parámetro '{nombre_param}' debe ser booleano (true/false)."})
+
+
+_ESTADOS_ALERTA_VALIDOS = frozenset(
+    codigo for codigo, _ in PeticionPosibleDuplicado.ESTADOS_REVISION_CHOICES
+)
+
+
+def _validar_parametros_listado_alertas(request, *, permitir_filtro_peticion=True):
+    params = request.query_params
+
+    estado_raw = params.get('estado_revision')
+    alias_estado_raw = params.get('estado')
+    estado_norm = estado_raw.strip().upper() if isinstance(estado_raw, str) and estado_raw.strip() else None
+    alias_norm = alias_estado_raw.strip().upper() if isinstance(alias_estado_raw, str) and alias_estado_raw.strip() else None
+
+    if estado_norm and alias_norm and estado_norm != alias_norm:
+        raise DRFValidationError({
+            'estado_revision': "Los parámetros 'estado' y 'estado_revision' tienen valores distintos."
+        })
+    estado_final = estado_norm or alias_norm
+    if estado_final is not None and estado_final not in _ESTADOS_ALERTA_VALIDOS:
+        estados_ok = ', '.join(sorted(_ESTADOS_ALERTA_VALIDOS))
+        raise DRFValidationError({
+            'estado_revision': f"Estado inválido '{estado_final}'. Valores permitidos: {estados_ok}."
+        })
+
+    id_peticion_final = None
+    if permitir_filtro_peticion:
+        pet_a = _parsear_entero_positivo_query(params.get('id_peticion'), 'id_peticion')
+        pet_b = _parsear_entero_positivo_query(params.get('peticion'), 'peticion')
+        if pet_a is not None and pet_b is not None and pet_a != pet_b:
+            raise DRFValidationError({
+                'id_peticion': "Los parámetros 'id_peticion' y 'peticion' tienen valores distintos."
+            })
+        id_peticion_final = pet_a if pet_a is not None else pet_b
+
+    solo_pendientes = _parsear_booleano_query(params.get('solo_pendientes'), 'solo_pendientes')
+    _parsear_entero_positivo_query(params.get('page'), 'page')
+    _parsear_entero_positivo_query(params.get('page_size'), 'page_size')
+
+    return {
+        'estado_revision': estado_final,
+        'id_peticion': id_peticion_final,
+        'solo_pendientes': solo_pendientes,
+    }
+
+
+def _optimizar_queryset_alertas(queryset):
+    if isinstance(queryset, QuerySet):
+        return (
+            queryset.select_related(
+                'peticion_menor',
+                'peticion_menor__id_tipo',
+                'peticion_menor__id_estado',
+                'peticion_menor__id_ubicacion',
+                'peticion_menor__asignado_a',
+                'peticion_menor__asignado_por',
+                'peticion_mayor',
+                'peticion_mayor__id_tipo',
+                'peticion_mayor__id_estado',
+                'peticion_mayor__id_ubicacion',
+                'peticion_mayor__asignado_a',
+                'peticion_mayor__asignado_por',
+                'peticion_origen',
+                'peticion_principal',
+                'revisado_por',
+            ).prefetch_related(
+                'peticion_menor__evidenciapeticiones_set',
+                'peticion_mayor__evidenciapeticiones_set',
+            )
+        )
+    return queryset
+
+
+def _enriquecer_alerta_para_detalle(alerta):
+    if isinstance(alerta, PeticionPosibleDuplicado) and getattr(alerta, '_state', None) and alerta._state.db:
+        prefetch_related_objects(
+            [alerta],
+            'peticion_menor__id_tipo',
+            'peticion_menor__id_estado',
+            'peticion_menor__id_ubicacion',
+            'peticion_menor__asignado_a',
+            'peticion_menor__asignado_por',
+            'peticion_menor__evidenciapeticiones_set',
+            'peticion_mayor__id_tipo',
+            'peticion_mayor__id_estado',
+            'peticion_mayor__id_ubicacion',
+            'peticion_mayor__asignado_a',
+            'peticion_mayor__asignado_por',
+            'peticion_mayor__evidenciapeticiones_set',
+        )
+    return alerta
+
+
+class AlertasDuplicadosListView(APIView):
+    """
+    GET /api/peticiones/duplicados/alertas/
+    Lista alertas de posibles duplicados con filtros por estado, petición y paginación.
+    Exclusivo para roles Administrador (1) y Jurídico (2).
+    """
+
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+
+    @swagger_auto_schema(
+        operation_description="Lista alertas de posibles peticiones duplicadas con filtros por estado, petición y paginación.",
+        manual_parameters=[
+            openapi.Parameter('estado_revision', openapi.IN_QUERY, description="Filtrar por estado (PENDIENTE, CONFIRMADO, DESCARTADO)", type=openapi.TYPE_STRING),
+            openapi.Parameter('estado', openapi.IN_QUERY, description="Alias de estado_revision", type=openapi.TYPE_STRING),
+            openapi.Parameter('id_peticion', openapi.IN_QUERY, description="Filtrar alertas asociadas a una petición específica", type=openapi.TYPE_INTEGER),
+            openapi.Parameter('peticion', openapi.IN_QUERY, description="Alias de id_peticion", type=openapi.TYPE_INTEGER),
+            openapi.Parameter('solo_pendientes', openapi.IN_QUERY, description="Si es true y no se envía estado_revision, retorna solo PENDIENTE", type=openapi.TYPE_BOOLEAN),
+            openapi.Parameter('page', openapi.IN_QUERY, description="Número de página", type=openapi.TYPE_INTEGER),
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Tamaño de página (default: 20, max: 100)", type=openapi.TYPE_INTEGER),
+        ],
+        responses={
+            200: PeticionPosibleDuplicadoListSerializer(many=True),
+            400: "Parámetros de filtro o paginación inválidos",
+            401: "No autenticado",
+            403: "Permiso denegado (solo Administrador o Jurídico)",
+        },
+    )
+    def get(self, request):
+        filtros = _validar_parametros_listado_alertas(request, permitir_filtro_peticion=True)
+
+        try:
+            queryset = listar_alertas_duplicados(
+                estado_revision=filtros['estado_revision'],
+                id_peticion=filtros['id_peticion'],
+                solo_pendientes=filtros['solo_pendientes'],
+            )
+            resumen = obtener_resumen_alertas_duplicados(id_peticion=filtros['id_peticion'])
+        except (TransicionAlertaInvalidaError, ParDuplicadoInvalidoError) as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = _optimizar_queryset_alertas(queryset)
+        paginator = AlertasDuplicadosPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        if page is not None:
+            serializer = PeticionPosibleDuplicadoListSerializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data, resumen=resumen)
+
+        serializer = PeticionPosibleDuplicadoListSerializer(queryset, many=True)
+        return Response(
+            {'count': len(serializer.data), 'resumen': resumen, 'results': serializer.data},
+            status=status.HTTP_200_OK,
+        )
+
+
+class AlertaDuplicadoDetailView(APIView):
+    """
+    GET /api/peticiones/duplicados/alertas/<id_alerta>/
+    Devuelve la comparación detallada entre las dos peticiones de la alerta.
+    Exclusivo para roles Administrador (1) y Jurídico (2).
+    """
+
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+
+    @swagger_auto_schema(
+        operation_description="Obtiene la comparación detallada de una alerta de posible duplicado.",
+        responses={
+            200: PeticionPosibleDuplicadoDetailSerializer(),
+            401: "No autenticado",
+            403: "Permiso denegado (solo Administrador o Jurídico)",
+            404: "Alerta no encontrada",
+        },
+    )
+    def get(self, request, id_alerta):
+        try:
+            alerta = obtener_alerta_por_id(id_alerta)
+        except AlertaNoEncontradaError:
+            return Response(
+                {'error': f"La alerta de duplicado #{id_alerta} no fue encontrada."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        alerta = _enriquecer_alerta_para_detalle(alerta)
+        serializer = PeticionPosibleDuplicadoDetailSerializer(alerta)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class ResolverAlertaDuplicadoView(APIView):
+    """
+    POST /api/peticiones/duplicados/alertas/<id_alerta>/resolver/
+    Permite confirmar (CONFIRMADO) o descartar (DESCARTADO) una alerta de posible duplicado.
+    No modifica estados de peticiones, asignaciones ni historias clínicas.
+    """
+
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+
+    @swagger_auto_schema(
+        operation_description="Resuelve una alerta de posible duplicado confirmándola o descartándola.",
+        request_body=ResolverAlertaDuplicadoSerializer,
+        responses={
+            200: PeticionPosibleDuplicadoDetailSerializer(),
+            400: "Datos inválidos o petición principal fuera del par",
+            401: "No autenticado",
+            403: "Permiso denegado (solo Administrador o Jurídico)",
+            404: "Alerta no encontrada",
+            409: "Conflicto de estado o concurrencia al resolver la alerta",
+        },
+    )
+    def post(self, request, id_alerta):
+        serializer = ResolverAlertaDuplicadoSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        datos = serializer.validated_data
+        decision = datos['estado_revision']
+        observacion = datos.get('observacion')
+
+        try:
+            if decision == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
+                resultado = confirmar_duplicado(
+                    id_alerta,
+                    datos['peticion_principal'],
+                    usuario_revisor=request.user,
+                    observacion=observacion,
+                    permitir_cambio_decision_previa=False,
+                    registrar_historial=True,
+                )
+            else:
+                resultado = descartar_duplicado(
+                    id_alerta,
+                    usuario_revisor=request.user,
+                    observacion=observacion,
+                    permitir_cambio_decision_previa=False,
+                    registrar_historial=True,
+                )
+        except AlertaNoEncontradaError:
+            return Response(
+                {'error': f"La alerta de duplicado #{id_alerta} no fue encontrada."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except SeleccionPrincipalInvalidaError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except (ParDuplicadoInvalidoError, UsuarioRevisionInvalidoError) as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except TransicionAlertaInvalidaError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        except OperationalError:
+            return Response(
+                {
+                    'error': (
+                        "Conflicto de concurrencia al resolver la alerta de duplicado. "
+                        "Recargue el estado actual e intente nuevamente."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        alerta = _enriquecer_alerta_para_detalle(resultado.alerta)
+        alerta_data = PeticionPosibleDuplicadoDetailSerializer(alerta).data
+
+        if not resultado.cambiada:
+            mensaje = "La alerta ya se encontraba resuelta con la misma decisión."
+        elif decision == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
+            mensaje = "Alerta de duplicado confirmada correctamente."
+        else:
+            mensaje = "Alerta de duplicado descartada correctamente."
+
+        return Response(
+            {
+                'mensaje': mensaje,
+                'cambiada': resultado.cambiada,
+                'estado_anterior': resultado.estado_anterior,
+                'estado_nuevo': resultado.estado_nuevo,
+                'alerta': alerta_data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class PeticionAlertasDuplicadosView(APIView):
+    """
+    GET /api/peticiones/<id_peticion>/duplicados/
+    Consulta las alertas de posibles duplicados asociadas a una petición específica.
+    Exclusivo para roles Administrador (1) y Jurídico (2).
+    """
+
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+
+    @swagger_auto_schema(
+        operation_description="Lista las alertas de posibles duplicados asociadas a una petición.",
+        manual_parameters=[
+            openapi.Parameter('estado_revision', openapi.IN_QUERY, description="Filtrar por estado (PENDIENTE, CONFIRMADO, DESCARTADO)", type=openapi.TYPE_STRING),
+            openapi.Parameter('estado', openapi.IN_QUERY, description="Alias de estado_revision", type=openapi.TYPE_STRING),
+            openapi.Parameter('solo_pendientes', openapi.IN_QUERY, description="Si es true y no se envía estado_revision, retorna solo PENDIENTE", type=openapi.TYPE_BOOLEAN),
+            openapi.Parameter('page', openapi.IN_QUERY, description="Número de página", type=openapi.TYPE_INTEGER),
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Tamaño de página (default: 20, max: 100)", type=openapi.TYPE_INTEGER),
+        ],
+        responses={
+            200: PeticionPosibleDuplicadoListSerializer(many=True),
+            400: "Parámetros de filtro o paginación inválidos",
+            401: "No autenticado",
+            403: "Permiso denegado (solo Administrador o Jurídico)",
+            404: "Petición no encontrada",
+        },
+    )
+    def get(self, request, id_peticion):
+        filtros = _validar_parametros_listado_alertas(request, permitir_filtro_peticion=False)
+
+        peticion_ref = (
+            Peticiones.objects
+            .filter(pk=id_peticion)
+            .values('id_peticion', 'numero_radicado')
+            .first()
+        )
+        if not peticion_ref:
+            return Response(
+                {'error': f"La petición #{id_peticion} no fue encontrada."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            queryset = listar_alertas_duplicados(
+                estado_revision=filtros['estado_revision'],
+                id_peticion=id_peticion,
+                solo_pendientes=filtros['solo_pendientes'],
+            )
+            resumen = obtener_resumen_alertas_duplicados(id_peticion=id_peticion)
+        except (TransicionAlertaInvalidaError, ParDuplicadoInvalidoError) as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = _optimizar_queryset_alertas(queryset)
+        extra = {
+            'id_peticion': peticion_ref['id_peticion'],
+            'numero_radicado': peticion_ref.get('numero_radicado'),
+        }
+
+        paginator = AlertasDuplicadosPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        if page is not None:
+            serializer = PeticionPosibleDuplicadoListSerializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data, resumen=resumen, extra=extra)
+
+        serializer = PeticionPosibleDuplicadoListSerializer(queryset, many=True)
+        return Response(
+            {
+                'count': len(serializer.data),
+                'resumen': resumen,
+                **extra,
+                'results': serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 

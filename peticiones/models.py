@@ -1,4 +1,6 @@
+from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import F, Q
 
 
 class TipoPeticion(models.Model):
@@ -396,3 +398,222 @@ class NotificacionPeticion(models.Model):
 
     def __str__(self):
         return f"Notificación #{self.id_notificacion} - {self.titulo}"
+
+
+class PeticionPosibleDuplicado(models.Model):
+    """Registra pares de peticiones candidatas a duplicidad y su decisión humana.
+
+    Conserva siempre ambas peticiones originales mediante relaciones sin eliminación
+    en cascada y garantiza unicidad del par usando IDs ordenados
+    (id_peticion_menor < id_peticion_mayor).
+    """
+
+    ESTADO_PENDIENTE = 'PENDIENTE'
+    ESTADO_CONFIRMADO = 'CONFIRMADO'
+    ESTADO_DESCARTADO = 'DESCARTADO'
+    ESTADOS_REVISION_CHOICES = [
+        (ESTADO_PENDIENTE, 'Pendiente de revisión'),
+        (ESTADO_CONFIRMADO, 'Duplicado confirmado'),
+        (ESTADO_DESCARTADO, 'Duplicado descartado'),
+    ]
+
+    ORIGEN_REGISTRO = 'REGISTRO_PETICION'
+    ORIGEN_ENDPOINT_MANUAL = 'ENDPOINT_MANUAL'
+    ORIGEN_REANALISIS = 'REANALISIS'
+    ORIGENES_DETECCION_CHOICES = [
+        (ORIGEN_REGISTRO, 'Registro de petición'),
+        (ORIGEN_ENDPOINT_MANUAL, 'Consulta manual del detector'),
+        (ORIGEN_REANALISIS, 'Reanálisis posterior'),
+    ]
+
+    id_alerta = models.AutoField(primary_key=True)
+    peticion_menor = models.ForeignKey(
+        Peticiones,
+        on_delete=models.PROTECT,
+        db_column='id_peticion_menor',
+        related_name='alertas_duplicado_como_menor',
+    )
+    peticion_mayor = models.ForeignKey(
+        Peticiones,
+        on_delete=models.PROTECT,
+        db_column='id_peticion_mayor',
+        related_name='alertas_duplicado_como_mayor',
+    )
+    peticion_origen = models.ForeignKey(
+        Peticiones,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='id_peticion_origen',
+        related_name='alertas_duplicado_originadas',
+    )
+    estado_revision = models.CharField(
+        max_length=20,
+        choices=ESTADOS_REVISION_CHOICES,
+        default=ESTADO_PENDIENTE,
+    )
+    peticion_principal = models.ForeignKey(
+        Peticiones,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        db_column='id_peticion_principal',
+        related_name='duplicados_confirmados_como_principal',
+    )
+
+    similitud_texto = models.FloatField(null=True, blank=True)
+    coincidencia_texto = models.BooleanField(default=False)
+    distancia_metros = models.FloatField(null=True, blank=True)
+    coincidencia_gps = models.BooleanField(default=False)
+    distancia_hamming = models.SmallIntegerField(null=True, blank=True)
+    similitud_imagen = models.FloatField(null=True, blank=True)
+    coincidencia_imagen = models.BooleanField(default=False)
+    score_combinado = models.FloatField(default=0.0)
+    criterios_coincidencia = models.JSONField(default=list, blank=True)
+    origen_deteccion = models.CharField(
+        max_length=40,
+        choices=ORIGENES_DETECCION_CHOICES,
+        default=ORIGEN_ENDPOINT_MANUAL,
+    )
+
+    revisado_por = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='revisado_por_id',
+        related_name='revisiones_duplicados_realizadas',
+    )
+    observacion_revision = models.TextField(blank=True, null=True)
+    fecha_revision = models.DateTimeField(null=True, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_actualizacion = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = 'peticion_posible_duplicado'
+        ordering = ['-fecha_creacion', '-id_alerta']
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(peticion_menor__lt=F('peticion_mayor')),
+                name='chk_pet_dup_par_ordenado',
+            ),
+            models.UniqueConstraint(
+                fields=['peticion_menor', 'peticion_mayor'],
+                name='uq_pet_dup_par',
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    estado_revision__in=['PENDIENTE', 'CONFIRMADO', 'DESCARTADO']
+                ),
+                name='chk_pet_dup_estado_valido',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(peticion_principal__isnull=True)
+                    | Q(peticion_principal=F('peticion_menor'))
+                    | Q(peticion_principal=F('peticion_mayor'))
+                ),
+                name='chk_pet_dup_principal_par',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(peticion_origen__isnull=True)
+                    | Q(peticion_origen=F('peticion_menor'))
+                    | Q(peticion_origen=F('peticion_mayor'))
+                ),
+                name='chk_pet_dup_origen_par',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['estado_revision', '-fecha_creacion'],
+                name='idx_pet_dup_est_fecha',
+            ),
+            models.Index(
+                fields=['peticion_menor', 'estado_revision'],
+                name='idx_pet_dup_menor_est',
+            ),
+            models.Index(
+                fields=['peticion_mayor', 'estado_revision'],
+                name='idx_pet_dup_mayor_est',
+            ),
+            models.Index(
+                fields=['peticion_principal', 'estado_revision'],
+                name='idx_pet_dup_princ_est',
+            ),
+        ]
+
+    @staticmethod
+    def normalizar_par_ids(peticion_a_id, peticion_b_id):
+        """Retorna la tupla ordenada (id_menor, id_mayor) y rechaza autorreferencias."""
+        if (
+            peticion_a_id is None
+            or peticion_b_id is None
+            or isinstance(peticion_a_id, bool)
+            or isinstance(peticion_b_id, bool)
+        ):
+            raise ValidationError('Ambos identificadores de petición son obligatorios.')
+        try:
+            id_a = int(peticion_a_id)
+            id_b = int(peticion_b_id)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError('Los identificadores de petición deben ser enteros válidos.') from exc
+        if id_a <= 0 or id_b <= 0:
+            raise ValidationError('Los identificadores de petición deben ser positivos.')
+        if id_a == id_b:
+            raise ValidationError('Una petición no puede relacionarse consigo misma como duplicado.')
+        return (id_a, id_b) if id_a < id_b else (id_b, id_a)
+
+    @classmethod
+    def normalizar_par_peticiones(cls, peticion_a, peticion_b):
+        """Retorna las instancias ordenadas (peticion_menor, peticion_mayor)."""
+        if peticion_a is None or peticion_b is None:
+            raise ValidationError('Ambas instancias de petición son obligatorias.')
+        id_menor, id_mayor = cls.normalizar_par_ids(peticion_a.pk, peticion_b.pk)
+        if peticion_a.pk == id_menor and peticion_b.pk == id_mayor:
+            return (peticion_a, peticion_b)
+        return (peticion_b, peticion_a)
+
+    def clean(self):
+        errores = {}
+        estados_validos = {
+            self.ESTADO_PENDIENTE,
+            self.ESTADO_CONFIRMADO,
+            self.ESTADO_DESCARTADO,
+        }
+        if self.estado_revision not in estados_validos:
+            errores['estado_revision'] = 'Estado de revisión inválido.'
+
+        if self.peticion_menor_id is not None and self.peticion_mayor_id is not None:
+            if self.peticion_menor_id == self.peticion_mayor_id:
+                errores['peticion_mayor'] = (
+                    'Una petición no puede relacionarse consigo misma.'
+                )
+            elif self.peticion_menor_id > self.peticion_mayor_id:
+                errores['peticion_menor'] = (
+                    'El par debe almacenarse ordenado (id_peticion_menor < id_peticion_mayor).'
+                )
+
+        if self.peticion_principal_id is not None:
+            ids_par = {self.peticion_menor_id, self.peticion_mayor_id} - {None}
+            if self.peticion_principal_id not in ids_par:
+                errores['peticion_principal'] = (
+                    'La petición principal debe corresponder a una de las dos peticiones de la alerta.'
+                )
+
+        if self.peticion_origen_id is not None:
+            ids_par = {self.peticion_menor_id, self.peticion_mayor_id} - {None}
+            if self.peticion_origen_id not in ids_par:
+                errores['peticion_origen'] = (
+                    'La petición origen debe corresponder a una de las dos peticiones de la alerta.'
+                )
+
+        if errores:
+            raise ValidationError(errores)
+
+    def __str__(self):
+        return (
+            f"Alerta duplicado #{self.id_alerta}: "
+            f"peticiones ({self.peticion_menor_id}, {self.peticion_mayor_id}) [{self.estado_revision}]"
+        )

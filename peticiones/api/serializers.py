@@ -1572,3 +1572,314 @@ class DetectarDuplicadosRequestSerializer(serializers.Serializer):
             )
         return attrs
 
+
+# ==============================================================================
+# FASE 4C: SERIALIZERS DE ALERTAS DE POSIBLES DUPLICADOS PARA JURÍDICO / ADMIN
+# ==============================================================================
+
+from peticiones.models import PeticionPosibleDuplicado
+
+
+def _formatear_fecha_alerta(valor):
+    if valor is None:
+        return None
+    if hasattr(valor, 'isoformat'):
+        return serializers.DateTimeField().to_representation(valor)
+    return valor
+
+
+def _serializar_usuario_alerta(usuario, *, incluir_matricula=False):
+    if not usuario:
+        return None
+    id_usuario = getattr(usuario, 'id_usuario', None) or getattr(usuario, 'pk', None)
+    nombre = (getattr(usuario, 'nombre', '') or '').strip()
+    apellido = (getattr(usuario, 'apellido', '') or '').strip()
+    data = {
+        'id_usuario': id_usuario,
+        'nombre': nombre,
+        'apellido': apellido,
+        'nombre_completo': f"{nombre} {apellido}".strip() or None,
+        'email': getattr(usuario, 'email', None),
+    }
+    if incluir_matricula:
+        data['matricula_profesional'] = getattr(usuario, 'matricula_profesional', None)
+    return data
+
+
+def _serializar_ubicacion_alerta(ubicacion):
+    if not ubicacion:
+        return None
+    lat = getattr(ubicacion, 'latitud', None)
+    lon = getattr(ubicacion, 'longitud', None)
+    return {
+        'id_ubicacion': getattr(ubicacion, 'id_ubicacion', None),
+        'direccion': getattr(ubicacion, 'direccion', None),
+        'latitud': float(lat) if lat is not None else None,
+        'longitud': float(lon) if lon is not None else None,
+    }
+
+
+def _serializar_estado_alerta(estado, *, detallado=False):
+    if not estado:
+        return None
+    data = {
+        'id_estado': getattr(estado, 'id_estado', None),
+        'nombre': getattr(estado, 'nombre', None),
+    }
+    if detallado:
+        data['descripcion'] = getattr(estado, 'descripcion', None)
+        data['orden'] = getattr(estado, 'orden', None)
+    return data
+
+
+def _serializar_asignacion_alerta(peticion, *, detallado=False):
+    asignado_a = getattr(peticion, 'asignado_a', None)
+    asignado_por = getattr(peticion, 'asignado_por', None)
+    fecha_asignacion = getattr(peticion, 'fecha_asignacion', None)
+    asignada = bool(getattr(peticion, 'asignado_a_id', None) or asignado_a is not None)
+    return {
+        'asignada': asignada,
+        'asignado_a': _serializar_usuario_alerta(asignado_a, incluir_matricula=detallado),
+        'asignado_por': _serializar_usuario_alerta(asignado_por),
+        'fecha_asignacion': _formatear_fecha_alerta(fecha_asignacion),
+    }
+
+
+def _serializar_peticion_alerta(peticion, *, detallado=False, id_origen=None, id_principal=None):
+    if not peticion:
+        return None
+    from peticiones.services.duplicados_service import extraer_fotografias_peticion
+
+    foto_principal, fotos_urls = extraer_fotografias_peticion(peticion)
+    id_peticion = getattr(peticion, 'id_peticion', None)
+    numero_radicado = getattr(peticion, 'numero_radicado', None)
+    tipo_obj = getattr(peticion, 'id_tipo', None)
+    estado_obj = getattr(peticion, 'id_estado', None)
+    ubicacion_obj = getattr(peticion, 'id_ubicacion', None)
+
+    data = {
+        'id_peticion': id_peticion,
+        'numero_radicado': numero_radicado,
+        'codigo': numero_radicado or (f"#INC-2026-{int(id_peticion):06d}" if id_peticion is not None else None),
+        'tipo': (
+            {
+                'id_tipo': getattr(tipo_obj, 'id_tipo', None),
+                'nombre': getattr(tipo_obj, 'nombre', None),
+            }
+            if tipo_obj
+            else None
+        ),
+        'estado': _serializar_estado_alerta(estado_obj, detallado=detallado),
+        'ubicacion': _serializar_ubicacion_alerta(ubicacion_obj),
+        'descripcion': getattr(peticion, 'descripcion', None),
+        'prioridad': getattr(peticion, 'prioridad', None),
+        'fecha': _formatear_fecha_alerta(getattr(peticion, 'fecha', None)),
+        'foto': foto_principal,
+        'fotos': fotos_urls,
+        'total_fotos': len(fotos_urls),
+        'asignacion': _serializar_asignacion_alerta(peticion, detallado=detallado),
+    }
+
+    if detallado:
+        prefetched = getattr(peticion, '_prefetched_objects_cache', None)
+        ev_cache = prefetched.get('evidenciapeticiones_set') if isinstance(prefetched, dict) else None
+        if ev_cache is None:
+            ev_cache = list(
+                EvidenciaPeticiones.objects
+                .filter(id_peticion=peticion)
+                .order_by('id_evidencia')
+            )
+        data['evidencias'] = [
+            {
+                'id_evidencia': getattr(ev, 'id_evidencia', None),
+                'ruta_archivo': getattr(ev, 'ruta_archivo', None),
+                'descripcion': getattr(ev, 'descripcion', None),
+            }
+            for ev in ev_cache
+        ]
+        data['es_peticion_origen'] = bool(id_origen is not None and id_peticion == id_origen)
+        data['es_peticion_principal'] = bool(id_principal is not None and id_peticion == id_principal)
+
+    return data
+
+
+class PeticionPosibleDuplicadoListSerializer(serializers.ModelSerializer):
+    """Representación resumida de una alerta de posible duplicado para listados."""
+
+    peticion_menor_id = serializers.IntegerField(read_only=True)
+    peticion_mayor_id = serializers.IntegerField(read_only=True)
+    peticion_origen_id = serializers.IntegerField(read_only=True, allow_null=True)
+    peticion_principal_id = serializers.IntegerField(read_only=True, allow_null=True)
+    revisado_por = serializers.SerializerMethodField()
+    peticion_menor = serializers.SerializerMethodField()
+    peticion_mayor = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PeticionPosibleDuplicado
+        fields = [
+            'id_alerta',
+            'estado_revision',
+            'peticion_menor_id',
+            'peticion_mayor_id',
+            'peticion_origen_id',
+            'peticion_principal_id',
+            'similitud_texto',
+            'coincidencia_texto',
+            'distancia_metros',
+            'coincidencia_gps',
+            'distancia_hamming',
+            'similitud_imagen',
+            'coincidencia_imagen',
+            'score_combinado',
+            'criterios_coincidencia',
+            'origen_deteccion',
+            'observacion_revision',
+            'revisado_por',
+            'fecha_revision',
+            'fecha_creacion',
+            'fecha_actualizacion',
+            'peticion_menor',
+            'peticion_mayor',
+        ]
+        read_only_fields = fields
+
+    def get_revisado_por(self, obj):
+        return _serializar_usuario_alerta(getattr(obj, 'revisado_por', None))
+
+    def get_peticion_menor(self, obj):
+        return _serializar_peticion_alerta(getattr(obj, 'peticion_menor', None), detallado=False)
+
+    def get_peticion_mayor(self, obj):
+        return _serializar_peticion_alerta(getattr(obj, 'peticion_mayor', None), detallado=False)
+
+
+class PeticionPosibleDuplicadoDetailSerializer(PeticionPosibleDuplicadoListSerializer):
+    """Comparación detallada lado a lado de las dos peticiones asociadas a una alerta."""
+
+    comparacion = serializers.SerializerMethodField()
+
+    class Meta(PeticionPosibleDuplicadoListSerializer.Meta):
+        fields = PeticionPosibleDuplicadoListSerializer.Meta.fields + ['comparacion']
+        read_only_fields = fields
+
+    def get_peticion_menor(self, obj):
+        return _serializar_peticion_alerta(
+            getattr(obj, 'peticion_menor', None),
+            detallado=True,
+            id_origen=getattr(obj, 'peticion_origen_id', None),
+            id_principal=getattr(obj, 'peticion_principal_id', None),
+        )
+
+    def get_peticion_mayor(self, obj):
+        return _serializar_peticion_alerta(
+            getattr(obj, 'peticion_mayor', None),
+            detallado=True,
+            id_origen=getattr(obj, 'peticion_origen_id', None),
+            id_principal=getattr(obj, 'peticion_principal_id', None),
+        )
+
+    def get_comparacion(self, obj):
+        menor = getattr(obj, 'peticion_menor', None)
+        mayor = getattr(obj, 'peticion_mayor', None)
+
+        tipo_menor = getattr(menor, 'id_tipo_id', None) if menor else None
+        tipo_mayor = getattr(mayor, 'id_tipo_id', None) if mayor else None
+        estado_menor = getattr(menor, 'id_estado_id', None) if menor else None
+        estado_mayor = getattr(mayor, 'id_estado_id', None) if mayor else None
+        asig_menor = getattr(menor, 'asignado_a_id', None) if menor else None
+        asig_mayor = getattr(mayor, 'asignado_a_id', None) if mayor else None
+
+        fecha_menor = getattr(menor, 'fecha', None) if menor else None
+        fecha_mayor = getattr(mayor, 'fecha', None) if mayor else None
+        diferencia_horas = None
+        if fecha_menor is not None and fecha_mayor is not None:
+            try:
+                diferencia_horas = round(abs((fecha_mayor - fecha_menor).total_seconds()) / 3600.0, 2)
+            except TypeError:
+                diferencia_horas = None
+
+        criterios = list(getattr(obj, 'criterios_coincidencia', None) or [])
+        return {
+            'peticion_menor_id': getattr(obj, 'peticion_menor_id', None),
+            'peticion_mayor_id': getattr(obj, 'peticion_mayor_id', None),
+            'mismo_tipo': bool(tipo_menor and tipo_menor == tipo_mayor),
+            'mismo_estado': bool(estado_menor and estado_menor == estado_mayor),
+            'ambas_asignadas': bool(asig_menor and asig_mayor),
+            'mismo_veterinario_asignado': bool(asig_menor and asig_menor == asig_mayor),
+            'diferencia_tiempo_horas': diferencia_horas,
+            'metricas': {
+                'similitud_texto': getattr(obj, 'similitud_texto', None),
+                'coincidencia_texto': bool(getattr(obj, 'coincidencia_texto', False)),
+                'distancia_metros': getattr(obj, 'distancia_metros', None),
+                'coincidencia_gps': bool(getattr(obj, 'coincidencia_gps', False)),
+                'distancia_hamming': getattr(obj, 'distancia_hamming', None),
+                'similitud_imagen': getattr(obj, 'similitud_imagen', None),
+                'coincidencia_imagen': bool(getattr(obj, 'coincidencia_imagen', False)),
+                'score_combinado': getattr(obj, 'score_combinado', 0.0),
+                'criterios_coincidencia': criterios,
+            },
+        }
+
+
+class ResolverAlertaDuplicadoSerializer(serializers.Serializer):
+    """Valida la decisión manual (CONFIRMADO / DESCARTADO) sobre una alerta de duplicado."""
+
+    estado_revision = serializers.ChoiceField(
+        choices=(
+            (PeticionPosibleDuplicado.ESTADO_CONFIRMADO, 'Duplicado confirmado'),
+            (PeticionPosibleDuplicado.ESTADO_DESCARTADO, 'Duplicado descartado'),
+        ),
+        required=True,
+    )
+    peticion_principal = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+    )
+    observacion = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=2000,
+    )
+
+    def to_internal_value(self, data):
+        if hasattr(data, 'copy'):
+            normalizado = data.copy()
+        elif isinstance(data, dict):
+            normalizado = dict(data)
+        else:
+            return super().to_internal_value(data)
+
+        estado = normalizado.get('estado_revision')
+        if isinstance(estado, str):
+            normalizado['estado_revision'] = estado.strip().upper()
+        return super().to_internal_value(normalizado)
+
+    def validate(self, attrs):
+        estado = attrs.get('estado_revision')
+        peticion_principal = attrs.get('peticion_principal')
+
+        if estado == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
+            if peticion_principal is None:
+                raise serializers.ValidationError({
+                    'peticion_principal': (
+                        "Debe indicar una 'peticion_principal' válida perteneciente al par "
+                        "para confirmar la alerta como duplicado."
+                    )
+                })
+        elif estado == PeticionPosibleDuplicado.ESTADO_DESCARTADO:
+            if peticion_principal is not None:
+                raise serializers.ValidationError({
+                    'peticion_principal': (
+                        "No debe especificar 'peticion_principal' cuando la decisión es DESCARTADO."
+                    )
+                })
+
+        observacion = attrs.get('observacion')
+        if observacion is not None:
+            observacion_limpia = observacion.strip()
+            attrs['observacion'] = observacion_limpia or None
+        return attrs
+
+
