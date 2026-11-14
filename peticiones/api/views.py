@@ -1417,14 +1417,70 @@ class DictadoVozActaView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
+    MAX_AUDIO_BYTES = 25 * 1024 * 1024
+    MAX_REQUEST_BYTES = 35 * 1024 * 1024
+    MIN_AUDIO_BYTES = 1024
+    ALLOWED_AUDIO_MIMES = {
+        "audio/mp4": "audio/mp4",
+        "audio/m4a": "audio/mp4",
+        "audio/x-m4a": "audio/mp4",
+        "audio/aac": "audio/aac",
+        "audio/3gpp": "audio/3gpp",
+        "audio/3gp": "audio/3gpp",
+        "audio/wav": "audio/wav",
+        "audio/x-wav": "audio/wav",
+        "audio/wave": "audio/wav",
+        "audio/ogg": "audio/ogg",
+        "audio/mp3": "audio/mp3",
+        "audio/mpeg": "audio/mp3",
+    }
+
+    @classmethod
+    def _error_response(cls, message, error_code, http_status, form_id=FORM_ID_ACTA, form_version=FORM_VERSION_ACTA):
+        return Response(
+            {
+                "status": "error",
+                "error_code": error_code,
+                "error": message,
+                "message": message,
+                "form_id": form_id,
+                "form_version": form_version,
+                "fields": {},
+                "warnings": [message],
+                "requires_review": True,
+            },
+            status=http_status,
+        )
+
+    @classmethod
+    def _normalizar_mime(cls, raw_mime):
+        if not raw_mime or not str(raw_mime).strip():
+            return "audio/mp4"
+        base_mime = str(raw_mime).split(";", 1)[0].strip().lower()
+        return cls.ALLOWED_AUDIO_MIMES.get(base_mime)
+
     def post(self, request, *args, **kwargs):
         user = request.user
         rol_id = getattr(user, 'id_rol_id', None)
         if rol_id not in (1, 3):
-            return Response(
-                {"error": "Solo administradores y médicos veterinarios pueden utilizar el dictado por voz."},
-                status=status.HTTP_403_FORBIDDEN
+            return self._error_response(
+                "Solo administradores y médicos veterinarios pueden utilizar el dictado por voz.",
+                error_code="permiso_denegado",
+                http_status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Validar tamaño total de petición ANTES de leer o parsear el cuerpo
+        raw_content_length = request.META.get("CONTENT_LENGTH")
+        if raw_content_length:
+            try:
+                if int(raw_content_length) > self.MAX_REQUEST_BYTES:
+                    return self._error_response(
+                        "El audio supera el límite máximo permitido de 25 MB.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    )
+            except (TypeError, ValueError):
+                pass
 
         form_id = request.data.get('form_id') or FORM_ID_ACTA
         try:
@@ -1433,55 +1489,118 @@ class DictadoVozActaView(APIView):
             form_version = FORM_VERSION_ACTA
 
         audio_bytes = None
-        mime_type = "audio/m4a"
+        mime_type = None
 
         # 1. Comprobar si se subió como archivo multipart
         archivo_audio = request.FILES.get('audio') or request.FILES.get('file')
-        if archivo_audio:
-            audio_bytes = archivo_audio.read()
-            mime_type = archivo_audio.content_type or "audio/m4a"
+        if archivo_audio is not None:
+            file_size = getattr(archivo_audio, 'size', None)
+            if file_size is not None:
+                if file_size > self.MAX_AUDIO_BYTES:
+                    return self._error_response(
+                        "El archivo de audio supera el límite máximo permitido de 25 MB.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        form_id=form_id,
+                        form_version=form_version,
+                    )
+                if file_size < self.MIN_AUDIO_BYTES:
+                    return self._error_response(
+                        "La grabación es demasiado corta o está vacía. Habla al menos unos segundos e intenta de nuevo.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_400_BAD_REQUEST,
+                        form_id=form_id,
+                        form_version=form_version,
+                    )
+
+            mime_type = self._normalizar_mime(getattr(archivo_audio, 'content_type', None))
+            if not mime_type:
+                return self._error_response(
+                    "Formato de audio no soportado. Usa audio M4A, MP4, AAC, 3GPP, WAV, OGG o MP3.",
+                    error_code="audio_invalido",
+                    http_status=status.HTTP_400_BAD_REQUEST,
+                    form_id=form_id,
+                    form_version=form_version,
+                )
+
+            audio_bytes = archivo_audio.read(self.MAX_AUDIO_BYTES + 1)
         else:
             # 2. Comprobar si se envió como cadena base64 en JSON
             audio_raw = request.data.get('audio') or request.data.get('audio_base64')
-            if isinstance(audio_raw, str) and len(audio_raw) > 20:
+            if isinstance(audio_raw, str) and audio_raw.strip():
+                max_b64_len = (self.MAX_AUDIO_BYTES * 4 // 3) + 4096
+                if len(audio_raw) > max_b64_len:
+                    return self._error_response(
+                        "El audio supera el límite máximo permitido de 25 MB.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        form_id=form_id,
+                        form_version=form_version,
+                    )
+
                 import base64
-                cadena_b64 = audio_raw
+                import binascii
+                cadena_b64 = audio_raw.strip()
+                raw_mime = None
                 if ',' in cadena_b64:
                     encabezado, cadena_b64 = cadena_b64.split(',', 1)
                     if 'data:' in encabezado and ';base64' in encabezado:
-                        mime_type = encabezado.replace('data:', '').replace(';base64', '')
+                        raw_mime = encabezado.replace('data:', '').split(';base64', 1)[0].strip()
+
+                mime_type = self._normalizar_mime(raw_mime)
+                if not mime_type:
+                    return self._error_response(
+                        "Formato de audio no soportado. Usa audio M4A, MP4, AAC, 3GPP, WAV, OGG o MP3.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_400_BAD_REQUEST,
+                        form_id=form_id,
+                        form_version=form_version,
+                    )
+
                 try:
-                    audio_bytes = base64.b64decode(cadena_b64)
-                except Exception as b64_err:
-                    return Response(
-                        {"error": f"Formato base64 de audio inválido: {b64_err}"},
-                        status=status.HTTP_400_BAD_REQUEST
+                    audio_bytes = base64.b64decode(cadena_b64, validate=True)
+                except (binascii.Error, ValueError):
+                    return self._error_response(
+                        "El audio enviado no tiene una codificación válida.",
+                        error_code="audio_invalido",
+                        http_status=status.HTTP_400_BAD_REQUEST,
+                        form_id=form_id,
+                        form_version=form_version,
                     )
 
         if not audio_bytes:
-            return Response(
-                {
-                    "error": "Debe enviar un archivo de audio o una cadena en base64 bajo la clave 'audio'.",
-                    "form_id": form_id,
-                    "form_version": form_version,
-                    "requires_review": True
-                },
-                status=status.HTTP_400_BAD_REQUEST
+            return self._error_response(
+                "Debe enviar una grabación de audio válida para procesar el dictado.",
+                error_code="audio_invalido",
+                http_status=status.HTTP_400_BAD_REQUEST,
+                form_id=form_id,
+                form_version=form_version,
             )
 
-        # Limitar tamaño de archivo (máximo 25 MB)
-        if len(audio_bytes) > 25 * 1024 * 1024:
-            return Response(
-                {"error": "El audio supera el límite máximo permitido de 25 MB."},
-                status=status.HTTP_400_BAD_REQUEST
+        if len(audio_bytes) > self.MAX_AUDIO_BYTES:
+            return self._error_response(
+                "El audio supera el límite máximo permitido de 25 MB.",
+                error_code="audio_invalido",
+                http_status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                form_id=form_id,
+                form_version=form_version,
             )
 
-        # Procesar con Gemini AI
+        if len(audio_bytes) < self.MIN_AUDIO_BYTES:
+            return self._error_response(
+                "La grabación es demasiado corta o está vacía. Habla al menos unos segundos e intenta de nuevo.",
+                error_code="audio_invalido",
+                http_status=status.HTTP_400_BAD_REQUEST,
+                form_id=form_id,
+                form_version=form_version,
+            )
+
+        # Procesar con Gemini AI (sin registrar audio ni datos personales)
         resultado, http_status = procesar_audio_con_gemini(
             audio_bytes=audio_bytes,
-            mime_type=mime_type,
+            mime_type=mime_type or "audio/mp4",
             form_id=form_id,
-            form_version=form_version
+            form_version=form_version,
         )
 
         return Response(resultado, status=http_status)
