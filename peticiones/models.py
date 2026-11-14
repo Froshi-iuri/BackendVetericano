@@ -1,6 +1,7 @@
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import F, Q
+from django.utils import timezone
 
 
 class TipoPeticion(models.Model):
@@ -616,4 +617,52 @@ class PeticionPosibleDuplicado(models.Model):
         return (
             f"Alerta duplicado #{self.id_alerta}: "
             f"peticiones ({self.peticion_menor_id}, {self.peticion_mayor_id}) [{self.estado_revision}]"
+        )
+
+
+class PeticionFotoAutorizada(models.Model):
+    """Registra la autorización expresa del ciudadano para mostrar una foto puntual
+    como miniatura anonimizada en el detector ciudadano de posibles duplicados.
+    """
+
+    id_autorizacion = models.AutoField(primary_key=True)
+    id_peticion = models.ForeignKey(
+        Peticiones,
+        on_delete=models.CASCADE,
+        db_column='id_peticion',
+        related_name='fotos_autorizadas_duplicados',
+    )
+    ruta_archivo = models.CharField(max_length=500)
+    autorizado_por = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='autorizado_por_id',
+        related_name='fotos_peticiones_autorizadas',
+    )
+    fecha_autorizacion = models.DateTimeField(default=timezone.now)
+    version_texto = models.CharField(max_length=20, default='v1')
+    revocada_en = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = True
+        db_table = 'peticion_foto_autorizada'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['id_peticion', 'ruta_archivo'],
+                name='uq_pet_foto_aut',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['id_peticion'],
+                name='idx_pet_foto_aut_peticion',
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"Foto autorizada #{self.id_autorizacion} "
+            f"(Petición #{self.id_peticion_id}, {self.version_texto})"
         )

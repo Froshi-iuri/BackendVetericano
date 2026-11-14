@@ -22,6 +22,7 @@ from .views import (
     ResolverAlertaDuplicadoView,
     PeticionAlertasDuplicadosView,
 )
+from .duplicados_ciudadano import DetectarDuplicadosCiudadanoView
 
 urlpatterns = [
     # Rutas existentes
@@ -29,6 +30,11 @@ urlpatterns = [
     path('listar/', ListarPeticionesView.as_view(), name='listar-peticiones'),
     path('iniciar/', IniciarPeticionView.as_view(), name='iniciar-peticion'),
     path('detectar-duplicados/', DetectarDuplicadosPeticionView.as_view(), name='detectar-duplicados-peticion'),
+    path(
+        'detectar-duplicados-ciudadano/',
+        DetectarDuplicadosCiudadanoView.as_view(),
+        name='detectar-duplicados-ciudadano-peticion',
+    ),
     path('duplicados/alertas/', AlertasDuplicadosListView.as_view(), name='alertas-duplicados-listar'),
     path('duplicados/alertas/<int:id_alerta>/', AlertaDuplicadoDetailView.as_view(), name='alerta-duplicado-detalle'),
     path('duplicados/alertas/<int:id_alerta>/resolver/', ResolverAlertaDuplicadoView.as_view(), name='alerta-duplicado-resolver'),
