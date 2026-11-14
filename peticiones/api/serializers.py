@@ -15,6 +15,7 @@ from peticiones.utils import (
     obtener_multimedia_acta,
     detectar_tipo_archivo,
 )
+from peticiones.services.foto_autorizada_service import registrar_fotos_autorizadas
 from animales.models import Animal, Responsables
 from inventario.api.kit_serializers import CampoPassthroughJSONField
 
@@ -38,6 +39,13 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         allow_empty=True,
         write_only=True
     )
+    fotos_autorizadas_duplicados = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        allow_null=True,
+        write_only=True,
+    )
 
     class Meta:
         model = Peticiones
@@ -49,6 +57,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             'prioridad',
             'foto',
             'fotos',
+            'fotos_autorizadas_duplicados',
             'direccion',
             'latitud',
             'longitud',
@@ -61,6 +70,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         latitud = validated_data.pop('latitud', None)
         longitud = validated_data.pop('longitud', None)
         fotos_input = validated_data.pop('fotos', [])
+        fotos_autorizadas_input = validated_data.pop('fotos_autorizadas_duplicados', None)
         foto_input = validated_data.get('foto', None)
 
         # 1. Si viene algún dato de mapa/dirección, creamos el registro en Ubicaciones
@@ -112,7 +122,15 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
                 ruta_archivo=url,
                 descripcion=f"Evidencia #{idx} de la petición"
             )
-        
+
+        # 5. Registrar autorización expresa de fotos para detector ciudadano (no bloqueante)
+        registrar_fotos_autorizadas(
+            peticion=peticion,
+            autorizado_por=peticion.responsable,
+            urls_autorizadas=fotos_autorizadas_input,
+            urls_procesadas=urls_procesadas,
+        )
+
         return peticion
 
 

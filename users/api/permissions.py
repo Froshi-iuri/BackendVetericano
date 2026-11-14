@@ -158,6 +158,14 @@ class EsJuridicoOAdmin(BasePermission):
         return es_admin_o_juridico(request.user)
 
 
+class EsPeticionario(BasePermission):
+    """Acceso exclusivo para el Peticionario (Rol 4)."""
+    message = "Se requieren permisos de Peticionario para realizar esta acción."
+
+    def has_permission(self, request, view):
+        return es_peticionario(request.user)
+
+
 class EsVeterinarioOAdmin(BasePermission):
     """Acceso para Administrador (Rol 1) o Veterinario (Rol 3)."""
     message = "Se requieren permisos de Administrador o Veterinario para realizar esta acción."

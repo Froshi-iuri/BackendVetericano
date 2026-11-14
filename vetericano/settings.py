@@ -165,6 +165,10 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_RATES': {
+        'duplicados_ciudadano_rafaga': '10/min',
+        'duplicados_ciudadano_sostenido': '60/hour',
+    },
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
@@ -311,3 +315,7 @@ DUPLICADOS_DETECCION_AUTOMATICA_ACTIVA = _leer_env_bool(
 )
 DUPLICADOS_AUTO_STATEMENT_TIMEOUT_MS = _leer_env_duplicados_timeout_ms()
 DUPLICADOS_AUTO_MAX_CANDIDATOS = _leer_env_duplicados_max_candidatos()
+DUPLICADOS_CIUDADANO_FOTO_ACTIVA = _leer_env_bool(
+    'DUPLICADOS_CIUDADANO_FOTO_ACTIVA',
+    default=True,
+)
