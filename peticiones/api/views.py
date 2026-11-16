@@ -664,7 +664,8 @@ class DashboardJuridicoView(APIView):
             ~Q(id_estado__nombre__icontains='finaliz') &
             ~Q(id_estado__nombre__icontains='alta') &
             ~Q(id_estado__nombre__icontains='cerrad') &
-            ~Q(id_estado__nombre__icontains='resuelt')
+            ~Q(id_estado__nombre__icontains='resuelt') &
+            ~Q(id_estado__nombre__icontains='duplicad')
         )
         filtro_atrasadas = (
             (Q(fecha_asignacion__lte=hace_5_dias) | (Q(fecha_asignacion__isnull=True) & Q(fecha__lte=hace_5_dias))) &
@@ -685,6 +686,8 @@ class DashboardJuridicoView(APIView):
         finalizadas_count = 0
         for est_nom, cant in distribucion_estados.items():
             est_low = est_nom.lower()
+            if 'duplicad' in est_low:
+                continue
             if any(term in est_low for term in ['atendid', 'finaliz', 'cerrad', 'alta', 'resuelt']):
                 finalizadas_count += cant
             elif any(term in est_low for term in ['proceso', 'atenci', 'curso', 'tratam']):

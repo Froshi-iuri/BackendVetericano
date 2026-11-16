@@ -364,11 +364,12 @@ class Dinov2PrioridadImagenGpsYRespaldoTests(SimpleTestCase):
         self.assertEqual(res['parametros']['umbral_dinov2'], 0.45)
         self.assertEqual(res['parametros']['metodo_imagen'], 'dinov2_small')
         self.assertEqual(res['parametros']['radio_metros'], 200.0)
-        # Solo el candidato que cumple AMBOS (imagen >= 0.45 Y GPS <= 200m) genera alerta
-        self.assertEqual(res['total_candidatos'], 1)
+        # Tanto #101 (visual + GPS <= 200 m) como #102 (solo GPS <= 200 m) se incluyen;
+        # #103 (fuera de 200 m con foto idéntica) queda excluido por regla GPS obligatoria.
+        self.assertEqual(res['total_candidatos'], 2)
         mock_objects.select_related.assert_called_once()
 
-        primero = res['posibles_duplicados'][0]
+        primero, segundo = res['posibles_duplicados']
         self.assertEqual(primero['id_peticion'], 101)
         self.assertTrue(primero['posible_duplicado'])
         self.assertTrue(primero['coincidencia_imagen'])
@@ -376,6 +377,11 @@ class Dinov2PrioridadImagenGpsYRespaldoTests(SimpleTestCase):
         self.assertGreater(primero['porcentaje_similitud_visual'], 45.0)
         self.assertFalse(primero['es_certeza_identidad'])
         self.assertEqual(primero['metodo_imagen'], 'dinov2_small')
+
+        self.assertEqual(segundo['id_peticion'], 102)
+        self.assertTrue(segundo['posible_duplicado'])
+        self.assertTrue(segundo['coincidencia_gps'])
+        self.assertFalse(segundo['coincidencia_imagen'])
 
     @override_settings(
         DUPLICADOS_IA_DINOV2_ACTIVA=True,
@@ -403,18 +409,26 @@ class Dinov2PrioridadImagenGpsYRespaldoTests(SimpleTestCase):
         self.assertEqual(res_sin_gps['total_candidatos'], 0)
         mock_objects.select_related.assert_not_called()
 
-        # 2) Texto + GPS sin fotografía -> tampoco activa alerta en flujo IA
+        # 2) Texto + GPS sin fotografía -> sí advierte cuando hay candidatos en GPS <= 200 m
+        cand_sin_foto_en_gps = _peticion_falsa(
+            id_peticion=201,
+            descripcion='Perro cafe herido cerca al parque central',
+            latitud=2.444820,
+            longitud=-76.614740,
+            similitud_texto=0.95,
+        )
+        mock_objects.select_related.return_value = _mock_queryset([cand_sin_foto_en_gps])
         res_sin_foto = duplicados_service.buscar_peticiones_similares_por_descripcion(
             'Perro cafe herido cerca al parque central',
             latitud=2.444814,
             longitud=-76.614739,
         )
-        self.assertFalse(res_sin_foto['posible_duplicado'])
-        self.assertFalse(res_sin_foto['advertencia_duplicado'])
-        self.assertEqual(res_sin_foto['total_candidatos'], 0)
-        mock_objects.select_related.assert_not_called()
+        self.assertTrue(res_sin_foto['posible_duplicado'])
+        self.assertTrue(res_sin_foto['advertencia_duplicado'])
+        self.assertEqual(res_sin_foto['total_candidatos'], 1)
+        self.assertIsNone(res_sin_foto['posibles_duplicados'][0]['porcentaje_similitud_visual'])
 
-        # 3) GPS <= 200m + descripción idéntica, pero animal distinto (< 45%) -> sin alerta
+        # 3) GPS <= 200m + descripción idéntica, pero animal distinto (< 45%) -> alerta GPS con info visual
         cand_distinta_en_gps = _peticion_falsa(
             id_peticion=202,
             descripcion='Perro cafe herido cerca al parque central',
@@ -437,10 +451,11 @@ class Dinov2PrioridadImagenGpsYRespaldoTests(SimpleTestCase):
             longitud=-76.614739,
             foto=url_origen,
         )
-        self.assertFalse(res_gps_sin_visual['posible_duplicado'])
-        self.assertFalse(res_gps_sin_visual['advertencia_duplicado'])
-        self.assertEqual(res_gps_sin_visual['total_candidatos'], 0)
-        self.assertEqual(res_gps_sin_visual['posibles_duplicados'], [])
+        self.assertTrue(res_gps_sin_visual['posible_duplicado'])
+        self.assertTrue(res_gps_sin_visual['advertencia_duplicado'])
+        self.assertEqual(res_gps_sin_visual['total_candidatos'], 1)
+        self.assertTrue(res_gps_sin_visual['posibles_duplicados'][0]['coincidencia_gps'])
+        self.assertFalse(res_gps_sin_visual['posibles_duplicados'][0]['coincidencia_imagen'])
 
         # 4) Mismo animal (> 45%) pero fuera del radio de 200m -> sin alerta
         cand_lejos = _peticion_falsa(
@@ -594,9 +609,9 @@ class Dinov2EndpointCiudadanoYJuridicoTests(SimpleTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['posible_duplicado'])
-        self.assertEqual(response.data['total_candidatos'], 2)
+        self.assertEqual(response.data['total_candidatos'], 3)
 
-        c0, c1 = response.data['posibles_duplicados']
+        c0, c1, c2 = response.data['posibles_duplicados']
         self.assertEqual(c0['cercania'], 'muy_cerca')
         self.assertEqual(c0['porcentaje_similitud_visual'], 91.0)
         self.assertEqual(c0['similitud_visual'], 'alta')
@@ -609,6 +624,12 @@ class Dinov2EndpointCiudadanoYJuridicoTests(SimpleTestCase):
         self.assertEqual(c1['similitud_visual'], 'media')
         self.assertIsNone(c1['foto'])
         self.assertFalse(c1['tiene_fotografia'])
+
+        self.assertEqual(c2['cercania'], 'muy_cerca')
+        self.assertTrue(c2['coincidencia_gps'])
+        self.assertFalse(c2['coincidencia_imagen'])
+        self.assertIsNone(c2['foto'])
+        self.assertFalse(c2['tiene_fotografia'])
 
         for campo_privado in ('id_peticion', 'numero_radicado', 'descripcion', 'distancia_metros', 'ubicacion'):
             self.assertNotIn(campo_privado, c0)
@@ -814,4 +835,78 @@ class Dinov2MicroservicioClienteTests(SimpleTestCase):
         img_bytes = _crear_bytes_imagen('PNG', (64, 64))
         with self.assertRaises(dinov2_service.ModelDinov2NoDisponibleError):
             dinov2_service.extraer_embedding_dinov2_desde_bytes(img_bytes)
+
+    @override_settings(
+        DUPLICADOS_IA_DINOV2_ACTIVA=True,
+        DUPLICADOS_RADIO_GPS_METROS=200.0,
+        DUPLICADOS_UMBRAL_DINOV2=0.45,
+        DUPLICADOS_DINOV2_FALLBACK_DHASH=True,
+        DUPLICADOS_DINOV2_BACKEND='microservicio',
+        DUPLICADOS_DINOV2_MICROSERVICIO_URL='http://127.0.0.1:8001',
+        DUPLICADOS_DINOV2_MICROSERVICIO_SECRET='secreto-prueba-local',
+    )
+    @patch('peticiones.services.duplicados_service.Peticiones.objects')
+    def test_regla_gps_0m_200m_201m_y_fallback_timeout_no_acumula(self, mock_objects):
+        import requests as req_lib
+        lat_base = 2.444814
+        lon_base = -76.614739
+        metros_por_grado_lat = 6371000.0 * math.pi / 180.0
+        # 200.0 m exactos (ligeramente por debajo de 200.0 por redondeo flotante para asegurar <= 200.0)
+        lat_200 = lat_base + (199.99 / metros_por_grado_lat)
+        lat_201 = lat_base + (201.05 / metros_por_grado_lat)
+
+        url_0 = 'https://res.cloudinary.com/demo/image/upload/v1/c0.jpg'
+        url_200 = 'https://res.cloudinary.com/demo/image/upload/v1/c200.jpg'
+        url_201 = 'https://res.cloudinary.com/demo/image/upload/v1/c201.jpg'
+        url_orig = 'https://res.cloudinary.com/demo/image/upload/v1/orig.jpg'
+
+        cand_0m = _peticion_falsa(
+            id_peticion=801,
+            descripcion='Caso exacto 0 metros',
+            latitud=lat_base,
+            longitud=lon_base,
+            foto=url_0,
+        )
+        cand_200m = _peticion_falsa(
+            id_peticion=802,
+            descripcion='Caso limite 200 metros',
+            latitud=lat_200,
+            longitud=lon_base,
+            foto=url_200,
+        )
+        cand_201m = _peticion_falsa(
+            id_peticion=803,
+            descripcion='Caso fuera 201 metros con misma foto',
+            latitud=lat_201,
+            longitud=lon_base,
+            foto=url_201,
+        )
+        mock_objects.select_related.return_value = _mock_queryset([cand_0m, cand_200m, cand_201m])
+
+        img_bytes = _crear_bytes_imagen('JPEG', (64, 64))
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            return_value=img_bytes,
+        ), patch(
+            'peticiones.services.ia_client_service.requests.post',
+            side_effect=req_lib.Timeout('Read timed out'),
+        ) as mock_post:
+            res = duplicados_service.buscar_peticiones_similares_por_descripcion(
+                'Animal reportado cerca',
+                latitud=lat_base,
+                longitud=lon_base,
+                foto=url_orig,
+            )
+
+        # No acumula timeouts: tras el primer timeout en VetericanoIA detiene las llamadas IA
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertTrue(res['posible_duplicado'])
+        ids = {c['id_peticion'] for c in res['posibles_duplicados']}
+        self.assertIn(801, ids)
+        self.assertIn(802, ids)
+        self.assertNotIn(803, ids)
+        for cand in res['posibles_duplicados']:
+            self.assertLessEqual(cand['distancia_metros'], 200.0)
+            self.assertIsNone(cand['porcentaje_similitud_visual'])
+
 
