@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -130,12 +131,36 @@ class Dinov2Engine:
                     processor, model, torch_mod = tupla
                     return processor, model, torch_mod, cached_dev
 
+            hilos = max(1, min(4, int(getattr(self.settings, 'torch_num_threads', 1))))
+            for var in (
+                'OMP_NUM_THREADS',
+                'MKL_NUM_THREADS',
+                'OPENBLAS_NUM_THREADS',
+                'VECLIB_MAXIMUM_THREADS',
+                'NUMEXPR_NUM_THREADS',
+                'TORCH_NUM_THREADS',
+            ):
+                os.environ.setdefault(var, str(hilos))
+            os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
+            os.environ.setdefault('KMP_BLOCKTIME', '0')
+
             try:
                 import torch
                 from transformers import AutoImageProcessor, AutoModel
             except Exception as exc:
                 self._last_error = f'Dependencias PyTorch/Transformers no disponibles: {exc}'
                 raise MotorDinov2Error(self._last_error) from exc
+
+            if hasattr(torch, 'set_num_threads'):
+                try:
+                    torch.set_num_threads(hilos)
+                except RuntimeError:
+                    pass
+            if hasattr(torch, 'set_num_interop_threads'):
+                try:
+                    torch.set_num_interop_threads(1)
+                except RuntimeError:
+                    pass
 
             dev_final = 'cpu'
             if dev_inicial.startswith('cuda'):
@@ -155,9 +180,33 @@ class Dinov2Engine:
                 self._last_error = f"No se pudo cargar el modelo '{nombre}': {exc}"
                 raise MotorDinov2Error(self._last_error) from exc
 
+            warmup_ms = 0.0
+            try:
+                from PIL import Image
+
+                t_warm = time.perf_counter()
+                dummy_img = Image.new('RGB', (32, 32), (128, 128, 128))
+                warm_inputs = processor(images=dummy_img, return_tensors='pt')
+                if dev_final != 'cpu' and hasattr(warm_inputs, 'items'):
+                    warm_inputs = {
+                        k: (v.to(dev_final) if hasattr(v, 'to') else v)
+                        for k, v in warm_inputs.items()
+                    }
+                with torch.no_grad():
+                    model(**warm_inputs)
+                warmup_ms = round((time.perf_counter() - t_warm) * 1000.0, 2)
+            except Exception as exc:
+                logger.warning('Precalentamiento inicial DINOv2 omitido: %s', exc)
+
             self._model_cache[(nombre, dev_final)] = (processor, model, torch)
             self._last_error = None
-            logger.info('Modelo DINOv2 cargado en memoria (%s, device=%s).', nombre, dev_final)
+            logger.info(
+                'Modelo DINOv2 cargado en memoria (%s, device=%s, torch_threads=%d, warmup_ms=%.2f).',
+                nombre,
+                dev_final,
+                hilos,
+                warmup_ms,
+            )
             return processor, model, torch, dev_final
 
     def extraer_embedding_sync(self, imagen_rgb: Any) -> Tuple[List[float], float]:

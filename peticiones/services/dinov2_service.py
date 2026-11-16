@@ -1,6 +1,7 @@
 import logging
 import math
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from django.conf import settings
@@ -436,6 +437,76 @@ def obtener_embedding_desde_url(
     return embedding
 
 
+def precargar_embeddings_bd(
+    urls: Iterable[str],
+    *,
+    cache: Optional[Dict[str, Optional[List[float]]]] = None,
+    id_peticiones: Optional[Iterable[int]] = None,
+    usar_cache_bd: Optional[bool] = None,
+) -> Dict[str, List[float]]:
+    """
+    Precarga en una sola consulta SQL los embeddings cacheados en PostgreSQL para
+    un conjunto de URLs (opcionalmente acotado por `id_peticiones`), evitando N+1 queries
+    y llamadas repetidas a VetericanoIA.
+    """
+    cfg = obtener_config_dinov2()
+    cache_bd = cfg['cache_bd_activa'] if usar_cache_bd is None else bool(usar_cache_bd)
+    if not cache_bd:
+        return {}
+
+    urls_pendientes: List[str] = []
+    vistas = set()
+    for raw in urls or ():
+        if not raw or not isinstance(raw, str):
+            continue
+        limpia = raw.strip()
+        if not limpia or len(limpia) > 500 or limpia in vistas:
+            continue
+        if cache is not None and limpia in cache:
+            continue
+        if detectar_tipo_archivo(limpia) != 'imagen':
+            continue
+        vistas.add(limpia)
+        urls_pendientes.append(limpia)
+
+    if not urls_pendientes:
+        return {}
+
+    ids_limpios = []
+    for pid in id_peticiones or ():
+        try:
+            ids_limpios.append(int(pid))
+        except (TypeError, ValueError):
+            continue
+
+    encontrados: Dict[str, List[float]] = {}
+    try:
+        from peticiones.models import PeticionImagenEmbedding
+
+        qs = PeticionImagenEmbedding.objects.filter(
+            url_imagen__in=urls_pendientes,
+            modelo_ia=cfg['model_name'],
+        )
+        if ids_limpios:
+            qs = qs.filter(peticion_id__in=ids_limpios)
+
+        for registro in qs.order_by('-fecha_creacion'):
+            url_reg = getattr(registro, 'url_imagen', None)
+            vec_raw = getattr(registro, 'embedding_vector', None)
+            if not url_reg or url_reg in encontrados or not vec_raw:
+                continue
+            try:
+                emb_norm = normalizar_vector_l2(vec_raw, dimension_esperada=DINOV2_EMBEDDING_DIM)
+            except ValueError:
+                continue
+            encontrados[url_reg] = emb_norm
+            if cache is not None:
+                cache[url_reg] = emb_norm
+    except Exception as exc:
+        logger.debug("Precarga batch de embeddings BD omitida: %s", exc)
+    return encontrados
+
+
 def calcular_embeddings_urls(
     urls: Iterable[str],
     *,
@@ -447,7 +518,10 @@ def calcular_embeddings_urls(
     """
     Extrae embeddings DINOv2 únicos y válidos desde URLs Cloudinary,
     respetando el límite de imágenes por petición y filtrando no-imágenes.
+    Cuando hay múltiples imágenes sin caché, paraleliza la descarga Cloudinary en I/O
+    acotado y mantiene las operaciones BD/caché en el hilo actual.
     """
+    cfg = obtener_config_dinov2()
     cfg_img = imagen_hash_service.obtener_config_imagen_hash()
     limite = max_imagenes if max_imagenes is not None else cfg_img['max_imagenes']
 
@@ -466,14 +540,91 @@ def calcular_embeddings_urls(
         if len(urls_limpias) >= limite:
             break
 
-    embeddings: List[List[float]] = []
-    for url in urls_limpias:
-        emb = obtener_embedding_desde_url(
-            url,
-            cache=cache,
-            id_peticion=id_peticion,
+    if not urls_limpias:
+        return []
+
+    cache_trabajo = cache if cache is not None else {}
+    cache_bd = cfg['cache_bd_activa'] if usar_cache_bd is None else bool(usar_cache_bd)
+    if cache_bd and len(urls_limpias) > 1:
+        precargar_embeddings_bd(
+            urls_limpias,
+            cache=cache_trabajo,
+            id_peticiones=[id_peticion] if id_peticion is not None else None,
             usar_cache_bd=usar_cache_bd,
         )
+
+    pendientes_descarga: List[Tuple[str, str]] = []
+    dominios = cfg_img['dominios_permitidos']
+    for url in urls_limpias:
+        if url in cache_trabajo:
+            continue
+        url_segura = imagen_hash_service.validar_url_cloudinary_segura(url, dominios_permitidos=dominios)
+        if not url_segura:
+            cache_trabajo[url] = None
+            continue
+        if cache_bd:
+            emb_bd = _leer_embedding_bd(url, cfg['model_name'], id_peticion=id_peticion)
+            if emb_bd is not None:
+                cache_trabajo[url] = emb_bd
+                continue
+        pendientes_descarga.append((url, url_segura))
+
+    if len(pendientes_descarga) == 1:
+        url_unica, url_segura_unica = pendientes_descarga[0]
+        contenido = imagen_hash_service.descargar_imagen_segura(
+            url_segura_unica,
+            dominios_permitidos=dominios,
+            miniatura_ancho=cfg['inferencia_ancho'],
+            miniatura_alto=cfg['inferencia_alto'],
+        )
+        if contenido is None:
+            cache_trabajo[url_unica] = None
+        else:
+            emb = extraer_embedding_dinov2_desde_bytes(
+                contenido,
+                model_name=cfg['model_name'],
+                device=cfg['device'],
+            )
+            if emb is not None and cache_bd and id_peticion is not None:
+                _guardar_embedding_bd(url_unica, cfg['model_name'], emb, id_peticion=id_peticion)
+            cache_trabajo[url_unica] = emb
+    elif len(pendientes_descarga) > 1:
+        # Solo descargamos bytes de Cloudinary en paralelo; las llamadas BD y el retorno a
+        # VetericanoIA permanecen en el hilo invocador.
+        def _descargar(par: Tuple[str, str]) -> Tuple[str, Optional[bytes]]:
+            _, segura = par
+            return (
+                par[0],
+                imagen_hash_service.descargar_imagen_segura(
+                    segura,
+                    dominios_permitidos=dominios,
+                    miniatura_ancho=cfg['inferencia_ancho'],
+                    miniatura_alto=cfg['inferencia_alto'],
+                ),
+            )
+
+        descargas: Dict[str, Optional[bytes]] = {}
+        with ThreadPoolExecutor(max_workers=min(3, len(pendientes_descarga))) as pool:
+            for url_orig, contenido in pool.map(_descargar, pendientes_descarga):
+                descargas[url_orig] = contenido
+
+        for url_orig, _ in pendientes_descarga:
+            contenido = descargas.get(url_orig)
+            if contenido is None:
+                cache_trabajo[url_orig] = None
+                continue
+            emb = extraer_embedding_dinov2_desde_bytes(
+                contenido,
+                model_name=cfg['model_name'],
+                device=cfg['device'],
+            )
+            if emb is not None and cache_bd and id_peticion is not None:
+                _guardar_embedding_bd(url_orig, cfg['model_name'], emb, id_peticion=id_peticion)
+            cache_trabajo[url_orig] = emb
+
+    embeddings: List[List[float]] = []
+    for url in urls_limpias:
+        emb = cache_trabajo.get(url)
         if emb is not None:
             embeddings.append(emb)
     return embeddings

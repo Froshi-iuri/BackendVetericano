@@ -174,6 +174,15 @@ class SeguridadYValidacionVetericanoIATests(unittest.TestCase):
             cfg_override = cargar_configuracion()
         self.assertEqual(cfg_override.host, '0.0.0.0')
         self.assertEqual(cfg_override.port, 8111)
+        self.assertEqual(cfg_override.torch_num_threads, 1)
+
+        with patch.dict(os.environ, {'IA_TORCH_NUM_THREADS': '2'}, clear=True):
+            cfg_t2 = cargar_configuracion()
+        self.assertEqual(cfg_t2.torch_num_threads, 2)
+
+        with patch.dict(os.environ, {'IA_TORCH_NUM_THREADS': '64'}, clear=True):
+            cfg_tmax = cargar_configuracion()
+        self.assertEqual(cfg_tmax.torch_num_threads, 4)
 
     def test_validaciones_imagen_rechaza_corruptas_formato_dimension_y_tamano(self):
         app = create_app(custom_settings=_settings_prueba(max_image_bytes=32768))

@@ -934,10 +934,12 @@ class PostgresAlertasDuplicadosAPITests(VetericanoTransactionTestCase):
         )
 
         # 9. Verificar conservación estricta de peticiones, asignaciones e historias clínicas
+        # (la petición secundaria pasa a estado 'Duplicada' conservando todos sus datos e historial)
         self.p1.refresh_from_db()
         self.p2.refresh_from_db()
         self.assertEqual((self.p1.id_estado_id, self.p1.asignado_a_id, self.p1.asignado_por_id, self.p1.descripcion, self.p1.foto), snap_p1)
-        self.assertEqual((self.p2.id_estado_id, self.p2.asignado_a_id, self.p2.asignado_por_id, self.p2.descripcion, self.p2.foto), snap_p2)
+        self.assertEqual(self.p2.id_estado.nombre, 'Duplicada')
+        self.assertEqual((self.p2.asignado_a_id, self.p2.asignado_por_id, self.p2.descripcion, self.p2.foto), snap_p2[1:])
         self.assertEqual(HistoriaClinica.objects.count(), historias_antes)
         self.assertEqual(Consulta.objects.count(), consultas_antes)
         self.assertEqual(HistorialAsignacionPeticion.objects.count(), hist_asig_antes)
@@ -992,7 +994,8 @@ class PostgresAlertasDuplicadosAPITests(VetericanoTransactionTestCase):
         self.p1.refresh_from_db()
         self.p2.refresh_from_db()
         self.assertEqual((self.p1.id_estado_id, self.p1.asignado_a_id, self.p1.asignado_por_id, self.p1.descripcion, self.p1.foto), snap_p1)
-        self.assertEqual((self.p2.id_estado_id, self.p2.asignado_a_id, self.p2.asignado_por_id, self.p2.descripcion, self.p2.foto), snap_p2)
+        self.assertEqual(self.p2.id_estado.nombre, 'Duplicada')
+        self.assertEqual((self.p2.asignado_a_id, self.p2.asignado_por_id, self.p2.descripcion, self.p2.foto), snap_p2[1:])
 
     def test_resolucion_simultanea_endpoint_en_postgresql(self):
         barrier = threading.Barrier(2)
