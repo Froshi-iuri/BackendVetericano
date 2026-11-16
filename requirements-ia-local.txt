@@ -1,0 +1,10 @@
+# Dependencias opcionales para ejecutar DINOv2 Small localmente dentro de Django.
+# No instalar en el despliegue estándar de Railway (el microservicio VetericanoIA
+# ejecuta la inferencia). Solo necesario si se revierte a DUPLICADOS_DINOV2_BACKEND=local.
+-r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy>=1.26.0
+pgvector>=0.3.0
+torch>=2.2.0
+transformers>=4.40.0

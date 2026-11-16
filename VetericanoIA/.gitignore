@@ -1,0 +1,15 @@
+envs/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.cache/
+.huggingface/
+.env
+.env.*
+!.env.example
+!.env.railway.example
+*.pem
+*.key

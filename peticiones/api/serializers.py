@@ -1565,6 +1565,14 @@ class DetectarDuplicadosRequestSerializer(serializers.Serializer):
         min_value=0,
         max_value=64,
     )
+    umbral_dinov2 = serializers.FloatField(
+        required=False,
+        min_value=0.01,
+        max_value=1.0,
+    )
+    usar_dinov2 = serializers.BooleanField(
+        required=False,
+    )
     dias = serializers.IntegerField(
         required=False,
         min_value=1,

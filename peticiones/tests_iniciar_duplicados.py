@@ -460,6 +460,34 @@ class DetectarYRegistrarAlIniciarServiceTests(SimpleTestCase):
         self.assertEqual(cfg['timeout_ms'], 10000)
         self.assertEqual(cfg['max_candidatos'], 50)
 
+    @override_settings(
+        DUPLICADOS_DETECCION_AUTOMATICA_ACTIVA=True,
+        DUPLICADOS_IA_DINOV2_ACTIVA=True,
+    )
+    @patch('peticiones.services.alertas_duplicados_service.connection')
+    @patch('peticiones.services.alertas_duplicados_service.registrar_alertas_desde_deteccion')
+    @patch('peticiones.services.alertas_duplicados_service.buscar_peticiones_similares_por_descripcion')
+    def test_con_dinov2_activo_pasa_usar_dinov2_false_al_detector_automatico(
+        self, mock_buscar, mock_registrar, mock_conn
+    ):
+        mock_conn.vendor = 'sqlite'
+        mock_buscar.return_value = {
+            'posible_duplicado': True,
+            'posibles_duplicados': [{'id_peticion': 9, 'posible_duplicado': True, 'score_combinado': 0.9}],
+        }
+        pet = _crear_peticion_en_memoria(id_peticion=14)
+
+        with patch('peticiones.services.alertas_duplicados_service.transaction.atomic'):
+            res = detectar_y_registrar_duplicados_al_iniciar(pet)
+
+        self.assertTrue(res.ejecutada)
+        self.assertEqual(res.candidatos_detectados, 1)
+        kwargs = mock_buscar.call_args.kwargs
+        self.assertIs(kwargs['usar_dinov2'], False)
+        self.assertIs(kwargs['incluir_imagenes'], False)
+        self.assertIs(kwargs['incluir_evidencias'], False)
+        mock_registrar.assert_called_once()
+
 
 class DetectarYRegistrarSqliteIntegracionTests(SimpleTestCase):
     """
