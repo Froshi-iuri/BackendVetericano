@@ -15,8 +15,14 @@ from django.db.migrations.questioner import NonInteractiveMigrationQuestioner
 from django.db.migrations.state import ProjectState
 from django.test import SimpleTestCase
 
-from peticiones.models import Peticiones, PeticionPosibleDuplicado
-from users.models import Usuarios
+from peticiones.models import (
+    EstadoPeticiones,
+    Peticiones,
+    PeticionPosibleDuplicado,
+    TipoPeticion,
+    Ubicaciones,
+)
+from users.models import Rol, Sede, Usuarios
 
 
 class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
@@ -35,12 +41,18 @@ class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
             'peticion_origen',
             'estado_revision',
             'peticion_principal',
+            'peticion_duplicada',
             'similitud_texto',
             'coincidencia_texto',
             'distancia_metros',
+            'radio_gps_metros',
+            'porcentaje_proximidad_gps',
             'coincidencia_gps',
             'distancia_hamming',
             'similitud_imagen',
+            'similitud_visual_coseno',
+            'porcentaje_similitud_visual',
+            'metodo_imagen',
             'coincidencia_imagen',
             'score_combinado',
             'criterios_coincidencia',
@@ -67,6 +79,7 @@ class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
                 'peticion_mayor',
                 'peticion_origen',
                 'peticion_principal',
+                'peticion_duplicada',
                 'revisado_por',
             },
         )
@@ -80,12 +93,14 @@ class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
         self.assertIs(fks['peticion_menor'].remote_field.on_delete, models.PROTECT)
         self.assertIs(fks['peticion_mayor'].remote_field.on_delete, models.PROTECT)
         self.assertIs(fks['peticion_principal'].remote_field.on_delete, models.PROTECT)
+        self.assertIs(fks['peticion_duplicada'].remote_field.on_delete, models.PROTECT)
         self.assertIs(fks['peticion_origen'].remote_field.on_delete, models.SET_NULL)
         self.assertIs(fks['revisado_por'].remote_field.on_delete, models.SET_NULL)
 
         self.assertIs(fks['peticion_menor'].remote_field.model, Peticiones)
         self.assertIs(fks['peticion_mayor'].remote_field.model, Peticiones)
         self.assertIs(fks['peticion_principal'].remote_field.model, Peticiones)
+        self.assertIs(fks['peticion_duplicada'].remote_field.model, Peticiones)
         self.assertIs(fks['peticion_origen'].remote_field.model, Peticiones)
         self.assertIs(fks['revisado_por'].remote_field.model, Usuarios)
 
@@ -171,6 +186,25 @@ class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
             ).clean()
         self.assertIn('peticion_origen', ctx_origen.exception.message_dict)
 
+        # Petición duplicada fuera del par o igual a principal
+        with self.assertRaises(ValidationError) as ctx_dup_fuera:
+            PeticionPosibleDuplicado(
+                peticion_menor_id=5,
+                peticion_mayor_id=10,
+                peticion_principal_id=5,
+                peticion_duplicada_id=99,
+            ).clean()
+        self.assertIn('peticion_duplicada', ctx_dup_fuera.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as ctx_dup_misma:
+            PeticionPosibleDuplicado(
+                peticion_menor_id=5,
+                peticion_mayor_id=10,
+                peticion_principal_id=5,
+                peticion_duplicada_id=5,
+            ).clean()
+        self.assertIn('peticion_duplicada', ctx_dup_misma.exception.message_dict)
+
     def test_migracion_0005_integra_solo_nuevo_modelo_y_sin_alterar_tablas_existentes(self):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         loader.graph.ensure_not_cyclic()
@@ -223,6 +257,82 @@ class PeticionPosibleDuplicadoModeloTest(SimpleTestCase):
         self.assertNotIn('ALTER TABLE "peticiones"', sql_completo)
         self.assertNotIn('ALTER TABLE "usuarios"', sql_completo)
         self.assertTrue(mig.operations[0].reversible)
+
+    def test_migracion_0008_solo_amplia_peticionposibleduplicado_sin_tocar_peticiones(self):
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        loader.graph.ensure_not_cyclic()
+
+        mig = loader.get_migration('peticiones', '0008_peticionposibleduplicado_resolucion_dinov2')
+        self.assertEqual(
+            set(mig.dependencies),
+            {('peticiones', '0007_peticionimagenembedding_pgvector')},
+        )
+        for op in mig.operations:
+            self.assertEqual(getattr(op, 'model_name', '').lower(), 'peticionposibleduplicado')
+
+        autodetector = MigrationAutodetector(
+            loader.project_state(),
+            ProjectState.from_apps(apps),
+            NonInteractiveMigrationQuestioner(dry_run=True),
+        )
+        changes = autodetector.changes(graph=loader.graph)
+        pendientes_dup = [
+            (type(op).__name__, getattr(op, 'name', ''))
+            for migs in changes.values()
+            for m in migs
+            for op in m.operations
+            if getattr(op, 'model_name', '').lower() == 'peticionposibleduplicado'
+        ]
+        self.assertEqual(pendientes_dup, [])
+
+        # Compilación DDL en BD SQLite aislada sin tocar ninguna BD real
+        sqlite_settings = {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+            'TIME_ZONE': None,
+            'CONN_MAX_AGE': 0,
+            'CONN_HEALTH_CHECKS': False,
+            'OPTIONS': {},
+            'AUTOCOMMIT': True,
+        }
+        alias_tmp = 'sqlite_aislado_mig_0008'
+        sqlite_conn = SqliteDatabaseWrapper(sqlite_settings, alias=alias_tmp)
+        with sqlite_conn.cursor():
+            pass
+        setattr(connections._connections, alias_tmp, sqlite_conn)
+        try:
+            estado_previo = loader.project_state(('peticiones', '0007_peticionimagenembedding_pgvector'))
+            nuevo_estado = estado_previo.clone()
+            with sqlite_conn.schema_editor(atomic=False) as editor_base:
+                editor_base.create_model(Rol)
+                editor_base.create_model(Sede)
+                editor_base.create_model(TipoPeticion)
+                editor_base.create_model(EstadoPeticiones)
+                editor_base.create_model(Ubicaciones)
+                editor_base.create_model(Usuarios)
+                editor_base.create_model(Peticiones)
+                mig_0005 = loader.get_migration('peticiones', '0005_peticionposibleduplicado')
+                mig_0005.apply(loader.project_state(('peticiones', '0004_renombrar_y_agregar_tests_seguimiento_visita')).clone(), editor_base)
+
+            schema_editor = sqlite_conn.schema_editor(collect_sql=True, atomic=False)
+            with schema_editor:
+                mig.apply(nuevo_estado, schema_editor)
+
+            sql_completo = '\n'.join(schema_editor.collected_sql)
+            self.assertIn('peticion_posible_duplicado', sql_completo)
+            self.assertIn('chk_pet_dup_duplicada_par', sql_completo)
+            self.assertIn('chk_pet_dup_principal_distinta_duplicada', sql_completo)
+            self.assertIn('idx_pet_dup_duplicada_est', sql_completo)
+            self.assertNotIn('ALTER TABLE "peticiones"', sql_completo)
+            self.assertNotIn('DROP TABLE "peticiones"', sql_completo)
+            self.assertNotIn('DROP TABLE "evidencia_peticiones"', sql_completo)
+            self.assertNotIn('DELETE ', sql_completo.upper())
+        finally:
+            try:
+                sqlite_conn.close()
+            finally:
+                if hasattr(connections._connections, alias_tmp):
+                    delattr(connections._connections, alias_tmp)
 
 
 class PeticionPosibleDuplicadoRestriccionesSQLTest(SimpleTestCase):

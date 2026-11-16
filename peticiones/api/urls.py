@@ -20,6 +20,7 @@ from .views import (
     AlertasDuplicadosListView,
     AlertaDuplicadoDetailView,
     ResolverAlertaDuplicadoView,
+    CompararVisualAlertaDuplicadoView,
     PeticionAlertasDuplicadosView,
 )
 from .duplicados_ciudadano import DetectarDuplicadosCiudadanoView
@@ -38,6 +39,7 @@ urlpatterns = [
     path('duplicados/alertas/', AlertasDuplicadosListView.as_view(), name='alertas-duplicados-listar'),
     path('duplicados/alertas/<int:id_alerta>/', AlertaDuplicadoDetailView.as_view(), name='alerta-duplicado-detalle'),
     path('duplicados/alertas/<int:id_alerta>/resolver/', ResolverAlertaDuplicadoView.as_view(), name='alerta-duplicado-resolver'),
+    path('duplicados/alertas/<int:id_alerta>/comparar-visual/', CompararVisualAlertaDuplicadoView.as_view(), name='alerta-duplicado-comparar-visual'),
     path('perfil/', PerfilUsuarioView.as_view(), name='perfil-usuario'),
 
     # Dashboard consolidado del rol Jurídico (Requerimiento 1)

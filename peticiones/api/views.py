@@ -2,15 +2,18 @@ import unicodedata
 import logging
 from datetime import timedelta
 from django.db import transaction
-from django.db.models import Count, Q, F, Sum
+from django.db.models import Count, Exists, OuterRef, Q, F, Sum
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.renderers import JSONRenderer
+from rest_framework.negotiation import DefaultContentNegotiation
+from rest_framework.exceptions import NotAcceptable
 from peticiones.models import (
     TipoPeticion, Peticiones, EstadoPeticiones, SeguimientoPeticionesVisita,
-    HistorialAsignacionPeticion, NotificacionJuridico
+    HistorialAsignacionPeticion, NotificacionJuridico, PeticionPosibleDuplicado,
 )
 from clinica.models import Consulta
 from users.models import Usuarios
@@ -25,7 +28,10 @@ from .serializers import (
     HistorialAsignacionPeticionSerializer, NotificacionJuridicoSerializer,
 )
 from peticiones.utils import obtener_fotos_acta_con_fallback, obtener_multimedia_acta
-from peticiones.services.alertas_duplicados_service import detectar_y_registrar_duplicados_al_iniciar
+from peticiones.services.alertas_duplicados_service import (
+    detectar_y_registrar_duplicados_al_iniciar,
+    es_peticion_duplicada,
+)
 from inventario.api.kit_views import KitErrorHandlingMixin
 
 logger = logging.getLogger(__name__)
@@ -370,6 +376,21 @@ class ListarSeguimientosPorPeticionView(ListarSeguimientoPeticionesVisitaView):
         return queryset.filter(id_peticion_id=id_pet)
 
 
+def _es_instancia_peticion_duplicada(peticion) -> bool:
+    """Evalúa de forma segura (en BD o mock) si la petición está marcada como duplicada."""
+    estado_obj = getattr(peticion, 'id_estado', None)
+    nombre_estado = _normalizar_texto(getattr(estado_obj, 'nombre', None))
+    if nombre_estado in ('duplicada', 'duplicado'):
+        return True
+    if (
+        isinstance(peticion, Peticiones)
+        and getattr(getattr(peticion, '_state', None), 'db', None)
+        and getattr(peticion, 'pk', None) is not None
+    ):
+        return es_peticion_duplicada(peticion)
+    return False
+
+
 class AsignarPeticionView(generics.UpdateAPIView):
     """
     PATCH /api/peticiones/<id_peticion>/asignar/
@@ -387,6 +408,16 @@ class AsignarPeticionView(generics.UpdateAPIView):
     def update(self, request, *args, **kwargs):
         kwargs['partial'] = True
         peticion = self.get_object()
+
+        if _es_instancia_peticion_duplicada(peticion):
+            return Response(
+                {
+                    'error': 'No se puede asignar ni reasignar un veterinario a una petición marcada como duplicada.',
+                    'codigo': 'PETICION_DUPLICADA',
+                    'id_peticion': getattr(peticion, 'id_peticion', None),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         # Obtenemos el ID del veterinario a asignar
         asignado_a_id = request.data.get('asignado_a')
@@ -1071,8 +1102,22 @@ _orig_listar_peticiones_get_qs = ListarPeticionesView.get_queryset
 def _juridico_listar_peticiones_get_queryset(self):
     qs = _orig_listar_peticiones_get_qs(self).select_related('asignado_por').prefetch_related('historial_cambios')
     params = self.request.query_params
+    rol_id = getattr(self.request.user, 'id_rol_id', None)
+
+    duplicadas_subq = PeticionPosibleDuplicado.objects.filter(
+        estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+        peticion_duplicada_id=OuterRef('pk'),
+    )
+    qs = qs.annotate(_es_duplicada_confirmada=Exists(duplicadas_subq))
 
     estado = params.get('estado')
+    incluir_duplicadas = str(params.get('incluir_duplicadas', '')).strip().lower() in ('true', '1', 'si')
+    solicita_estado_duplicada = bool(estado and normalizar_texto_juridico(estado) in ('duplicada', 'duplicado'))
+
+    if not (rol_id in (1, 2) and (incluir_duplicadas or solicita_estado_duplicada)):
+        if rol_id != 4:
+            qs = qs.exclude(Q(id_estado__nombre__iexact='Duplicada') | Q(_es_duplicada_confirmada=True))
+
     if estado:
         qs = qs.filter(id_estado__nombre__iexact=estado.strip())
 
@@ -1085,7 +1130,7 @@ def _juridico_listar_peticiones_get_queryset(self):
         qs = qs.filter(prioridad__iexact=prioridad.strip())
 
     asignado_a = params.get('asignado_a')
-    if asignado_a and getattr(self.request.user, 'id_rol_id', None) in (1, 2):
+    if asignado_a and rol_id in (1, 2):
         qs = qs.filter(asignado_a_id=asignado_a)
 
     id_tipo = params.get('id_tipo')
@@ -1258,6 +1303,16 @@ def _juridico_asignar_peticion_update(self, request, *args, **kwargs):
     peticion = self.get_object()
     es_modelo_real = isinstance(peticion, Peticiones)
 
+    if _es_instancia_peticion_duplicada(peticion):
+        return Response(
+            {
+                'error': 'No se puede asignar ni reasignar un veterinario a una petición marcada como duplicada.',
+                'codigo': 'PETICION_DUPLICADA',
+                'id_peticion': getattr(peticion, 'id_peticion', None),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     veterinario_anterior = getattr(peticion, 'asignado_a', None)
     estado_anterior = getattr(peticion, 'id_estado', None)
     es_reasignacion = veterinario_anterior is not None
@@ -1353,6 +1408,15 @@ def _juridico_actualizar_estado_patch(self, request, id_peticion):
         .filter(pk=id_peticion)
         .first()
     )
+    if peticion_prev and _es_instancia_peticion_duplicada(peticion_prev):
+        return Response(
+            {
+                'error': 'No se puede cambiar el estado operativo de una petición marcada como duplicada.',
+                'codigo': 'PETICION_DUPLICADA',
+                'id_peticion': getattr(peticion_prev, 'id_peticion', None),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
     estado_anterior = peticion_prev.id_estado if peticion_prev else None
     vet_anterior = peticion_prev.asignado_a if peticion_prev else None
 
@@ -1688,10 +1752,12 @@ from peticiones.api.serializers import (
 )
 from peticiones.services.alertas_duplicados_service import (
     AlertaNoEncontradaError,
+    Dinov2NoDisponibleParaAlertaError,
     ParDuplicadoInvalidoError,
     SeleccionPrincipalInvalidaError,
     TransicionAlertaInvalidaError,
     UsuarioRevisionInvalidoError,
+    calcular_comparacion_visual_dinov2_alerta,
     confirmar_duplicado,
     descartar_duplicado,
     listar_alertas_duplicados,
@@ -1810,6 +1876,7 @@ def _optimizar_queryset_alertas(queryset):
                 'peticion_mayor__asignado_por',
                 'peticion_origen',
                 'peticion_principal',
+                'peticion_duplicada',
                 'revisado_por',
             ).prefetch_related(
                 'peticion_menor__evidenciapeticiones_set',
@@ -2009,6 +2076,214 @@ class ResolverAlertaDuplicadoView(APIView):
                 'cambiada': resultado.cambiada,
                 'estado_anterior': resultado.estado_anterior,
                 'estado_nuevo': resultado.estado_nuevo,
+                'peticion_original_id': alerta_data.get('peticion_principal_id'),
+                'peticion_duplicada_id': alerta_data.get('peticion_duplicada_id'),
+                'historial_ids': list(resultado.historial_ids),
+                'alerta': alerta_data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+def _respuesta_error_comparacion_visual(
+    *,
+    codigo: str,
+    mensaje: str,
+    http_status: int,
+    motivo: str | None = None,
+    distancia_gps_metros: float | None = None,
+) -> Response:
+    """Construye una respuesta JSON uniforme para errores en comparación visual DINOv2."""
+    return Response(
+        {
+            'comparado': False,
+            'dinov2_calculada': False,
+            'visual_calculada': False,
+            'codigo': codigo,
+            'motivo': motivo,
+            'error': mensaje,
+            'mensaje': mensaje,
+            'similitud_imagen_porcentaje': None,
+            'porcentaje_similitud_visual': None,
+            'similitud_imagen': None,
+            'similitud_visual_coseno': None,
+            'coincidencia_imagen': False,
+            'metodo_imagen': None,
+            'distancia_gps_metros': distancia_gps_metros,
+            'alerta_modificada': False,
+        },
+        status=http_status,
+    )
+
+
+class _SoloJsonContentNegotiation(DefaultContentNegotiation):
+    """Fuerza respuestas JSON incluso si el cliente envía Accept: text/html."""
+
+    def select_renderer(self, request, renderers, format_suffix=None):
+        try:
+            return super().select_renderer(request, renderers, format_suffix)
+        except NotAcceptable:
+            renderer = renderers[0]
+            return renderer, renderer.media_type
+
+
+class CompararVisualAlertaDuplicadoView(APIView):
+    """
+    POST /api/peticiones/duplicados/alertas/<id_alerta>/comparar-visual/
+    Calcula bajo demanda la similitud visual real con DINOv2 Small para las
+    fotografías disponibles de ambas peticiones de una alerta, reutilizando
+    embeddings cacheados cuando existan. No modifica ni resuelve la alerta.
+    Exclusivo para roles Administrador (1) y Jurídico (2).
+    """
+
+    permission_classes = [IsAuthenticated, IsJuridicoOrAdmin]
+    renderer_classes = [JSONRenderer]
+    content_negotiation_class = _SoloJsonContentNegotiation
+
+    @swagger_auto_schema(
+        operation_description=(
+            "Calcula la similitud visual real con DINOv2 Small entre las fotografías "
+            "de ambas peticiones de la alerta sin modificar ni resolver la alerta."
+        ),
+        responses={
+            200: PeticionPosibleDuplicadoDetailSerializer(),
+            401: "No autenticado",
+            403: "Permiso denegado (solo Administrador o Jurídico)",
+            404: "Alerta no encontrada",
+            422: "Faltan fotografías válidas o imágenes no procesables para DINOv2",
+            503: "Servicio DINOv2 (VetericanoIA) no disponible",
+        },
+    )
+    def post(self, request, id_alerta):
+        try:
+            resultado = calcular_comparacion_visual_dinov2_alerta(
+                id_alerta,
+                usuario=request.user,
+            )
+        except AlertaNoEncontradaError:
+            return _respuesta_error_comparacion_visual(
+                codigo='ALERTA_NO_ENCONTRADA',
+                mensaje=f"La alerta de duplicado #{id_alerta} no fue encontrada.",
+                http_status=status.HTTP_404_NOT_FOUND,
+            )
+        except UsuarioRevisionInvalidoError as exc:
+            return _respuesta_error_comparacion_visual(
+                codigo='PERMISO_DENEGADO',
+                mensaje=str(exc),
+                http_status=status.HTTP_403_FORBIDDEN,
+            )
+        except Dinov2NoDisponibleParaAlertaError as exc:
+            return _respuesta_error_comparacion_visual(
+                codigo=getattr(exc, 'codigo', 'DINOV2_NO_DISPONIBLE'),
+                motivo='DINOV2_NO_DISPONIBLE',
+                mensaje=str(exc),
+                http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                distancia_gps_metros=getattr(exc, 'distancia_gps_metros', None),
+            )
+        except (ParDuplicadoInvalidoError, ValueError) as exc:
+            return _respuesta_error_comparacion_visual(
+                codigo='SOLICITUD_INVALIDA',
+                mensaje=str(exc),
+                http_status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            logger.exception(
+                "Error inesperado en CompararVisualAlertaDuplicadoView para alerta=%s",
+                id_alerta,
+            )
+            return _respuesta_error_comparacion_visual(
+                codigo='ERROR_COMPARACION_VISUAL',
+                mensaje="Error interno inesperado al calcular la comparación visual con DINOv2.",
+                http_status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        alerta = _enriquecer_alerta_para_detalle(resultado['alerta'])
+        alerta_data = PeticionPosibleDuplicadoDetailSerializer(alerta).data
+        metricas_alerta = (alerta_data.get('comparacion') or {}).get('metricas') or {}
+        comparacion_ok = bool(resultado.get('comparado'))
+
+        distancia_gps = resultado.get('distancia_gps_metros')
+        if distancia_gps is None:
+            distancia_gps = metricas_alerta.get('distancia_metros')
+
+        radio_gps = resultado.get('radio_gps_metros')
+        if radio_gps is None:
+            radio_gps = metricas_alerta.get('radio_gps_metros')
+
+        porcentaje_gps = resultado.get('porcentaje_proximidad_gps')
+        if porcentaje_gps is None:
+            porcentaje_gps = metricas_alerta.get('porcentaje_proximidad_gps')
+
+        if not comparacion_ok:
+            mensaje = resultado.get('mensaje') or (
+                "No fue posible calcular la similitud visual DINOv2 con las fotografías disponibles."
+            )
+            return Response(
+                {
+                    'id_alerta': resultado.get('id_alerta', alerta_data.get('id_alerta')),
+                    'comparado': False,
+                    'dinov2_calculada': False,
+                    'visual_calculada': False,
+                    'codigo': resultado.get('codigo') or resultado.get('motivo') or 'NO_COMPARABLE',
+                    'motivo': resultado.get('motivo'),
+                    'error': mensaje,
+                    'mensaje': mensaje,
+                    'similitud_imagen_porcentaje': None,
+                    'porcentaje_similitud_visual': None,
+                    'similitud_imagen': None,
+                    'similitud_visual_coseno': None,
+                    'coincidencia_imagen': False,
+                    'metodo_imagen': None,
+                    'distancia_gps_metros': distancia_gps,
+                    'radio_gps_metros': radio_gps,
+                    'porcentaje_proximidad_gps': porcentaje_gps,
+                    'peticiones_sin_fotos': resultado.get('peticiones_sin_fotos', []),
+                    'estado_revision': resultado.get('estado_revision', alerta_data.get('estado_revision')),
+                    'alerta_modificada': False,
+                    'alerta': alerta_data,
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        similitud_pct = resultado.get('similitud_imagen_porcentaje')
+        if similitud_pct is None:
+            similitud_pct = metricas_alerta.get('porcentaje_similitud_visual')
+
+        similitud_img = resultado.get('similitud_imagen')
+        if similitud_img is None:
+            similitud_img = metricas_alerta.get('similitud_imagen')
+
+        similitud_cos = resultado.get('similitud_visual_coseno')
+        if similitud_cos is None:
+            similitud_cos = metricas_alerta.get('similitud_visual_coseno')
+
+        metodo_img = resultado.get('metodo_imagen') or metricas_alerta.get('metodo_imagen')
+        coincidencia_img = (
+            bool(resultado['coincidencia_imagen'])
+            if 'coincidencia_imagen' in resultado
+            else bool(metricas_alerta.get('coincidencia_imagen'))
+        )
+
+        return Response(
+            {
+                'id_alerta': resultado.get('id_alerta', alerta_data.get('id_alerta')),
+                'comparado': True,
+                'dinov2_calculada': True,
+                'visual_calculada': True,
+                'codigo': resultado.get('codigo') or 'OK',
+                'motivo': resultado.get('motivo'),
+                'mensaje': resultado.get('mensaje'),
+                'similitud_imagen_porcentaje': similitud_pct,
+                'porcentaje_similitud_visual': similitud_pct,
+                'similitud_imagen': similitud_img,
+                'similitud_visual_coseno': similitud_cos,
+                'coincidencia_imagen': coincidencia_img,
+                'metodo_imagen': metodo_img,
+                'distancia_gps_metros': distancia_gps,
+                'radio_gps_metros': radio_gps,
+                'porcentaje_proximidad_gps': porcentaje_gps,
+                'estado_revision': resultado.get('estado_revision', alerta_data.get('estado_revision')),
+                'alerta_modificada': False,
                 'alerta': alerta_data,
             },
             status=status.HTTP_200_OK,
