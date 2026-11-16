@@ -1637,6 +1637,11 @@ class DetectarDuplicadosPeticionView(generics.GenericAPIView):
         descripcion = datos['descripcion'] if 'descripcion' in datos else None
         coordenadas_proporcionadas = 'latitud' in datos or 'longitud' in datos
         fotos_proporcionadas = 'foto' in datos or 'fotos' in datos
+        extra_dinov2 = {}
+        if 'umbral_dinov2' in datos:
+            extra_dinov2['umbral_dinov2'] = datos['umbral_dinov2']
+        if 'usar_dinov2' in datos:
+            extra_dinov2['usar_dinov2'] = datos['usar_dinov2']
         try:
             resultado = detectar_duplicados_desde_solicitud(
                 descripcion=descripcion,
@@ -1653,6 +1658,7 @@ class DetectarDuplicadosPeticionView(generics.GenericAPIView):
                 umbral_hamming=datos.get('umbral_hamming'),
                 dias=datos.get('dias'),
                 limite=datos.get('limite'),
+                **extra_dinov2,
             )
         except PeticionNoEncontradaError:
             return Response(

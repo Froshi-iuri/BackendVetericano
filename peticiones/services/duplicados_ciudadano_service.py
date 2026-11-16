@@ -14,6 +14,11 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 
+from peticiones.services.dinov2_service import (
+    ADVERTENCIA_METRICA_VISUAL_DEFAULT,
+    TIPO_METRICA_VISUAL,
+    es_dinov2_activo,
+)
 from peticiones.services.duplicados_service import detectar_duplicados_desde_solicitud
 from peticiones.services.foto_autorizada_service import obtener_urls_autorizadas
 from peticiones.services.imagen_hash_service import (
@@ -176,6 +181,22 @@ def _clasificar_similitud(coincidencia_texto: bool, similitud_texto: Any) -> str
     return 'alta' if similitud >= UMBRAL_SIMILITUD_ALTA else 'media'
 
 
+def _clasificar_similitud_visual(porcentaje: Any) -> str:
+    if porcentaje is None or isinstance(porcentaje, bool):
+        return 'no_disponible'
+    try:
+        valor = float(porcentaje)
+    except (TypeError, ValueError):
+        return 'no_disponible'
+    if not math.isfinite(valor):
+        return 'no_disponible'
+    if valor >= 75.0:
+        return 'alta'
+    if valor >= 45.0:
+        return 'media'
+    return 'baja'
+
+
 def _normalizar_id_peticion(valor: Any) -> Optional[int]:
     if valor is None or isinstance(valor, bool):
         return None
@@ -192,6 +213,7 @@ def _mapear_candidato_ciudadano(
     foto_activa: bool,
     dominios_permitidos: Sequence[str],
     urls_autorizadas: Optional[AbstractSet[str]] = None,
+    incluir_visual_dinov2: bool = False,
 ) -> Dict[str, Any]:
     coincidencia_texto = bool(candidato.get('coincidencia_texto', False))
     coincidencia_gps = bool(candidato.get('coincidencia_gps', False))
@@ -205,7 +227,7 @@ def _mapear_candidato_ciudadano(
         else None
     )
 
-    return {
+    resultado: Dict[str, Any] = {
         'coincidencia_texto': coincidencia_texto,
         'coincidencia_gps': coincidencia_gps,
         'cercania': _clasificar_cercania(coincidencia_gps, candidato.get('distancia_metros')),
@@ -214,35 +236,83 @@ def _mapear_candidato_ciudadano(
         'tiene_fotografia': foto is not None,
     }
 
+    if incluir_visual_dinov2:
+        porcentaje_raw = candidato.get('porcentaje_similitud_visual')
+        if porcentaje_raw is None and candidato.get('similitud_imagen') is not None:
+            try:
+                porcentaje_raw = round(float(candidato['similitud_imagen']) * 100.0, 2)
+            except (TypeError, ValueError):
+                porcentaje_raw = None
+        resultado.update({
+            'coincidencia_imagen': bool(candidato.get('coincidencia_imagen', False)),
+            'porcentaje_similitud_visual': (
+                round(float(porcentaje_raw), 2)
+                if porcentaje_raw is not None and not isinstance(porcentaje_raw, bool)
+                else None
+            ),
+            'similitud_visual': _clasificar_similitud_visual(porcentaje_raw),
+            'metodo_imagen': candidato.get('metodo_imagen'),
+            'es_certeza_identidad': False,
+            'tipo_metrica_visual': candidato.get('tipo_metrica_visual') or TIPO_METRICA_VISUAL,
+            'advertencia_metrica_visual': (
+                candidato.get('advertencia_metrica_visual') or ADVERTENCIA_METRICA_VISUAL_DEFAULT
+            ),
+        })
+
+    return resultado
+
 
 def detectar_duplicados_ciudadano(
     *,
-    descripcion: str,
-    latitud: float,
-    longitud: float,
+    descripcion: Optional[str] = '',
+    latitud: Optional[float] = None,
+    longitud: Optional[float] = None,
+    foto: Optional[str] = None,
+    fotos: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
     Ejecuta la detección de duplicados para el flujo ciudadano con parámetros
     controlados por el servidor y respuesta anonimizada por lista blanca.
     """
     foto_activa = bool(getattr(settings, 'DUPLICADOS_CIUDADANO_FOTO_ACTIVA', True))
+    dinov2_activo = es_dinov2_activo()
 
-    resultado_interno = detectar_duplicados_desde_solicitud(
-        descripcion=descripcion,
-        latitud=latitud,
-        longitud=longitud,
-        coordenadas_proporcionadas=True,
-        limite=MAX_CANDIDATOS_CIUDADANO,
-        incluir_imagenes=False,
-        incluir_evidencias=foto_activa,
-    )
+    if dinov2_activo:
+        coords_ok = latitud is not None and longitud is not None
+        resultado_interno = detectar_duplicados_desde_solicitud(
+            descripcion=descripcion,
+            latitud=latitud,
+            longitud=longitud,
+            coordenadas_proporcionadas=coords_ok,
+            foto=foto,
+            fotos=fotos,
+            fotos_proporcionadas=bool(foto or fotos),
+            limite=MAX_CANDIDATOS_CIUDADANO,
+            incluir_imagenes=True,
+            incluir_evidencias=foto_activa,
+            usar_dinov2=True,
+        )
+    else:
+        resultado_interno = detectar_duplicados_desde_solicitud(
+            descripcion=descripcion,
+            latitud=latitud,
+            longitud=longitud,
+            coordenadas_proporcionadas=True,
+            limite=MAX_CANDIDATOS_CIUDADANO,
+            incluir_imagenes=False,
+            incluir_evidencias=foto_activa,
+        )
 
     candidatos_crudos = (resultado_interno or {}).get('posibles_duplicados') or []
     candidatos_limitados = [
         candidato
-        for candidato in list(candidatos_crudos)[:MAX_CANDIDATOS_CIUDADANO]
+        for candidato in list(candidatos_crudos)
         if isinstance(candidato, Mapping)
-    ]
+        and (
+            not dinov2_activo
+            or (bool(candidato.get('coincidencia_imagen')) and bool(candidato.get('coincidencia_gps')))
+        )
+    ][:MAX_CANDIDATOS_CIUDADANO]
 
     dominios_permitidos: Sequence[str] = ()
     urls_autorizadas_por_peticion: Dict[int, Set[str]] = {}
@@ -271,15 +341,40 @@ def detectar_duplicados_ciudadano(
             urls_autorizadas=urls_autorizadas_por_peticion.get(
                 _normalizar_id_peticion(candidato.get('id_peticion'))
             ),
+            incluir_visual_dinov2=dinov2_activo,
         )
         for candidato in candidatos_limitados
     ]
-    posibles_duplicados = sorted(
-        posibles_duplicados,
-        key=lambda c: not c['tiene_fotografia'],
-    )
+    if dinov2_activo:
+        posibles_duplicados = sorted(
+            posibles_duplicados,
+            key=lambda c: (
+                not c.get('coincidencia_imagen', False),
+                not c.get('coincidencia_gps', False),
+                -(
+                    float(c['porcentaje_similitud_visual'])
+                    if c.get('porcentaje_similitud_visual') is not None
+                    else -1.0
+                ),
+                not c['tiene_fotografia'],
+            ),
+        )
+    else:
+        posibles_duplicados = sorted(
+            posibles_duplicados,
+            key=lambda c: not c['tiene_fotografia'],
+        )
 
     hay_duplicados = len(posibles_duplicados) > 0
+    logger.info(
+        "Detector ciudadano duplicados: dinov2=%s gps=%s fotos_req=%d crudos=%d filtrados=%d autorizadas=%d",
+        dinov2_activo,
+        latitud is not None and longitud is not None,
+        int(bool(foto)) + len(fotos or ()),
+        len(candidatos_crudos),
+        len(posibles_duplicados),
+        sum(1 for c in posibles_duplicados if c.get('tiene_fotografia')),
+    )
     return {
         'advertencia_duplicado': hay_duplicados,
         'posible_duplicado': hay_duplicados,

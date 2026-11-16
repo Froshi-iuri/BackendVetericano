@@ -27,7 +27,7 @@ from peticiones.utils import detectar_tipo_archivo
 logger = logging.getLogger(__name__)
 
 UMBRAL_HAMMING_DEFAULT = 10
-TIMEOUT_IMAGEN_DEFAULT = 2.5
+TIMEOUT_IMAGEN_DEFAULT = 5.0
 MAX_BYTES_IMAGEN_DEFAULT = 2 * 1024 * 1024  # 2 MB
 MAX_IMAGENES_POR_PETICION_DEFAULT = 3
 MAX_CANDIDATOS_IMAGEN_DEFAULT = 10
@@ -37,6 +37,8 @@ MAX_REDIRECTS_PERMITIDOS = 2
 MAX_PIXELES_IMAGEN = 16_000_000  # ~4000x4000 px para mitigar bombas de descompresión
 CHUNK_SIZE_DESCARGA = 16384
 MAX_LARGO_URL = 2048
+FORMATOS_IMAGEN_SOPORTADOS = ('JPEG', 'PNG', 'WEBP', 'MPO')
+MIN_DIMENSION_IMAGEN = 16
 
 
 def obtener_config_imagen_hash() -> Dict[str, Any]:
@@ -201,10 +203,15 @@ def validar_url_cloudinary_segura(
     return url_limpia
 
 
-def construir_url_miniatura_cloudinary(url_segura: str) -> str:
+def construir_url_inferencia_cloudinary(
+    url_segura: str,
+    *,
+    ancho: int = 256,
+    alto: int = 256,
+) -> str:
     """
-    Construye una URL de entrega liviana de Cloudinary (on-the-fly) sin modificar
-    la imagen original almacenada en Cloudinary.
+    Construye una URL de entrega liviana de Cloudinary (on-the-fly) con dimensiones
+    configurables sin modificar ni reescribir el recurso original en Cloudinary.
     """
     marcador = '/image/upload/'
     if marcador not in url_segura:
@@ -221,7 +228,17 @@ def construir_url_miniatura_cloudinary(url_segura: str) -> str:
     ):
         return url_segura
 
-    return f"{prefijo}{marcador}w_128,h_128,c_limit,f_jpg/{sufijo}"
+    ancho_seguro = max(32, min(1024, int(ancho)))
+    alto_seguro = max(32, min(1024, int(alto)))
+    return f"{prefijo}{marcador}w_{ancho_seguro},h_{alto_seguro},c_limit,f_jpg/{sufijo}"
+
+
+def construir_url_miniatura_cloudinary(url_segura: str) -> str:
+    """
+    Construye una URL de miniatura liviana (128x128) de Cloudinary sin modificar
+    la imagen original almacenada en Cloudinary.
+    """
+    return construir_url_inferencia_cloudinary(url_segura, ancho=128, alto=128)
 
 
 def _descargar_bytes_url_validada(
@@ -315,6 +332,8 @@ def descargar_imagen_segura(
     dominios_permitidos: Optional[Sequence[str]] = None,
     usar_miniatura: bool = True,
     validar_dns: bool = True,
+    miniatura_ancho: Optional[int] = None,
+    miniatura_alto: Optional[int] = None,
 ) -> Optional[bytes]:
     """
     Descarga de forma segura una imagen desde Cloudinary validando HTTPS, dominio,
@@ -330,7 +349,14 @@ def descargar_imagen_segura(
         return None
 
     if usar_miniatura:
-        url_miniatura = construir_url_miniatura_cloudinary(url_segura)
+        if miniatura_ancho is not None or miniatura_alto is not None:
+            url_miniatura = construir_url_inferencia_cloudinary(
+                url_segura,
+                ancho=miniatura_ancho or 256,
+                alto=miniatura_alto or 256,
+            )
+        else:
+            url_miniatura = construir_url_miniatura_cloudinary(url_segura)
         if url_miniatura != url_segura:
             contenido = _descargar_bytes_url_validada(
                 url_miniatura,
@@ -349,6 +375,57 @@ def descargar_imagen_segura(
         dominios_permitidos=dominios,
         validar_dns=validar_dns,
     )
+
+
+def decodificar_y_validar_imagen_bytes(
+    contenido: Optional[bytes],
+    *,
+    formatos_permitidos: Sequence[str] = FORMATOS_IMAGEN_SOPORTADOS,
+    max_bytes: Optional[int] = None,
+    dimension_minima: int = MIN_DIMENSION_IMAGEN,
+) -> Optional[Image.Image]:
+    """
+    Decodifica y valida bytes de imagen antes de inferencia visual (tamaño en bytes,
+    formato permitido, dimensiones mínimas y protección contra decompression bombs).
+    Retorna una instancia `PIL.Image.Image` normalizada en RGB o `None` si no es válida.
+    """
+    if not contenido:
+        return None
+
+    cfg = obtener_config_imagen_hash()
+    max_bytes_val = int(max_bytes) if max_bytes is not None else cfg['max_bytes']
+    if len(contenido) > max_bytes_val:
+        logger.warning("Imagen descartada por exceder max_bytes (%d > %d).", len(contenido), max_bytes_val)
+        return None
+
+    formatos_upper = {str(fmt).upper() for fmt in formatos_permitidos if fmt}
+    anterior_max = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = MAX_PIXELES_IMAGEN
+    try:
+        with Image.open(io.BytesIO(contenido)) as img:
+            formato = (img.format or '').upper()
+            if formatos_upper and formato not in formatos_upper:
+                logger.warning("Formato de imagen no soportado para inferencia visual: %s", formato or 'desconocido')
+                return None
+
+            img.load()
+            ancho, alto = img.size
+            if ancho < int(dimension_minima) or alto < int(dimension_minima):
+                logger.warning("Imagen descartada por dimensiones insuficientes (%dx%d).", ancho, alto)
+                return None
+            if (ancho * alto) > MAX_PIXELES_IMAGEN:
+                logger.warning("Imagen descartada por exceder el máximo de píxeles (%dx%d).", ancho, alto)
+                return None
+
+            return ImageOps.exif_transpose(img).convert('RGB')
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        logger.warning("Imagen dañada o no decodificable ignorada: %s", exc)
+        return None
+    except Exception as exc:
+        logger.warning("Error inesperado validando imagen con Pillow: %s", exc)
+        return None
+    finally:
+        Image.MAX_IMAGE_PIXELS = anterior_max
 
 
 def calcular_dhash_desde_imagen(imagen: Image.Image) -> Optional[int]:

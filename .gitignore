@@ -1,16 +1,33 @@
-# Tu entorno virtual (en tu caso la carpeta se llama envs)
+# Entornos virtuales (Django y VetericanoIA)
 envs/
+.venv/
+venv/
+VetericanoIA/envs/
 
 # Base de datos local
 *.sqlite3
 
-# Archivos de caché de Python
+# Archivos de caché de Python, pruebas y modelos locales
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.cache/
+.huggingface/
 
-# Configuración del editor y variables
+# Fotografías locales de prueba
+scripts/fotos_prueba_dinov2/
+
+# Configuración del editor, secretos y variables reales
 .vscode/
 .env
+.env.*
+!.env.example
+!.env.railway.example
+!VetericanoIA/.env.example
+!VetericanoIA/.env.railway.example
+*.pem
+*.key
 
 # Archivos estáticos generados
 staticfiles/

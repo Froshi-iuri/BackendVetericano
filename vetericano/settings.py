@@ -319,3 +319,82 @@ DUPLICADOS_CIUDADANO_FOTO_ACTIVA = _leer_env_bool(
     'DUPLICADOS_CIUDADANO_FOTO_ACTIVA',
     default=True,
 )
+
+
+def _leer_env_float_rango(
+    nombre_var: str,
+    *,
+    default: float,
+    min_val: float,
+    max_val: float,
+) -> float:
+    """Lee un número flotante desde variable de entorno acotado a [min_val, max_val]."""
+    raw = os.environ.get(nombre_var)
+    if raw is None or isinstance(raw, bool):
+        return default
+    texto = str(raw).strip()
+    if not texto:
+        return default
+    try:
+        valor = float(texto)
+    except (TypeError, ValueError):
+        return default
+    if not (min_val <= valor <= max_val):
+        return default
+    return valor
+
+
+# ==============================================================================
+# CONFIGURACIÓN DE IA VISUAL DINOv2 SMALL PARA DETECCIÓN DE DUPLICADOS
+# ==============================================================================
+# Desactivada por defecto hasta validar su funcionamiento e instalar dependencias.
+DUPLICADOS_IA_DINOV2_ACTIVA = _leer_env_bool(
+    'DUPLICADOS_IA_DINOV2_ACTIVA',
+    default=False,
+)
+DUPLICADOS_DINOV2_MODEL_NAME = (
+    os.environ.get('DUPLICADOS_DINOV2_MODEL_NAME', 'facebook/dinov2-small').strip()
+    or 'facebook/dinov2-small'
+)
+DUPLICADOS_UMBRAL_DINOV2 = _leer_env_float_rango(
+    'DUPLICADOS_UMBRAL_DINOV2',
+    default=0.45,
+    min_val=0.01,
+    max_val=1.0,
+)
+DUPLICADOS_RADIO_GPS_METROS = _leer_env_float_rango(
+    'DUPLICADOS_RADIO_GPS_METROS',
+    default=200.0,
+    min_val=1.0,
+    max_val=50000.0,
+)
+DUPLICADOS_DINOV2_DEVICE = (
+    os.environ.get('DUPLICADOS_DINOV2_DEVICE', 'cpu').strip()
+    or 'cpu'
+)
+DUPLICADOS_DINOV2_CACHE_BD_ACTIVA = _leer_env_bool(
+    'DUPLICADOS_DINOV2_CACHE_BD_ACTIVA',
+    default=False,
+)
+DUPLICADOS_DINOV2_FALLBACK_DHASH = _leer_env_bool(
+    'DUPLICADOS_DINOV2_FALLBACK_DHASH',
+    default=True,
+)
+DUPLICADOS_DINOV2_BACKEND = (
+    os.environ.get('DUPLICADOS_DINOV2_BACKEND', 'microservicio').strip().lower()
+    or 'microservicio'
+)
+DUPLICADOS_DINOV2_MICROSERVICIO_URL = os.environ.get(
+    'DUPLICADOS_DINOV2_MICROSERVICIO_URL',
+    'http://127.0.0.1:8001',
+).strip()
+DUPLICADOS_DINOV2_MICROSERVICIO_SECRET = os.environ.get(
+    'DUPLICADOS_DINOV2_MICROSERVICIO_SECRET',
+    '',
+).strip()
+DUPLICADOS_DINOV2_MICROSERVICIO_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'DUPLICADOS_DINOV2_MICROSERVICIO_TIMEOUT_SEGUNDOS',
+    default=8.0,
+    min_val=0.5,
+    max_val=30.0,
+)

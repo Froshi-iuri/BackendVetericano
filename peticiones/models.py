@@ -666,3 +666,58 @@ class PeticionFotoAutorizada(models.Model):
             f"Foto autorizada #{self.id_autorizacion} "
             f"(Petición #{self.id_peticion_id}, {self.version_texto})"
         )
+
+
+class PeticionImagenEmbedding(models.Model):
+    """
+    Almacena caché de embeddings visuales DINOv2 (384 dimensiones, L2-normalizados)
+    y hash perceptual dHash para evitar descargar y reprocesar fotografías antiguas.
+
+    Nota sobre pgvector:
+    El campo `embedding_vector` (JSONField) permite compatibilidad inmediata con
+    PostgreSQL/SQLite sin exigir compilación previa de extensiones. En entornos
+    PostgreSQL con extensión `pgvector` habilitada, la migración 0007 documenta
+    el DDL opcional para agregar columna `vector(384)` e índice HNSW coseno.
+    """
+
+    id_embedding = models.BigAutoField(primary_key=True)
+    peticion = models.ForeignKey(
+        Peticiones,
+        on_delete=models.CASCADE,
+        db_column='id_peticion',
+        related_name='embeddings_imagenes',
+    )
+    url_imagen = models.CharField(max_length=500)
+    modelo_ia = models.CharField(max_length=100, default='facebook/dinov2-small')
+    dimensiones = models.PositiveSmallIntegerField(default=384)
+    embedding_vector = models.JSONField(
+        help_text='Vector L2-normalizado de 384 dimensiones (lista de floats); compatible con pgvector vector(384).'
+    )
+    dhash_64 = models.BigIntegerField(null=True, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = True
+        db_table = 'peticiones_imagen_embedding'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['peticion', 'url_imagen', 'modelo_ia'],
+                name='uq_pet_img_emb_peticion_url_modelo',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['peticion'],
+                name='idx_pet_img_emb_peticion',
+            ),
+            models.Index(
+                fields=['url_imagen'],
+                name='idx_pet_img_emb_url',
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"Embedding #{self.id_embedding} "
+            f"(Petición #{self.peticion_id}, {self.modelo_ia}, {self.dimensiones}d)"
+        )
