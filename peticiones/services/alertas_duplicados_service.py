@@ -1424,6 +1424,7 @@ def detectar_y_registrar_duplicados_al_iniciar(
                 longitud=longitud,
                 excluir_id_peticion=id_peticion_ref,
                 limite=cfg_auto['max_candidatos'],
+                usar_dinov2=False,
                 incluir_imagenes=False,
                 incluir_evidencias=False,
             )

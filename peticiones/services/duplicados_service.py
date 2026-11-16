@@ -24,6 +24,7 @@ from django.db.models.functions import Coalesce, Length, Trim
 from django.utils import timezone
 
 from peticiones.models import Peticiones
+from peticiones.services import dinov2_service
 from peticiones.services.imagen_hash_service import (
     UMBRAL_HAMMING_DEFAULT,
     calcular_hashes_urls,
@@ -97,6 +98,7 @@ def obtener_config_duplicados() -> Dict[str, Any]:
     limite_sql = max(limite, min(limite_sql, MAX_CANDIDATOS_SQL_TOPE))
 
     cfg_img = obtener_config_imagen_hash()
+    cfg_dinov2 = dinov2_service.obtener_config_dinov2()
 
     return {
         'umbral': umbral,
@@ -110,6 +112,10 @@ def obtener_config_duplicados() -> Dict[str, Any]:
         'max_candidatos_imagen': cfg_img['max_candidatos'],
         'imagen_timeout': cfg_img['timeout'],
         'imagen_max_bytes': cfg_img['max_bytes'],
+        'dinov2_activo': cfg_dinov2['ia_activa'],
+        'umbral_dinov2': cfg_dinov2['umbral_dinov2'],
+        'dinov2_model_name': cfg_dinov2['model_name'],
+        'dinov2_fallback_dhash': cfg_dinov2['fallback_dhash'],
     }
 
 
@@ -307,10 +313,12 @@ def _calcular_puntaje_combinado(
     gps_activo: bool,
     similitud_imagen: Optional[float] = None,
     coincidencia_imagen: bool = False,
+    priorizar_visual_gps: bool = False,
 ) -> float:
     """
     Calcula el score combinado [0, 1] entre texto (`pg_trgm`), GPS (`Haversine`)
-    e imagen perceptual (`dHash`), conservando compatibilidad de orden con Fases 1 y 2.
+    e imagen (`DINOv2` o `dHash`). Cuando `priorizar_visual_gps=True`, prioriza imagen y GPS
+    y mantiene la descripción como señal complementaria.
     """
     score_gps = 0.0
     if gps_activo and distancia_metros is not None and radio_metros > 0:
@@ -318,6 +326,30 @@ def _calcular_puntaje_combinado(
             score_gps = max(0.0, min(1.0, 1.0 - (distancia_metros / radio_metros)))
         elif distancia_metros <= radio_metros * 2:
             score_gps = max(0.0, 0.25 * (1.0 - (distancia_metros / (radio_metros * 2))))
+
+    if priorizar_visual_gps:
+        score_txt = max(0.0, min(1.0, float(similitud_texto or 0.0)))
+        if similitud_imagen is not None:
+            score_img = max(0.0, min(1.0, float(similitud_imagen)))
+            if coincidencia_imagen:
+                if coincidencia_gps and gps_activo:
+                    score = (0.65 * score_img) + (0.30 * score_gps) + (0.05 * score_txt)
+                else:
+                    score = (0.90 * score_img) + (0.10 * score_txt)
+                return round(max(0.0, min(1.0, score)), 4)
+
+            if coincidencia_gps and gps_activo:
+                score = (0.55 * score_gps) + (0.35 * score_img) + (0.10 * score_txt)
+            else:
+                score = (0.35 * score_img) + (0.10 * score_txt)
+            return round(max(0.0, min(1.0, score)), 4)
+
+        if coincidencia_gps and gps_activo:
+            score = (0.85 * score_gps) + (0.15 * score_txt)
+            return round(max(0.0, min(1.0, score)), 4)
+        if coincidencia_texto:
+            return round(score_txt, 4)
+        return 0.0
 
     if coincidencia_imagen and similitud_imagen is not None:
         score_img = max(0.0, min(1.0, float(similitud_imagen)))
@@ -353,6 +385,13 @@ def _serializar_candidato(
     similitud_imagen: Optional[float],
     score_combinado: float,
     incluir_evidencias: bool = True,
+    porcentaje_similitud_visual: Optional[float] = None,
+    similitud_visual_coseno: Optional[float] = None,
+    metodo_imagen: Optional[str] = None,
+    es_certeza_identidad: bool = False,
+    tipo_metrica_visual: Optional[str] = None,
+    advertencia_metrica_visual: Optional[str] = None,
+    incluir_meta_dinov2: bool = False,
 ) -> Dict[str, Any]:
     """Construye la representación JSON de una petición candidata a duplicado."""
     similitud_float = max(0.0, min(1.0, float(similitud_texto or 0.0)))
@@ -382,7 +421,7 @@ def _serializar_candidato(
             'longitud': coords_cand[1] if coords_cand else None,
         }
 
-    return {
+    resultado = {
         'id_peticion': peticion.id_peticion,
         'numero_radicado': peticion.numero_radicado,
         'descripcion': peticion.descripcion,
@@ -396,7 +435,11 @@ def _serializar_candidato(
         'coincidencia_imagen': bool(coincidencia_imagen),
         'distancia_hamming': int(distancia_hamming) if distancia_hamming is not None else None,
         'similitud_imagen': round(float(similitud_imagen), 4) if similitud_imagen is not None else None,
-        'posible_duplicado': bool(coincidencia_texto or coincidencia_gps or coincidencia_imagen),
+        'posible_duplicado': (
+            bool(coincidencia_imagen and coincidencia_gps)
+            if incluir_meta_dinov2
+            else bool(coincidencia_texto or coincidencia_gps or coincidencia_imagen)
+        ),
         'criterios_coincidencia': criterios,
         'score_combinado': score_combinado,
         'id_estado': getattr(peticion, 'id_estado_id', None),
@@ -406,6 +449,26 @@ def _serializar_candidato(
         'fotos': fotos_disponibles,
         'tiene_fotografia': bool(foto_principal or fotos_disponibles),
     }
+
+    if incluir_meta_dinov2:
+        resultado.update({
+            'porcentaje_similitud_visual': (
+                round(float(porcentaje_similitud_visual), 2)
+                if porcentaje_similitud_visual is not None
+                else None
+            ),
+            'similitud_visual_coseno': (
+                round(float(similitud_visual_coseno), 4)
+                if similitud_visual_coseno is not None
+                else None
+            ),
+            'metodo_imagen': metodo_imagen,
+            'es_certeza_identidad': bool(es_certeza_identidad),
+            'tipo_metrica_visual': tipo_metrica_visual,
+            'advertencia_metrica_visual': advertencia_metrica_visual,
+        })
+
+    return resultado
 
 
 def _construir_respuesta(
@@ -422,27 +485,229 @@ def _construir_respuesta(
     mensaje: str,
     imagen_activo: bool = False,
     umbral_hamming: int = UMBRAL_HAMMING_DEFAULT,
+    dinov2_activo: Optional[bool] = None,
+    umbral_dinov2: Optional[float] = None,
+    metodo_imagen: Optional[str] = None,
 ) -> Dict[str, Any]:
     hay_duplicados = len(candidatos) > 0
+    parametros: Dict[str, Any] = {
+        'umbral_similitud': umbral,
+        'radio_metros': radio_metros,
+        'dias_ventana': dias,
+        'longitud_minima_descripcion': min_longitud,
+        'limite': limite,
+        'id_peticion_excluido': excluir_id_peticion,
+        'texto_activo': texto_activo,
+        'gps_activo': gps_activo,
+        'imagen_activa': imagen_activo,
+        'umbral_hamming': umbral_hamming,
+    }
+    if dinov2_activo is not None:
+        parametros['dinov2_activo'] = bool(dinov2_activo)
+        parametros['umbral_dinov2'] = umbral_dinov2
+        parametros['metodo_imagen'] = metodo_imagen
+
     return {
         'advertencia_duplicado': hay_duplicados,
         'posible_duplicado': hay_duplicados,
         'total_candidatos': len(candidatos),
         'posibles_duplicados': candidatos,
         'mensaje': mensaje,
-        'parametros': {
-            'umbral_similitud': umbral,
-            'radio_metros': radio_metros,
-            'dias_ventana': dias,
-            'longitud_minima_descripcion': min_longitud,
-            'limite': limite,
-            'id_peticion_excluido': excluir_id_peticion,
-            'texto_activo': texto_activo,
-            'gps_activo': gps_activo,
-            'imagen_activa': imagen_activo,
-            'umbral_hamming': umbral_hamming,
-        },
+        'parametros': parametros,
     }
+
+
+def _comparar_con_dhash(
+    preseleccionados: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+    *,
+    urls_origen: List[str],
+    max_imagenes_pet: int,
+    max_candidatos_img: int,
+    umbral_hamming_val: int,
+) -> bool:
+    """Ejecuta la comparación visual dHash 64-bit sobre candidatos preseleccionados."""
+    hashes_origen: List[int] = []
+    cache_hashes: Dict[str, Optional[int]] = {}
+    try:
+        hashes_origen = calcular_hashes_urls(
+            urls_origen,
+            max_imagenes=max_imagenes_pet,
+            cache=cache_hashes,
+        )
+    except Exception as exc:
+        logger.warning("Comparación visual omitida por error procesando fotos de origen: %s", exc)
+        hashes_origen = []
+
+    if not hashes_origen:
+        return False
+
+    candidatos_img_procesados = 0
+    for _, item in preseleccionados:
+        if candidatos_img_procesados >= max_candidatos_img:
+            break
+
+        pet = item['peticion']
+        _, fotos_cand = extraer_fotografias_peticion(pet)
+        if not fotos_cand:
+            continue
+
+        candidatos_img_procesados += 1
+        try:
+            hashes_cand = calcular_hashes_urls(
+                fotos_cand,
+                max_imagenes=max_imagenes_pet,
+                cache=cache_hashes,
+            )
+            if hashes_cand:
+                comp = comparar_conjuntos_hashes(
+                    hashes_origen,
+                    hashes_cand,
+                    umbral_hamming=umbral_hamming_val,
+                )
+                if comp.get('comparado'):
+                    item['coincidencia_imagen'] = bool(comp['coincidencia_imagen'])
+                    item['distancia_hamming'] = comp['distancia_hamming']
+                    item['similitud_imagen'] = comp['similitud_imagen']
+                    item['metodo_imagen'] = item.get('metodo_imagen') or 'dhash'
+        except Exception as exc:
+            logger.warning(
+                "Fallo controlado comparando fotografías para petición %s: %s",
+                getattr(pet, 'id_peticion', '?'),
+                exc,
+            )
+    return True
+
+
+def _ejecutar_comparacion_visual(
+    preseleccionados: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+    *,
+    urls_origen: List[str],
+    dinov2_habilitado: bool,
+    umbral_dinov2_val: float,
+    umbral_hamming_val: int,
+    max_imagenes_pet: int,
+    max_candidatos_img: int,
+    dinov2_fallback_dhash: bool,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Orquesta la comparación visual de la Fase 3: usa DINOv2 Small cuando está habilitado
+    y recurre automáticamente a dHash 64-bit como respaldo ante fallos del modelo.
+    """
+    if not urls_origen or not preseleccionados:
+        return False, None
+
+    if dinov2_habilitado:
+        cache_embeddings: Dict[str, Optional[List[float]]] = {}
+        try:
+            embeddings_origen = dinov2_service.calcular_embeddings_urls(
+                urls_origen,
+                max_imagenes=max_imagenes_pet,
+                cache=cache_embeddings,
+            )
+        except dinov2_service.ModelDinov2NoDisponibleError as exc:
+            logger.warning("DINOv2 no disponible procesando fotos de origen; usando respaldo dHash=%s: %s", dinov2_fallback_dhash, exc)
+            embeddings_origen = []
+            dinov2_fallo = True
+        except Exception as exc:
+            logger.warning("Fallo inesperado en DINOv2 para fotos de origen; usando respaldo dHash=%s: %s", dinov2_fallback_dhash, exc)
+            embeddings_origen = []
+            dinov2_fallo = True
+        else:
+            dinov2_fallo = False
+
+        if not dinov2_fallo and embeddings_origen:
+            candidatos_img_procesados = 0
+            for _, item in preseleccionados:
+                if candidatos_img_procesados >= max_candidatos_img:
+                    break
+
+                pet = item['peticion']
+                _, fotos_cand = extraer_fotografias_peticion(pet)
+                if not fotos_cand:
+                    logger.debug(
+                        "Candidato petición #%s sin URLs de imagen para comparar con DINOv2.",
+                        getattr(pet, 'id_peticion', '?'),
+                    )
+                    continue
+
+                candidatos_img_procesados += 1
+                try:
+                    emb_cand = dinov2_service.calcular_embeddings_urls(
+                        fotos_cand,
+                        max_imagenes=max_imagenes_pet,
+                        cache=cache_embeddings,
+                        id_peticion=getattr(pet, 'id_peticion', None),
+                    )
+                except dinov2_service.ModelDinov2NoDisponibleError as exc:
+                    logger.warning(
+                        "Fallo de modelo DINOv2 comparando candidato %s; activando respaldo: %s",
+                        getattr(pet, 'id_peticion', '?'),
+                        exc,
+                    )
+                    dinov2_fallo = True
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "Error controlado procesando embeddings DINOv2 de candidato %s: %s",
+                        getattr(pet, 'id_peticion', '?'),
+                        exc,
+                    )
+                    continue
+
+                if emb_cand:
+                    comp = dinov2_service.comparar_conjuntos_embeddings(
+                        embeddings_origen,
+                        emb_cand,
+                        umbral_coseno=umbral_dinov2_val,
+                    )
+                    if comp.get('comparado'):
+                        item['coincidencia_imagen'] = bool(comp['coincidencia_imagen'])
+                        item['similitud_imagen'] = comp['similitud_imagen']
+                        item['porcentaje_similitud_visual'] = comp['porcentaje_similitud_visual']
+                        item['similitud_visual_coseno'] = comp['similitud_coseno']
+                        item['metodo_imagen'] = 'dinov2_small'
+                        item['es_certeza_identidad'] = False
+                        item['tipo_metrica_visual'] = comp['tipo_metrica_visual']
+                        item['advertencia_metrica_visual'] = comp['advertencia_metrica_visual']
+                else:
+                    logger.warning(
+                        "No se obtuvieron embeddings DINOv2 válidos para candidato #%s.",
+                        getattr(pet, 'id_peticion', '?'),
+                    )
+
+            logger.info(
+                "Comparación visual DINOv2 finalizada: origen_embs=%d, preseleccionados=%d, procesados=%d.",
+                len(embeddings_origen),
+                len(preseleccionados),
+                candidatos_img_procesados,
+            )
+            if not dinov2_fallo:
+                return True, 'dinov2_small'
+
+        if not dinov2_fallo:
+            return False, None
+        if not dinov2_fallback_dhash:
+            return False, None
+
+        for _, item in preseleccionados:
+            item['metodo_imagen'] = 'dhash_fallback'
+        dhash_ok = _comparar_con_dhash(
+            preseleccionados,
+            urls_origen=urls_origen,
+            max_imagenes_pet=max_imagenes_pet,
+            max_candidatos_img=max_candidatos_img,
+            umbral_hamming_val=umbral_hamming_val,
+        )
+        return dhash_ok, ('dhash_fallback' if dhash_ok else None)
+
+    dhash_ok = _comparar_con_dhash(
+        preseleccionados,
+        urls_origen=urls_origen,
+        max_imagenes_pet=max_imagenes_pet,
+        max_candidatos_img=max_candidatos_img,
+        umbral_hamming_val=umbral_hamming_val,
+    )
+    return dhash_ok, ('dhash' if dhash_ok else None)
 
 
 def buscar_peticiones_similares_por_descripcion(
@@ -456,6 +721,8 @@ def buscar_peticiones_similares_por_descripcion(
     umbral: Optional[float] = None,
     radio_metros: Optional[float] = None,
     umbral_hamming: Optional[int] = None,
+    umbral_dinov2: Optional[float] = None,
+    usar_dinov2: Optional[bool] = None,
     dias: Optional[int] = None,
     min_longitud: Optional[int] = None,
     limite: Optional[int] = None,
@@ -467,16 +734,22 @@ def buscar_peticiones_similares_por_descripcion(
     1. Similitud textual (`pg_trgm` `similarity()`, umbral configurable default `0.35`).
     2. Proximidad GPS sobre `Ubicaciones` (prefiltro *bounding box* + Haversine en metros,
        radio configurable default `200` m).
-    3. Comparación visual perceptual dHash 64-bit (`imagen_hash_service`, umbral configurable
-       default `10` bits Hamming) ejecutada exclusivamente sobre candidatos preseleccionados
-       cuando `incluir_imagenes=True`.
+    3. Comparación visual mediante DINOv2 Small (cuando está habilitado) o perceptual dHash
+       64-bit como predeterminado/respaldo sobre fotografías Cloudinary.
 
-    - Ignora descripciones vacías o cortas, manteniendo activa la búsqueda GPS si hay coordenadas.
-    - Ignora coordenadas nulas, inválidas o `(0,0)`, manteniendo activa la búsqueda textual.
-    - Si falla o falta una fotografía, las fases de texto y GPS continúan operando normalmente.
-    - Con `incluir_imagenes=False` omite por completo las descargas y comparaciones dHash.
+    - Cuando DINOv2 está activo, prioriza coincidencia visual e inmediación GPS, manteniendo
+      la descripción como señal complementaria y permitiendo consulta puramente visual.
+    - Cuando DINOv2 está desactivado, conserva intacto el flujo y puntuación de Fases 1-3.
     """
     config = obtener_config_duplicados()
+    dinov2_habilitado = dinov2_service.es_dinov2_activo(usar_dinov2)
+    umbral_dinov2_val = (
+        max(0.0, min(1.0, float(umbral_dinov2)))
+        if umbral_dinov2 is not None
+        else config['umbral_dinov2']
+    )
+    dinov2_fallback_dhash = bool(config['dinov2_fallback_dhash'])
+
     umbral_val = float(umbral) if umbral is not None else config['umbral']
     radio_val = float(radio_metros) if radio_metros is not None else config['radio_metros']
     umbral_hamming_val = (
@@ -497,7 +770,29 @@ def buscar_peticiones_similares_por_descripcion(
     gps_activo = coords_origen is not None
     urls_origen = _normalizar_lista_urls_origen(foto=foto, fotos=fotos) if incluir_imagenes else []
 
-    if not texto_activo and not gps_activo:
+    if dinov2_habilitado and not (gps_activo and urls_origen):
+        return _construir_respuesta(
+            [],
+            umbral=umbral_val,
+            radio_metros=radio_val,
+            dias=dias_val,
+            min_longitud=min_len,
+            limite=limite_val,
+            excluir_id_peticion=excluir_id_peticion,
+            texto_activo=texto_activo,
+            gps_activo=gps_activo,
+            imagen_activo=False,
+            umbral_hamming=umbral_hamming_val,
+            dinov2_activo=True,
+            umbral_dinov2=umbral_dinov2_val,
+            metodo_imagen=None,
+            mensaje=(
+                'El flujo DINOv2 exige tanto fotografía válida como coordenadas GPS '
+                'dentro del radio configurado para detectar posibles duplicados.'
+            ),
+        )
+
+    if not dinov2_habilitado and not texto_activo and not gps_activo:
         mensaje_omitido = (
             'Descripción vacía o demasiado corta y sin coordenadas GPS válidas; '
             'la comparación visual requiere preselección por texto o GPS.'
@@ -516,14 +811,17 @@ def buscar_peticiones_similares_por_descripcion(
             gps_activo=False,
             imagen_activo=False,
             umbral_hamming=umbral_hamming_val,
+            dinov2_activo=None,
+            umbral_dinov2=None,
+            metodo_imagen=None,
             mensaje=mensaje_omitido,
         )
 
     fecha_corte = timezone.now() - timedelta(days=dias_val)
     registros_candidatos: Dict[int, Dict[str, Any]] = {}
 
-    # Etapa 1: Candidatos por similitud textual en PostgreSQL (pg_trgm)
-    if texto_activo:
+    # Etapa 1: Candidatos por similitud textual en PostgreSQL (pg_trgm) solo en detector clásico
+    if texto_activo and not dinov2_habilitado:
         qs_texto = Peticiones.objects.select_related('id_estado', 'id_ubicacion')
         if incluir_evidencias:
             qs_texto = qs_texto.prefetch_related('evidenciapeticiones_set')
@@ -635,17 +933,26 @@ def buscar_peticiones_similares_por_descripcion(
                     item['distancia_metros'] = distancia
                     item['coincidencia_gps'] = distancia <= radio_val
 
-    # Preseleccionar únicamente los candidatos que ya coincidieron por texto o GPS
+    # Preseleccionar candidatos relevantes para comparar imágenes
     preseleccionados: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
     for item in registros_candidatos.values():
         coinc_txt = bool(item['coincidencia_texto'])
         coinc_gps = bool(item['coincidencia_gps'])
-        if not coinc_txt and not coinc_gps:
+        if dinov2_habilitado:
+            if not coinc_gps:
+                continue
+        elif not coinc_txt and not coinc_gps:
             continue
 
         item['coincidencia_imagen'] = False
         item['distancia_hamming'] = None
         item['similitud_imagen'] = None
+        item['porcentaje_similitud_visual'] = None
+        item['similitud_visual_coseno'] = None
+        item['metodo_imagen'] = None
+        item['es_certeza_identidad'] = False
+        item['tipo_metrica_visual'] = None
+        item['advertencia_metrica_visual'] = None
 
         pet = item['peticion']
         sim_txt = float(item['similitud_texto'])
@@ -657,65 +964,31 @@ def buscar_peticiones_similares_por_descripcion(
             coincidencia_gps=coinc_gps,
             radio_metros=radio_val,
             gps_activo=gps_activo,
+            priorizar_visual_gps=dinov2_habilitado,
         )
         fecha_obj = getattr(pet, 'fecha', None)
         fecha_ord = fecha_obj.timestamp() if hasattr(fecha_obj, 'timestamp') else 0.0
-        prelim_tier = (1 if coinc_txt else 0) + (1 if coinc_gps else 0)
         dist_ord = -float(dist_m) if dist_m is not None else float('-inf')
+        if dinov2_habilitado:
+            prelim_tier = (1 if coinc_gps else 0, 1 if coinc_txt else 0)
+        else:
+            prelim_tier = (1 if coinc_txt else 0) + (1 if coinc_gps else 0)
         prelim_key = (prelim_tier, prelim_score, sim_txt, dist_ord, fecha_ord, getattr(pet, 'id_peticion', 0) or 0)
         preseleccionados.append((prelim_key, item))
 
     preseleccionados.sort(key=lambda par: par[0], reverse=True)
 
-    # Etapa 3: Comparación perceptual dHash únicamente sobre candidatos preseleccionados
-    hashes_origen: List[int] = []
-    cache_hashes: Dict[str, Optional[int]] = {}
-    if urls_origen and preseleccionados:
-        try:
-            hashes_origen = calcular_hashes_urls(
-                urls_origen,
-                max_imagenes=max_imagenes_pet,
-                cache=cache_hashes,
-            )
-        except Exception as exc:
-            logger.warning("Comparación visual omitida por error procesando fotos de origen: %s", exc)
-            hashes_origen = []
-
-    imagen_activo = len(hashes_origen) > 0
-    if imagen_activo:
-        candidatos_img_procesados = 0
-        for _, item in preseleccionados:
-            if candidatos_img_procesados >= max_candidatos_img:
-                break
-
-            pet = item['peticion']
-            _, fotos_cand = extraer_fotografias_peticion(pet)
-            if not fotos_cand:
-                continue
-
-            candidatos_img_procesados += 1
-            try:
-                hashes_cand = calcular_hashes_urls(
-                    fotos_cand,
-                    max_imagenes=max_imagenes_pet,
-                    cache=cache_hashes,
-                )
-                if hashes_cand:
-                    comp = comparar_conjuntos_hashes(
-                        hashes_origen,
-                        hashes_cand,
-                        umbral_hamming=umbral_hamming_val,
-                    )
-                    if comp.get('comparado'):
-                        item['coincidencia_imagen'] = bool(comp['coincidencia_imagen'])
-                        item['distancia_hamming'] = comp['distancia_hamming']
-                        item['similitud_imagen'] = comp['similitud_imagen']
-            except Exception as exc:
-                logger.warning(
-                    "Fallo controlado comparando fotografías para petición %s: %s",
-                    getattr(pet, 'id_peticion', '?'),
-                    exc,
-                )
+    # Etapa 3: Comparación visual (DINOv2 Small o respaldo perceptual dHash)
+    imagen_activo, metodo_visual = _ejecutar_comparacion_visual(
+        preseleccionados,
+        urls_origen=urls_origen,
+        dinov2_habilitado=dinov2_habilitado,
+        umbral_dinov2_val=umbral_dinov2_val,
+        umbral_hamming_val=umbral_hamming_val,
+        max_imagenes_pet=max_imagenes_pet,
+        max_candidatos_img=max_candidatos_img,
+        dinov2_fallback_dhash=dinov2_fallback_dhash,
+    )
 
     candidatos_con_clave: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
     for _, item in preseleccionados:
@@ -723,6 +996,12 @@ def buscar_peticiones_similares_por_descripcion(
         coinc_txt = bool(item['coincidencia_texto'])
         coinc_gps = bool(item['coincidencia_gps'])
         coinc_img = bool(item['coincidencia_imagen'])
+        if dinov2_habilitado:
+            if not (coinc_img and coinc_gps):
+                continue
+        elif not (coinc_txt or coinc_gps or coinc_img):
+            continue
+
         sim_txt = float(item['similitud_texto'])
         dist_m = item['distancia_metros']
         dist_hamming = item['distancia_hamming']
@@ -737,6 +1016,7 @@ def buscar_peticiones_similares_por_descripcion(
             gps_activo=gps_activo,
             similitud_imagen=sim_img,
             coincidencia_imagen=coinc_img,
+            priorizar_visual_gps=dinov2_habilitado,
         )
         serializado = _serializar_candidato(
             pet,
@@ -749,22 +1029,47 @@ def buscar_peticiones_similares_por_descripcion(
             similitud_imagen=sim_img,
             score_combinado=score,
             incluir_evidencias=incluir_evidencias,
+            porcentaje_similitud_visual=item.get('porcentaje_similitud_visual'),
+            similitud_visual_coseno=item.get('similitud_visual_coseno'),
+            metodo_imagen=item.get('metodo_imagen'),
+            es_certeza_identidad=bool(item.get('es_certeza_identidad', False)),
+            tipo_metrica_visual=item.get('tipo_metrica_visual'),
+            advertencia_metrica_visual=item.get('advertencia_metrica_visual'),
+            incluir_meta_dinov2=dinov2_habilitado,
         )
 
         fecha_obj = getattr(pet, 'fecha', None)
         fecha_ord = fecha_obj.timestamp() if hasattr(fecha_obj, 'timestamp') else 0.0
-        tier = (1 if coinc_txt else 0) + (1 if coinc_gps else 0) + (1 if coinc_img else 0)
         dist_ord = -float(dist_m) if dist_m is not None else float('-inf')
-        hamming_ord = -int(dist_hamming) if dist_hamming is not None else float('-inf')
-        clave_orden = (
-            tier,
-            score,
-            sim_txt,
-            dist_ord,
-            hamming_ord,
-            fecha_ord,
-            getattr(pet, 'id_peticion', 0) or 0,
-        )
+        if dinov2_habilitado:
+            tier = (
+                1 if (coinc_img and coinc_gps) else 0,
+                1 if coinc_img else 0,
+                1 if coinc_gps else 0,
+                1 if coinc_txt else 0,
+            )
+            sim_img_ord = float(sim_img) if sim_img is not None else -1.0
+            clave_orden = (
+                tier,
+                score,
+                sim_img_ord,
+                dist_ord,
+                sim_txt,
+                fecha_ord,
+                getattr(pet, 'id_peticion', 0) or 0,
+            )
+        else:
+            tier = (1 if coinc_txt else 0) + (1 if coinc_gps else 0) + (1 if coinc_img else 0)
+            hamming_ord = -int(dist_hamming) if dist_hamming is not None else float('-inf')
+            clave_orden = (
+                tier,
+                score,
+                sim_txt,
+                dist_ord,
+                hamming_ord,
+                fecha_ord,
+                getattr(pet, 'id_peticion', 0) or 0,
+            )
         candidatos_con_clave.append((clave_orden, serializado))
 
     candidatos_con_clave.sort(key=lambda par: par[0], reverse=True)
@@ -790,6 +1095,9 @@ def buscar_peticiones_similares_por_descripcion(
         gps_activo=gps_activo,
         imagen_activo=imagen_activo,
         umbral_hamming=umbral_hamming_val,
+        dinov2_activo=(True if dinov2_habilitado else None),
+        umbral_dinov2=(umbral_dinov2_val if dinov2_habilitado else None),
+        metodo_imagen=(metodo_visual if dinov2_habilitado else None),
         mensaje=mensaje,
     )
 
@@ -808,6 +1116,8 @@ def detectar_duplicados_desde_solicitud(
     umbral: Optional[float] = None,
     radio_metros: Optional[float] = None,
     umbral_hamming: Optional[int] = None,
+    umbral_dinov2: Optional[float] = None,
+    usar_dinov2: Optional[bool] = None,
     dias: Optional[int] = None,
     min_longitud: Optional[int] = None,
     limite: Optional[int] = None,
@@ -885,6 +1195,8 @@ def detectar_duplicados_desde_solicitud(
         umbral=umbral,
         radio_metros=radio_metros,
         umbral_hamming=umbral_hamming,
+        umbral_dinov2=umbral_dinov2,
+        usar_dinov2=usar_dinov2,
         dias=dias,
         min_longitud=min_longitud,
         limite=limite,
