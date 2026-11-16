@@ -14,6 +14,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+import requests
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
@@ -21,19 +23,27 @@ from django.db.models import Count, Q, QuerySet
 from django.utils import timezone
 
 from peticiones.models import (
+    EstadoPeticiones,
     HistorialPeticiones,
     NotificacionJuridico,
     Peticiones,
     PeticionPosibleDuplicado,
 )
+from peticiones.services import dinov2_service
 from peticiones.services.duplicados_service import (
     PeticionNoEncontradaError,
+    RADIO_GPS_METROS_DEFAULT,
+    _calcular_puntaje_combinado,
     buscar_peticiones_similares_por_descripcion,
+    calcular_distancia_haversine_metros,
     es_descripcion_valida_para_comparacion,
+    extraer_fotografias_peticion,
     normalizar_coordenadas,
     normalizar_descripcion,
     obtener_config_duplicados,
 )
+from peticiones.utils import detectar_tipo_archivo, normalizar_texto_juridico
+from users.api.permissions import es_admin_o_juridico
 from users.models import Usuarios
 
 logger = logging.getLogger(__name__)
@@ -53,6 +63,10 @@ HISTORIAL_TIPO_DUPLICADO_DESCARTADO = 'DUPLICADO_DESCARTADO'
 HISTORIAL_TIPO_DUPLICADO_REABIERTO = 'DUPLICADO_REABIERTO'
 
 MAX_LONGITUD_TIPO_CAMBIO_HISTORIAL = 30
+ESTADO_PETICION_DUPLICADA = 'Duplicada'
+ESTADOS_DUPLICADOS_NORM = frozenset({'duplicada', 'duplicado'})
+METODO_IMAGEN_DINOV2 = 'dinov2_small'
+METODOS_IMAGEN_DHASH = frozenset({'dhash', 'dhash_fallback'})
 
 AUTO_DETECCION_TIMEOUT_MS_DEFAULT = 1500
 AUTO_DETECCION_TIMEOUT_MS_MIN = 100
@@ -106,6 +120,21 @@ class SeleccionPrincipalInvalidaError(AlertaDuplicadoError, ValueError):
 
 class UsuarioRevisionInvalidoError(AlertaDuplicadoError, ValueError):
     """El usuario revisor o actor indicado no es válido o no existe."""
+
+
+class Dinov2NoDisponibleParaAlertaError(AlertaDuplicadoError, RuntimeError):
+    """El servicio DINOv2 no se encuentra disponible para comparar las evidencias."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        codigo: str = 'DINOV2_NO_DISPONIBLE',
+        distancia_gps_metros: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.codigo = codigo
+        self.distancia_gps_metros = distancia_gps_metros
 
 
 # ==============================================================================
@@ -295,6 +324,212 @@ def _normalizar_criterios(
     return limpios
 
 
+def _leer_float_seguro(valor: Any) -> float | None:
+    if valor is None or isinstance(valor, bool):
+        return None
+    if not isinstance(valor, (int, float)):
+        return None
+    numero = float(valor)
+    return numero if math.isfinite(numero) else None
+
+
+def _leer_int_seguro(valor: Any) -> int | None:
+    if valor is None or isinstance(valor, bool):
+        return None
+    if isinstance(valor, int):
+        return int(valor)
+    if isinstance(valor, float) and math.isfinite(valor) and valor.is_integer():
+        return int(valor)
+    return None
+
+
+def _leer_str_seguro(valor: Any) -> str | None:
+    if not isinstance(valor, str):
+        return None
+    limpio = valor.strip()
+    return limpio or None
+
+
+def obtener_radio_gps_referencia(radio_metros: float | None = None) -> float:
+    """Retorna el radio GPS de referencia (default 200 m)."""
+    radio = _leer_float_seguro(radio_metros)
+    if radio is not None and radio >= 1.0:
+        return radio
+    try:
+        cfg = obtener_config_duplicados()
+        radio_cfg = _leer_float_seguro(cfg.get('radio_metros'))
+        if radio_cfg is not None and radio_cfg >= 1.0:
+            return radio_cfg
+    except Exception:
+        pass
+    return float(RADIO_GPS_METROS_DEFAULT)
+
+
+def calcular_porcentaje_proximidad_gps(
+    distancia_metros: float | None,
+    radio_metros: float | None = None,
+) -> float | None:
+    """
+    Calcula el porcentaje real de proximidad GPS [0, 100] dentro del radio de
+    referencia (default 200 m): `100 * max(0, 1 - distancia_metros / radio_metros)`.
+    """
+    dist = _leer_float_seguro(distancia_metros)
+    if dist is None or dist < 0.0:
+        return None
+    radio = obtener_radio_gps_referencia(radio_metros)
+    ratio = max(0.0, min(1.0, 1.0 - (dist / radio)))
+    return round(ratio * 100.0, 2)
+
+
+def resolver_estado_metrica_visual(fuente: Any) -> dict[str, Any]:
+    """
+    Determina de forma estricta si existe comparación visual calculada por DINOv2,
+    sin inventar porcentajes ni presentar dHash legado como resultado de DINOv2.
+    """
+    if isinstance(fuente, Mapping):
+        raw_metodo = fuente.get('metodo_imagen')
+        raw_hamming = fuente.get('distancia_hamming')
+        raw_sim_img = fuente.get('similitud_imagen')
+        raw_cos = fuente.get('similitud_visual_coseno')
+        raw_pct = fuente.get('porcentaje_similitud_visual')
+    else:
+        raw_metodo = getattr(fuente, 'metodo_imagen', None)
+        raw_hamming = getattr(fuente, 'distancia_hamming', None)
+        raw_sim_img = getattr(fuente, 'similitud_imagen', None)
+        raw_cos = getattr(fuente, 'similitud_visual_coseno', None)
+        raw_pct = getattr(fuente, 'porcentaje_similitud_visual', None)
+
+    metodo = _leer_str_seguro(raw_metodo)
+    metodo_norm = metodo.lower() if metodo else None
+    hamming = _leer_int_seguro(raw_hamming)
+    sim_img = _leer_float_seguro(raw_sim_img)
+    sim_cos = _leer_float_seguro(raw_cos)
+    pct_guardado = _leer_float_seguro(raw_pct)
+
+    if metodo_norm is None and hamming is not None and sim_img is not None:
+        metodo_norm = 'dhash'
+
+    es_dinov2 = (
+        metodo_norm == METODO_IMAGEN_DINOV2
+        or (
+            sim_img is not None
+            and hamming is None
+            and metodo_norm not in METODOS_IMAGEN_DHASH
+        )
+    )
+
+    if not es_dinov2 or (sim_img is None and pct_guardado is None):
+        return {
+            'metodo_imagen': metodo_norm,
+            'dinov2_calculada': False,
+            'visual_calculada': False,
+            'similitud_visual_coseno': None,
+            'similitud_visual_dinov2': None,
+            'porcentaje_similitud_visual': None,
+            'estado_comparacion_visual': 'No calculada',
+        }
+
+    if metodo_norm is None:
+        metodo_norm = METODO_IMAGEN_DINOV2
+
+    sim_base = sim_img if sim_img is not None else max(0.0, min(1.0, (pct_guardado or 0.0) / 100.0))
+    sim_acotada = round(max(0.0, min(1.0, sim_base)), 4)
+    pct_final = (
+        round(max(0.0, min(100.0, pct_guardado)), 2)
+        if pct_guardado is not None
+        else round(sim_acotada * 100.0, 2)
+    )
+    cos_final = round(sim_cos, 4) if sim_cos is not None else sim_acotada
+    return {
+        'metodo_imagen': metodo_norm,
+        'dinov2_calculada': True,
+        'visual_calculada': True,
+        'similitud_visual_coseno': cos_final,
+        'similitud_visual_dinov2': sim_acotada,
+        'porcentaje_similitud_visual': pct_final,
+        'estado_comparacion_visual': 'Calculada (DINOv2)',
+    }
+
+
+def obtener_o_crear_estado_duplicada(*, permitir_crear: bool = True) -> EstadoPeticiones | None:
+    """Obtiene o crea el estado institucional `'Duplicada'` en `estado_peticiones`."""
+    estado = EstadoPeticiones.objects.filter(nombre__iexact=ESTADO_PETICION_DUPLICADA).first()
+    if estado is not None:
+        return estado
+    for item in EstadoPeticiones.objects.all():
+        if normalizar_texto_juridico(getattr(item, 'nombre', '')) in ESTADOS_DUPLICADOS_NORM:
+            return item
+    if not permitir_crear:
+        return None
+    return EstadoPeticiones.objects.create(
+        nombre=ESTADO_PETICION_DUPLICADA,
+        descripcion='Petición marcada como duplicada tras comparación jurídica.',
+        orden=99,
+        activo=True,
+    )
+
+
+def _obtener_estado_reactivacion(id_estado_preferido: int | None = None) -> EstadoPeticiones | None:
+    """Busca un estado activo no duplicado cuando se revierte explícitamente una alerta confirmada."""
+    if id_estado_preferido is not None:
+        cand = EstadoPeticiones.objects.filter(pk=id_estado_preferido).first()
+        if cand is not None and normalizar_texto_juridico(cand.nombre) not in ESTADOS_DUPLICADOS_NORM:
+            return cand
+    for nombre in ('En revisión', 'Pendiente', 'Borrador'):
+        est = EstadoPeticiones.objects.filter(nombre__iexact=nombre).first()
+        if est is not None:
+            return est
+    for item in EstadoPeticiones.objects.filter(activo=True).order_by('orden', 'id_estado'):
+        if normalizar_texto_juridico(getattr(item, 'nombre', '')) not in ESTADOS_DUPLICADOS_NORM:
+            return item
+    return None
+
+
+def es_peticion_duplicada(peticion_o_id: Peticiones | int | None) -> bool:
+    """Indica si la petición fue marcada como duplicada o figura en una alerta CONFIRMADO."""
+    if peticion_o_id is None:
+        return False
+    if isinstance(peticion_o_id, Peticiones):
+        estado_obj = getattr(peticion_o_id, 'id_estado', None)
+        nombre_estado = normalizar_texto_juridico(getattr(estado_obj, 'nombre', ''))
+        if nombre_estado in ESTADOS_DUPLICADOS_NORM:
+            return True
+        pid = getattr(peticion_o_id, 'pk', None)
+    elif isinstance(peticion_o_id, bool) or not isinstance(peticion_o_id, int) or peticion_o_id <= 0:
+        return False
+    else:
+        pid = int(peticion_o_id)
+        estado_nom = (
+            Peticiones.objects.filter(pk=pid)
+            .values_list('id_estado__nombre', flat=True)
+            .first()
+        )
+        if normalizar_texto_juridico(estado_nom) in ESTADOS_DUPLICADOS_NORM:
+            return True
+
+    if pid is None:
+        return False
+
+    return PeticionPosibleDuplicado.objects.filter(
+        estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+        peticion_duplicada_id=pid,
+    ).exists()
+
+
+def obtener_peticion_original_de_duplicada(id_peticion: int | None) -> int | None:
+    """Devuelve el ID de la petición original conservada si esta petición fue confirmada como duplicada."""
+    if not isinstance(id_peticion, int) or isinstance(id_peticion, bool) or id_peticion <= 0:
+        return None
+    return (
+        PeticionPosibleDuplicado.objects.filter(
+            estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+            peticion_duplicada_id=id_peticion,
+        )
+        .values_list('peticion_principal_id', flat=True)
+        .first()
+    )
+
+
 def _normalizar_evidencia_deteccion(
     evidencia: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -345,14 +580,57 @@ def _normalizar_evidencia_deteccion(
         coincidencia_gps=coincidencia_gps,
         coincidencia_imagen=coincidencia_imagen,
     )
+    radio_gps_metros = _validar_float_opcional(
+        data.get('radio_gps_metros'),
+        nombre_campo='radio_gps_metros',
+        minimo=1.0,
+    )
+    radio_final = obtener_radio_gps_referencia(radio_gps_metros)
+
+    porcentaje_gps = _validar_float_opcional(
+        data.get('porcentaje_proximidad_gps'),
+        nombre_campo='porcentaje_proximidad_gps',
+        minimo=0.0,
+        maximo=100.0,
+    )
+    if porcentaje_gps is None and distancia_metros is not None:
+        porcentaje_gps = calcular_porcentaje_proximidad_gps(distancia_metros, radio_final)
+
+    metodo_imagen_raw = _leer_str_seguro(data.get('metodo_imagen'))
+    metodo_imagen = metodo_imagen_raw[:40] if metodo_imagen_raw else None
+    similitud_visual_coseno = _validar_float_opcional(
+        data.get('similitud_visual_coseno'),
+        nombre_campo='similitud_visual_coseno',
+        minimo=-1.0,
+        maximo=1.0,
+    )
+    porcentaje_similitud_visual = _validar_float_opcional(
+        data.get('porcentaje_similitud_visual'),
+        nombre_campo='porcentaje_similitud_visual',
+        minimo=0.0,
+        maximo=100.0,
+    )
+
+    info_visual = resolver_estado_metrica_visual({
+        'metodo_imagen': metodo_imagen,
+        'distancia_hamming': distancia_hamming,
+        'similitud_imagen': similitud_imagen,
+        'similitud_visual_coseno': similitud_visual_coseno,
+        'porcentaje_similitud_visual': porcentaje_similitud_visual,
+    })
 
     return {
         'similitud_texto': similitud_texto,
         'coincidencia_texto': coincidencia_texto,
         'distancia_metros': distancia_metros,
+        'radio_gps_metros': radio_final,
+        'porcentaje_proximidad_gps': porcentaje_gps,
         'coincidencia_gps': coincidencia_gps,
         'distancia_hamming': distancia_hamming,
         'similitud_imagen': similitud_imagen,
+        'similitud_visual_coseno': info_visual['similitud_visual_coseno'],
+        'porcentaje_similitud_visual': info_visual['porcentaje_similitud_visual'],
+        'metodo_imagen': info_visual['metodo_imagen'],
         'coincidencia_imagen': coincidencia_imagen,
         'score_combinado': float(score_combinado if score_combinado is not None else 0.0),
         'criterios_coincidencia': criterios,
@@ -502,11 +780,13 @@ def _registrar_auditoria_par(
     tipo_cambio: str,
     usuario_accion: Usuarios | None,
     observacion: str,
+    estado_anterior_por_id: Mapping[int, EstadoPeticiones | None] | None = None,
+    estado_nuevo_por_id: Mapping[int, EstadoPeticiones | None] | None = None,
 ) -> tuple[int, int]:
     """
     Registra la auditoría en `HistorialPeticiones` para ambas peticiones del par
     respetando la estructura real de `historial_peticiones` (`tipo_cambio <= 30`),
-    sin modificar estado ni asignaciones de las peticiones originales.
+    incluyendo transiciones de estado cuando se confirma o revierte un duplicado.
     """
     if len(tipo_cambio) > MAX_LONGITUD_TIPO_CAMBIO_HISTORIAL:
         raise ValueError(
@@ -514,11 +794,14 @@ def _registrar_auditoria_par(
             'caracteres permitidos por historial_peticiones.'
         )
 
+    est_ant_map = estado_anterior_por_id or {}
+    est_nvo_map = estado_nuevo_por_id or {}
+
     h_menor = HistorialPeticiones.objects.create(
         id_peticion=peticion_menor,
         tipo_cambio=tipo_cambio,
-        id_estado_anterior=None,
-        id_estado_nuevo=None,
+        id_estado_anterior=est_ant_map.get(peticion_menor.id_peticion),
+        id_estado_nuevo=est_nvo_map.get(peticion_menor.id_peticion),
         id_veterinario_anterior=None,
         id_veterinario_nuevo=None,
         id_usuario_accion=usuario_accion,
@@ -527,8 +810,8 @@ def _registrar_auditoria_par(
     h_mayor = HistorialPeticiones.objects.create(
         id_peticion=peticion_mayor,
         tipo_cambio=tipo_cambio,
-        id_estado_anterior=None,
-        id_estado_nuevo=None,
+        id_estado_anterior=est_ant_map.get(peticion_mayor.id_peticion),
+        id_estado_nuevo=est_nvo_map.get(peticion_mayor.id_peticion),
         id_veterinario_anterior=None,
         id_veterinario_nuevo=None,
         id_usuario_accion=usuario_accion,
@@ -565,10 +848,16 @@ def _observacion_decision(
     estado_anterior: str,
     nuevo_estado: str,
     observacion_usuario: str | None,
+    usuario_revisor: Usuarios | None = None,
 ) -> str:
     marcador = _marcador_par(alerta.peticion_menor_id, alerta.peticion_mayor_id)
     rad_menor = _formatear_radicado(peticion_menor)
     rad_mayor = _formatear_radicado(peticion_mayor)
+    actor_txt = ''
+    if usuario_revisor is not None:
+        nombre_actor = f"{getattr(usuario_revisor, 'nombre', '') or ''} {getattr(usuario_revisor, 'apellido', '') or ''}".strip()
+        etiqueta_actor = nombre_actor or getattr(usuario_revisor, 'email', None) or f"Usuario #{usuario_revisor.pk}"
+        actor_txt = f' Usuario responsable: {etiqueta_actor} (ID #{usuario_revisor.pk}).'
 
     if nuevo_estado == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
         pet_principal = (
@@ -584,21 +873,21 @@ def _observacion_decision(
         detalle = (
             f'Alerta #{alerta.id_alerta} CONFIRMADA ({estado_anterior} -> CONFIRMADO) '
             f'para {marcador} ({rad_menor} y {rad_mayor}). '
-            f'Petición principal: {_formatear_radicado(pet_principal)} '
-            f'(ID #{pet_principal.id_peticion}); duplicado confirmado: '
+            f'Petición original conservada: {_formatear_radicado(pet_principal)} '
+            f'(ID #{pet_principal.id_peticion}); petición marcada como duplicada: '
             f'{_formatear_radicado(pet_duplicada)} (ID #{pet_duplicada.id_peticion}). '
-            'Las peticiones y evidencias originales permanecen intactas.'
+            f'Las evidencias y registros originales permanecen intactos.{actor_txt}'
         )
     elif nuevo_estado == PeticionPosibleDuplicado.ESTADO_DESCARTADO:
         detalle = (
             f'Alerta #{alerta.id_alerta} DESCARTADA ({estado_anterior} -> DESCARTADO) '
             f'para {marcador} ({rad_menor} y {rad_mayor}). '
-            'Se descarta duplicidad y ambas peticiones permanecen independientes.'
+            f'Se descarta duplicidad y ambas peticiones permanecen independientes.{actor_txt}'
         )
     else:
         detalle = (
             f'Alerta #{alerta.id_alerta} REABIERTA ({estado_anterior} -> PENDIENTE) '
-            f'para {marcador} ({rad_menor} y {rad_mayor}).'
+            f'para {marcador} ({rad_menor} y {rad_mayor}).{actor_txt}'
         )
 
     if observacion_usuario:
@@ -623,9 +912,14 @@ def _actualizar_metricas_si_pendiente(
         'similitud_texto',
         'coincidencia_texto',
         'distancia_metros',
+        'radio_gps_metros',
+        'porcentaje_proximidad_gps',
         'coincidencia_gps',
         'distancia_hamming',
         'similitud_imagen',
+        'similitud_visual_coseno',
+        'porcentaje_similitud_visual',
+        'metodo_imagen',
         'coincidencia_imagen',
         'score_combinado',
         'criterios_coincidencia',
@@ -731,12 +1025,18 @@ def registrar_alerta_posible_duplicado(
                         peticion_origen=peticion_origen_obj,
                         estado_revision=PeticionPosibleDuplicado.ESTADO_PENDIENTE,
                         peticion_principal=None,
+                        peticion_duplicada=None,
                         similitud_texto=metricas['similitud_texto'],
                         coincidencia_texto=metricas['coincidencia_texto'],
                         distancia_metros=metricas['distancia_metros'],
+                        radio_gps_metros=metricas['radio_gps_metros'],
+                        porcentaje_proximidad_gps=metricas['porcentaje_proximidad_gps'],
                         coincidencia_gps=metricas['coincidencia_gps'],
                         distancia_hamming=metricas['distancia_hamming'],
                         similitud_imagen=metricas['similitud_imagen'],
+                        similitud_visual_coseno=metricas['similitud_visual_coseno'],
+                        porcentaje_similitud_visual=metricas['porcentaje_similitud_visual'],
+                        metodo_imagen=metricas['metodo_imagen'],
                         coincidencia_imagen=metricas['coincidencia_imagen'],
                         score_combinado=metricas['score_combinado'],
                         criterios_coincidencia=metricas['criterios_coincidencia'],
@@ -1045,39 +1345,112 @@ def gestionar_decision_alerta(
 
         revisor_obj = _resolver_usuario_opcional(usuario_revisor)
         estado_anterior = alerta.estado_revision
+        id_duplicada_anterior = alerta.peticion_duplicada_id
 
-        # Idempotencia si el estado (y principal cuando aplica) ya coinciden
-        if estado_anterior == nuevo_estado:
-            if nuevo_estado != PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
-                return ResultadoDecisionAlerta(
-                    alerta=alerta,
-                    cambiada=False,
-                    estado_anterior=estado_anterior,
-                    estado_nuevo=nuevo_estado,
-                    historial_ids=(),
-                )
-            if alerta.peticion_principal_id == id_principal:
-                return ResultadoDecisionAlerta(
-                    alerta=alerta,
-                    cambiada=False,
-                    estado_anterior=estado_anterior,
-                    estado_nuevo=nuevo_estado,
-                    historial_ids=(),
-                )
-            if not permitir_cambio_decision_previa:
-                raise TransicionAlertaInvalidaError(
-                    f'La alerta #{alerta.id_alerta} ya fue confirmada con petición principal '
-                    f'#{alerta.peticion_principal_id}. Para cambiarla, autorice explícitamente '
-                    'el cambio de decisión previa.'
-                )
-        elif estado_anterior in ESTADOS_ALERTA_RESUELTOS and not permitir_cambio_decision_previa:
-            raise TransicionAlertaInvalidaError(
-                f'La alerta #{alerta.id_alerta} ya tiene decisión previa "{estado_anterior}" '
-                f'y no puede pasar automáticamente a "{nuevo_estado}".'
+        # Impedir decisiones repetidas, confirmaciones simultáneas y sobrescrituras no autorizadas
+        if estado_anterior == PeticionPosibleDuplicado.ESTADO_PENDIENTE and nuevo_estado == PeticionPosibleDuplicado.ESTADO_PENDIENTE:
+            return ResultadoDecisionAlerta(
+                alerta=alerta,
+                cambiada=False,
+                estado_anterior=estado_anterior,
+                estado_nuevo=nuevo_estado,
+                historial_ids=(),
             )
+
+        if estado_anterior in ESTADOS_ALERTA_RESUELTOS and not permitir_cambio_decision_previa:
+            if estado_anterior == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
+                raise TransicionAlertaInvalidaError(
+                    f'La alerta #{alerta.id_alerta} ya fue confirmada previamente con petición original '
+                    f'#{alerta.peticion_principal_id}. No se permiten decisiones repetidas ni cambios concurrentes.'
+                )
+            raise TransicionAlertaInvalidaError(
+                f'La alerta #{alerta.id_alerta} ya fue resuelta previamente en estado "{estado_anterior}" '
+                'y no admite decisiones repetidas ni transiciones automáticas.'
+            )
+
+        id_duplicada: int | None = None
+        estado_anterior_por_id: dict[int, EstadoPeticiones | None] = {}
+        estado_nuevo_por_id: dict[int, EstadoPeticiones | None] = {}
+
+        if nuevo_estado == PeticionPosibleDuplicado.ESTADO_CONFIRMADO:
+            id_duplicada = (
+                alerta.peticion_mayor_id
+                if id_principal == alerta.peticion_menor_id
+                else alerta.peticion_menor_id
+            )
+            pet_principal = peticion_menor if id_principal == peticion_menor.id_peticion else peticion_mayor
+            pet_duplicada = peticion_mayor if id_duplicada == peticion_mayor.id_peticion else peticion_menor
+
+            # Verificar integridad cruzada contra otras alertas confirmadas antes de aplicar
+            ya_duplicada_otra = (
+                PeticionPosibleDuplicado.objects.filter(
+                    estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+                    peticion_duplicada_id=id_principal,
+                )
+                .exclude(id_alerta=alerta.id_alerta)
+                .exists()
+            )
+            estado_princ_actual = EstadoPeticiones.objects.filter(pk=pet_principal.id_estado_id).first()
+            estado_princ_norm = normalizar_texto_juridico(getattr(estado_princ_actual, 'nombre', ''))
+            if ya_duplicada_otra or estado_princ_norm in ESTADOS_DUPLICADOS_NORM:
+                raise TransicionAlertaInvalidaError(
+                    f'La petición #{id_principal} ya fue marcada como duplicada en otra resolución '
+                    'y no puede elegirse como petición original.'
+                )
+
+            dup_es_original_en_otra = (
+                PeticionPosibleDuplicado.objects.filter(
+                    estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+                    peticion_principal_id=id_duplicada,
+                )
+                .exclude(id_alerta=alerta.id_alerta)
+                .exists()
+            )
+            if dup_es_original_en_otra:
+                raise TransicionAlertaInvalidaError(
+                    f'La petición #{id_duplicada} ya fue confirmada como original en otra alerta '
+                    'y no puede marcarse como duplicada.'
+                )
+
+            estado_dup_anterior = EstadoPeticiones.objects.filter(pk=pet_duplicada.id_estado_id).first()
+            estado_duplicada_obj = obtener_o_crear_estado_duplicada(permitir_crear=True)
+            if estado_duplicada_obj is not None and pet_duplicada.id_estado_id != estado_duplicada_obj.id_estado:
+                pet_duplicada.id_estado = estado_duplicada_obj
+                pet_duplicada.save(update_fields=['id_estado'])
+
+            estado_anterior_por_id = {
+                pet_principal.id_peticion: estado_princ_actual,
+                pet_duplicada.id_peticion: estado_dup_anterior,
+            }
+            estado_nuevo_por_id = {
+                pet_principal.id_peticion: estado_princ_actual,
+                pet_duplicada.id_peticion: estado_duplicada_obj or estado_dup_anterior,
+            }
+        elif id_duplicada_anterior is not None and permitir_cambio_decision_previa:
+            # Si se revierte explícitamente una confirmación previa, reactivar la petición solo si
+            # no está marcada como duplicada por otra alerta confirmada vigente.
+            sigue_siendo_duplicada = (
+                PeticionPosibleDuplicado.objects.filter(
+                    estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
+                    peticion_duplicada_id=id_duplicada_anterior,
+                )
+                .exclude(id_alerta=alerta.id_alerta)
+                .exists()
+            )
+            if not sigue_siendo_duplicada:
+                pet_antes_dup = (
+                    peticion_menor if id_duplicada_anterior == peticion_menor.id_peticion else peticion_mayor
+                )
+                est_act = EstadoPeticiones.objects.filter(pk=pet_antes_dup.id_estado_id).first()
+                if normalizar_texto_juridico(getattr(est_act, 'nombre', '')) in ESTADOS_DUPLICADOS_NORM:
+                    estado_reactivado = _obtener_estado_reactivacion()
+                    if estado_reactivado is not None:
+                        pet_antes_dup.id_estado = estado_reactivado
+                        pet_antes_dup.save(update_fields=['id_estado'])
 
         alerta.estado_revision = nuevo_estado
         alerta.peticion_principal_id = id_principal
+        alerta.peticion_duplicada_id = id_duplicada
         alerta.revisado_por = revisor_obj
         alerta.observacion_revision = obs_limpia
         alerta.fecha_revision = _ahora_local()
@@ -1085,6 +1458,7 @@ def gestionar_decision_alerta(
             update_fields=[
                 'estado_revision',
                 'peticion_principal',
+                'peticion_duplicada',
                 'revisado_por',
                 'observacion_revision',
                 'fecha_revision',
@@ -1111,7 +1485,10 @@ def gestionar_decision_alerta(
                     estado_anterior=estado_anterior,
                     nuevo_estado=nuevo_estado,
                     observacion_usuario=obs_limpia,
+                    usuario_revisor=revisor_obj,
                 ),
+                estado_anterior_por_id=estado_anterior_por_id,
+                estado_nuevo_por_id=estado_nuevo_por_id,
             )
 
         return ResultadoDecisionAlerta(
@@ -1183,6 +1560,251 @@ def reabrir_alerta_pendiente(
     )
 
 
+def _resolver_distancia_gps_alerta(alerta: PeticionPosibleDuplicado) -> float | None:
+    """Obtiene la distancia GPS real en metros entre ambas peticiones sin modificar la alerta."""
+    distancia = _leer_float_seguro(getattr(alerta, 'distancia_metros', None))
+    if distancia is not None and distancia >= 0.0:
+        return round(distancia, 2)
+
+    ubic_menor = getattr(getattr(alerta, 'peticion_menor', None), 'id_ubicacion', None)
+    ubic_mayor = getattr(getattr(alerta, 'peticion_mayor', None), 'id_ubicacion', None)
+    if ubic_menor is None or ubic_mayor is None:
+        return None
+
+    coords_menor = normalizar_coordenadas(
+        getattr(ubic_menor, 'latitud', None),
+        getattr(ubic_menor, 'longitud', None),
+    )
+    coords_mayor = normalizar_coordenadas(
+        getattr(ubic_mayor, 'latitud', None),
+        getattr(ubic_mayor, 'longitud', None),
+    )
+    if coords_menor is None or coords_mayor is None:
+        return None
+
+    return round(
+        float(
+            calcular_distancia_haversine_metros(
+                coords_menor[0],
+                coords_menor[1],
+                coords_mayor[0],
+                coords_mayor[1],
+            )
+        ),
+        2,
+    )
+
+
+def calcular_comparacion_visual_dinov2_alerta(
+    id_alerta: PeticionPosibleDuplicado | int,
+    *,
+    usuario: Usuarios | int | None = None,
+) -> dict[str, Any]:
+    """
+    Calcula bajo demanda la similitud visual real con DINOv2 Small entre las
+    fotografías de ambas peticiones de una alerta, reutilizando embeddings cacheados
+    cuando existan y consultando VetericanoIA cuando haga falta.
+    No modifica ni resuelve automáticamente la alerta en base de datos.
+    """
+    if isinstance(id_alerta, PeticionPosibleDuplicado):
+        if id_alerta.pk is None:
+            raise AlertaNoEncontradaError('La alerta indicada no está persistida.')
+        alerta_pk = int(id_alerta.pk)
+    elif isinstance(id_alerta, bool) or not isinstance(id_alerta, int) or id_alerta <= 0:
+        raise AlertaNoEncontradaError('id_alerta debe ser un entero positivo.')
+    else:
+        alerta_pk = int(id_alerta)
+
+    if usuario is not None:
+        usuario_res = _resolver_usuario_opcional(usuario)
+        if not es_admin_o_juridico(usuario_res):
+            raise UsuarioRevisionInvalidoError(
+                'Solo los roles Administrador y Jurídico autorizados pueden ejecutar la comparación visual.'
+            )
+
+    alerta = (
+        PeticionPosibleDuplicado.objects.select_related(
+            'peticion_menor',
+            'peticion_menor__id_tipo',
+            'peticion_menor__id_estado',
+            'peticion_menor__id_ubicacion',
+            'peticion_menor__asignado_a',
+            'peticion_menor__asignado_por',
+            'peticion_mayor',
+            'peticion_mayor__id_tipo',
+            'peticion_mayor__id_estado',
+            'peticion_mayor__id_ubicacion',
+            'peticion_mayor__asignado_a',
+            'peticion_mayor__asignado_por',
+            'peticion_origen',
+            'peticion_principal',
+            'peticion_duplicada',
+            'revisado_por',
+        )
+        .prefetch_related(
+            'peticion_menor__evidenciapeticiones_set',
+            'peticion_mayor__evidenciapeticiones_set',
+        )
+        .filter(id_alerta=alerta_pk)
+        .first()
+    )
+    if alerta is None:
+        raise AlertaNoEncontradaError(f'No existe la alerta de duplicado #{alerta_pk}.')
+
+    distancia_gps_metros = _resolver_distancia_gps_alerta(alerta)
+    radio_ref = obtener_radio_gps_referencia(getattr(alerta, 'radio_gps_metros', None))
+    porcentaje_gps = (
+        alerta.porcentaje_proximidad_gps
+        if alerta.porcentaje_proximidad_gps is not None
+        else calcular_porcentaje_proximidad_gps(distancia_gps_metros, radio_ref)
+    )
+
+    _, raw_fotos_menor = extraer_fotografias_peticion(alerta.peticion_menor)
+    _, raw_fotos_mayor = extraer_fotografias_peticion(alerta.peticion_mayor)
+    fotos_menor = [u for u in raw_fotos_menor if detectar_tipo_archivo(u) == 'imagen']
+    fotos_mayor = [u for u in raw_fotos_mayor if detectar_tipo_archivo(u) == 'imagen']
+
+    if not fotos_menor or not fotos_mayor:
+        peticiones_sin_fotos = [
+            pet.id_peticion
+            for pet, imgs in (
+                (alerta.peticion_menor, fotos_menor),
+                (alerta.peticion_mayor, fotos_mayor),
+            )
+            if not imgs and getattr(pet, 'id_peticion', None) is not None
+        ]
+        return {
+            'id_alerta': alerta.id_alerta,
+            'alerta': alerta,
+            'comparado': False,
+            'dinov2_calculada': False,
+            'visual_calculada': False,
+            'codigo': 'SIN_FOTOGRAFIAS',
+            'motivo': 'SIN_FOTOGRAFIAS_EN_AMBAS_PETICIONES',
+            'mensaje': 'Ambas peticiones deben contar con al menos una fotografía válida para calcular DINOv2.',
+            'similitud_imagen_porcentaje': None,
+            'porcentaje_similitud_visual': None,
+            'similitud_imagen': None,
+            'similitud_visual_coseno': None,
+            'coincidencia_imagen': False,
+            'metodo_imagen': None,
+            'distancia_gps_metros': distancia_gps_metros,
+            'radio_gps_metros': round(radio_ref, 2),
+            'porcentaje_proximidad_gps': porcentaje_gps,
+            'peticiones_sin_fotos': peticiones_sin_fotos,
+            'estado_revision': alerta.estado_revision,
+            'alerta_modificada': False,
+        }
+
+    cfg = obtener_config_duplicados()
+    cache_emb: dict[str, list[float] | None] = {}
+    try:
+        emb_menor = dinov2_service.calcular_embeddings_urls(
+            fotos_menor,
+            max_imagenes=cfg['max_imagenes_por_peticion'],
+            cache=cache_emb,
+            id_peticion=alerta.peticion_menor_id,
+            usar_cache_bd=True,
+        )
+        emb_mayor = dinov2_service.calcular_embeddings_urls(
+            fotos_mayor,
+            max_imagenes=cfg['max_imagenes_por_peticion'],
+            cache=cache_emb,
+            id_peticion=alerta.peticion_mayor_id,
+            usar_cache_bd=True,
+        )
+    except (
+        dinov2_service.ModelDinov2NoDisponibleError,
+        requests.RequestException,
+        TimeoutError,
+        ConnectionError,
+    ) as exc:
+        raise Dinov2NoDisponibleParaAlertaError(
+            f'El servicio DINOv2 no está disponible para calcular la comparación visual: {exc}',
+            codigo='DINOV2_NO_DISPONIBLE',
+            distancia_gps_metros=distancia_gps_metros,
+        ) from exc
+
+    if not emb_menor or not emb_mayor:
+        return {
+            'id_alerta': alerta.id_alerta,
+            'alerta': alerta,
+            'comparado': False,
+            'dinov2_calculada': False,
+            'visual_calculada': False,
+            'codigo': 'IMAGENES_NO_PROCESABLES',
+            'motivo': 'IMAGENES_NO_PROCESABLES',
+            'mensaje': 'No fue posible extraer embeddings DINOv2 de las imágenes adjuntas.',
+            'similitud_imagen_porcentaje': None,
+            'porcentaje_similitud_visual': None,
+            'similitud_imagen': None,
+            'similitud_visual_coseno': None,
+            'coincidencia_imagen': False,
+            'metodo_imagen': None,
+            'distancia_gps_metros': distancia_gps_metros,
+            'radio_gps_metros': round(radio_ref, 2),
+            'porcentaje_proximidad_gps': porcentaje_gps,
+            'estado_revision': alerta.estado_revision,
+            'alerta_modificada': False,
+        }
+
+    comp = dinov2_service.comparar_conjuntos_embeddings(
+        emb_menor,
+        emb_mayor,
+        umbral_coseno=cfg['umbral_dinov2'],
+    )
+    if not comp.get('comparado'):
+        return {
+            'id_alerta': alerta.id_alerta,
+            'alerta': alerta,
+            'comparado': False,
+            'dinov2_calculada': False,
+            'visual_calculada': False,
+            'codigo': 'SIN_COMPARACION_VALIDA',
+            'motivo': 'SIN_COMPARACION_VALIDA',
+            'mensaje': 'No se obtuvo una comparación visual DINOv2 válida.',
+            'similitud_imagen_porcentaje': None,
+            'porcentaje_similitud_visual': None,
+            'similitud_imagen': None,
+            'similitud_visual_coseno': None,
+            'coincidencia_imagen': False,
+            'metodo_imagen': None,
+            'distancia_gps_metros': distancia_gps_metros,
+            'radio_gps_metros': round(radio_ref, 2),
+            'porcentaje_proximidad_gps': porcentaje_gps,
+            'estado_revision': alerta.estado_revision,
+            'alerta_modificada': False,
+        }
+
+    similitud_pct = float(comp['porcentaje_similitud_visual'])
+    similitud_img = float(comp['similitud_imagen'])
+    similitud_cos = float(comp['similitud_coseno'])
+    coincidencia_img = bool(comp['coincidencia_imagen'])
+    metodo_img = comp.get('metodo_imagen') or METODO_IMAGEN_DINOV2
+
+    return {
+        'id_alerta': alerta.id_alerta,
+        'alerta': alerta,
+        'comparado': True,
+        'dinov2_calculada': True,
+        'visual_calculada': True,
+        'codigo': 'OK',
+        'motivo': None,
+        'mensaje': 'Similitud visual DINOv2 calculada correctamente.',
+        'similitud_imagen_porcentaje': similitud_pct,
+        'porcentaje_similitud_visual': similitud_pct,
+        'similitud_imagen': similitud_img,
+        'similitud_visual_coseno': similitud_cos,
+        'coincidencia_imagen': coincidencia_img,
+        'metodo_imagen': metodo_img,
+        'distancia_gps_metros': distancia_gps_metros,
+        'radio_gps_metros': round(radio_ref, 2),
+        'porcentaje_proximidad_gps': porcentaje_gps,
+        'estado_revision': alerta.estado_revision,
+        'alerta_modificada': False,
+    }
+
+
 # ==============================================================================
 # CONSULTAS DE LECTURA (SOPORTE PARA FUTURA FASE 4C)
 # ==============================================================================
@@ -1198,6 +1820,7 @@ def obtener_alerta_por_id(id_alerta: int) -> PeticionPosibleDuplicado:
             'peticion_mayor',
             'peticion_origen',
             'peticion_principal',
+            'peticion_duplicada',
             'revisado_por',
         )
         .filter(id_alerta=id_alerta)
@@ -1220,6 +1843,7 @@ def obtener_alerta_por_par(
             'peticion_mayor',
             'peticion_origen',
             'peticion_principal',
+            'peticion_duplicada',
             'revisado_por',
         )
         .filter(peticion_menor_id=id_menor, peticion_mayor_id=id_mayor)
@@ -1239,6 +1863,7 @@ def listar_alertas_duplicados(
         'peticion_mayor',
         'peticion_origen',
         'peticion_principal',
+        'peticion_duplicada',
         'revisado_por',
     )
 

@@ -193,6 +193,7 @@ class AlertasDuplicadosRutasYPermisosTestCase(SimpleTestCase):
             ('/api/peticiones/duplicados/alertas/', 'alertas-duplicados-listar'),
             ('/api/peticiones/duplicados/alertas/15/', 'alerta-duplicado-detalle'),
             ('/api/peticiones/duplicados/alertas/15/resolver/', 'alerta-duplicado-resolver'),
+            ('/api/peticiones/duplicados/alertas/15/comparar-visual/', 'alerta-duplicado-comparar-visual'),
             ('/api/peticiones/25/duplicados/', 'peticion-alertas-duplicados'),
             ('/api/peticiones/25/', 'detalle-peticion'),
             ('/api/peticiones/detectar-duplicados/', 'detectar-duplicados-peticion'),
@@ -205,6 +206,7 @@ class AlertasDuplicadosRutasYPermisosTestCase(SimpleTestCase):
         self.assertEqual(reverse('alertas-duplicados-listar'), '/api/peticiones/duplicados/alertas/')
         self.assertEqual(reverse('alerta-duplicado-detalle', args=[15]), '/api/peticiones/duplicados/alertas/15/')
         self.assertEqual(reverse('alerta-duplicado-resolver', args=[15]), '/api/peticiones/duplicados/alertas/15/resolver/')
+        self.assertEqual(reverse('alerta-duplicado-comparar-visual', args=[15]), '/api/peticiones/duplicados/alertas/15/comparar-visual/')
         self.assertEqual(reverse('peticion-alertas-duplicados', args=[25]), '/api/peticiones/25/duplicados/')
 
     def test_endpoints_retornan_401_sin_autenticacion(self):
@@ -212,6 +214,7 @@ class AlertasDuplicadosRutasYPermisosTestCase(SimpleTestCase):
             ('get', '/api/peticiones/duplicados/alertas/', None),
             ('get', '/api/peticiones/duplicados/alertas/1/', None),
             ('post', '/api/peticiones/duplicados/alertas/1/resolver/', {'estado_revision': 'DESCARTADO'}),
+            ('post', '/api/peticiones/duplicados/alertas/1/comparar-visual/', {}),
             ('get', '/api/peticiones/10/duplicados/', None),
         ]
         for metodo, url, body in rutas:
@@ -231,6 +234,7 @@ class AlertasDuplicadosRutasYPermisosTestCase(SimpleTestCase):
             ('get', '/api/peticiones/duplicados/alertas/', None),
             ('get', '/api/peticiones/duplicados/alertas/1/', None),
             ('post', '/api/peticiones/duplicados/alertas/1/resolver/', {'estado_revision': 'DESCARTADO'}),
+            ('post', '/api/peticiones/duplicados/alertas/1/comparar-visual/', {}),
             ('get', '/api/peticiones/10/duplicados/', None),
         ]
         for user in usuarios_denegados:
@@ -491,3 +495,149 @@ class AlertasDuplicadosEndpointsComportamientoTestCase(SimpleTestCase):
         mock_pet_obj.filter.return_value.values.return_value.first.return_value = None
         resp_404 = self.client.get('/api/peticiones/99999/duplicados/')
         self.assertEqual(resp_404.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('peticiones.api.views.obtener_alerta_por_id')
+    def test_metricas_separadas_gps_dinov2_y_no_calculada_en_detalle(self, mock_obtener):
+        # Caso 1: Alerta con DINOv2 real + distancia GPS 50m / radio 200m (= 75% proximidad)
+        alerta_dinov2 = _crear_mock_alerta(id_alerta=81)
+        alerta_dinov2.distancia_metros = 50.0
+        alerta_dinov2.radio_gps_metros = 200.0
+        alerta_dinov2.porcentaje_proximidad_gps = None
+        alerta_dinov2.distancia_hamming = None
+        alerta_dinov2.metodo_imagen = 'dinov2_small'
+        alerta_dinov2.similitud_imagen = 0.885
+        alerta_dinov2.similitud_visual_coseno = 0.885
+        alerta_dinov2.porcentaje_similitud_visual = 88.5
+        mock_obtener.return_value = alerta_dinov2
+
+        resp1 = self.client.get('/api/peticiones/duplicados/alertas/81/')
+        self.assertEqual(resp1.status_code, status.HTTP_200_OK)
+        m1 = resp1.data['comparacion']['metricas']
+        self.assertEqual(m1['distancia_metros'], 50.0)
+        self.assertEqual(m1['radio_gps_metros'], 200.0)
+        self.assertEqual(m1['porcentaje_proximidad_gps'], 75.0)
+        self.assertTrue(m1['dinov2_calculada'])
+        self.assertEqual(m1['porcentaje_similitud_visual'], 88.5)
+        self.assertEqual(m1['estado_comparacion_visual'], 'Calculada (DINOv2)')
+        self.assertEqual(m1['porcentaje_similitud_texto'], 87.0)
+        self.assertEqual(m1['porcentaje_score_combinado'], 92.0)
+
+        # Caso 2: Alerta sin comparación visual DINOv2 (o solo dHash) -> No calculada, nunca inventada
+        alerta_sin_visual = _crear_mock_alerta(id_alerta=82)
+        alerta_sin_visual.similitud_imagen = None
+        alerta_sin_visual.distancia_hamming = None
+        alerta_sin_visual.metodo_imagen = None
+        alerta_sin_visual.similitud_visual_coseno = None
+        alerta_sin_visual.porcentaje_similitud_visual = None
+        alerta_sin_visual.coincidencia_imagen = False
+        mock_obtener.return_value = alerta_sin_visual
+
+        resp2 = self.client.get('/api/peticiones/duplicados/alertas/82/')
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK)
+        m2 = resp2.data['comparacion']['metricas']
+        self.assertFalse(m2['dinov2_calculada'])
+        self.assertIsNone(m2['porcentaje_similitud_visual'])
+        self.assertEqual(m2['estado_comparacion_visual'], 'No calculada')
+
+    @patch('peticiones.api.views.calcular_comparacion_visual_dinov2_alerta')
+    def test_endpoint_comparar_visual_dinov2_200_422_404_503_json_y_contrato(self, mock_comp):
+        from peticiones.services.alertas_duplicados_service import Dinov2NoDisponibleParaAlertaError
+
+        alerta_pendiente = _crear_mock_alerta(id_alerta=90)
+        alerta_pendiente.distancia_metros = 20.0
+        alerta_pendiente.distancia_hamming = None
+        alerta_pendiente.metodo_imagen = None
+        alerta_pendiente.similitud_imagen = None
+        alerta_pendiente.porcentaje_similitud_visual = None
+
+        mock_comp.return_value = {
+            'id_alerta': 90,
+            'alerta': alerta_pendiente,
+            'comparado': True,
+            'dinov2_calculada': True,
+            'visual_calculada': True,
+            'codigo': 'OK',
+            'motivo': None,
+            'mensaje': 'Similitud visual DINOv2 calculada correctamente.',
+            'similitud_imagen_porcentaje': 91.0,
+            'porcentaje_similitud_visual': 91.0,
+            'similitud_imagen': 0.91,
+            'similitud_visual_coseno': 0.91,
+            'coincidencia_imagen': True,
+            'metodo_imagen': 'dinov2_small',
+            'distancia_gps_metros': 20.0,
+            'radio_gps_metros': 200.0,
+            'porcentaje_proximidad_gps': 90.0,
+            'estado_revision': 'PENDIENTE',
+            'alerta_modificada': False,
+        }
+        resp = self.client.post(
+            '/api/peticiones/duplicados/alertas/90/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('application/json', resp['Content-Type'])
+        self.assertTrue(resp.data['comparado'])
+        self.assertEqual(resp.data['similitud_imagen_porcentaje'], 91.0)
+        self.assertEqual(resp.data['metodo_imagen'], 'dinov2_small')
+        self.assertEqual(resp.data['distancia_gps_metros'], 20.0)
+        self.assertFalse(resp.data['alerta_modificada'])
+        self.assertEqual(resp.data['alerta']['estado_revision'], 'PENDIENTE')
+
+        mock_comp.return_value = {
+            'id_alerta': 90,
+            'alerta': alerta_pendiente,
+            'comparado': False,
+            'codigo': 'SIN_FOTOGRAFIAS',
+            'motivo': 'SIN_FOTOGRAFIAS_EN_AMBAS_PETICIONES',
+            'mensaje': 'Ambas peticiones deben contar con al menos una fotografía válida para calcular DINOv2.',
+            'distancia_gps_metros': 20.0,
+            'radio_gps_metros': 200.0,
+            'porcentaje_proximidad_gps': 90.0,
+            'peticiones_sin_fotos': [10],
+            'alerta_modificada': False,
+        }
+        resp_422 = self.client.post(
+            '/api/peticiones/duplicados/alertas/90/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp_422.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertIn('application/json', resp_422['Content-Type'])
+        self.assertFalse(resp_422.data['comparado'])
+        self.assertEqual(resp_422.data['codigo'], 'SIN_FOTOGRAFIAS')
+        self.assertIsNone(resp_422.data['similitud_imagen_porcentaje'])
+        self.assertIsNone(resp_422.data['metodo_imagen'])
+        self.assertEqual(resp_422.data['distancia_gps_metros'], 20.0)
+        self.assertIn('fotografía válida', resp_422.data['error'])
+
+        mock_comp.side_effect = Dinov2NoDisponibleParaAlertaError(
+            'VetericanoIA offline',
+            distancia_gps_metros=20.0,
+        )
+        resp_503 = self.client.post(
+            '/api/peticiones/duplicados/alertas/90/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp_503.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn('application/json', resp_503['Content-Type'])
+        self.assertFalse(resp_503.data['comparado'])
+        self.assertEqual(resp_503.data['codigo'], 'DINOV2_NO_DISPONIBLE')
+        self.assertEqual(resp_503.data['distancia_gps_metros'], 20.0)
+        self.assertIn('VetericanoIA offline', resp_503.data['error'])
+
+        mock_comp.side_effect = AlertaNoEncontradaError('No existe')
+        resp_404 = self.client.post(
+            '/api/peticiones/duplicados/alertas/90/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp_404.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn('application/json', resp_404['Content-Type'])
+        self.assertFalse(resp_404.data['comparado'])

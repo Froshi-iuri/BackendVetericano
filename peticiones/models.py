@@ -461,13 +461,26 @@ class PeticionPosibleDuplicado(models.Model):
         db_column='id_peticion_principal',
         related_name='duplicados_confirmados_como_principal',
     )
+    peticion_duplicada = models.ForeignKey(
+        Peticiones,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        db_column='id_peticion_duplicada',
+        related_name='duplicados_confirmados_como_duplicada',
+    )
 
     similitud_texto = models.FloatField(null=True, blank=True)
     coincidencia_texto = models.BooleanField(default=False)
     distancia_metros = models.FloatField(null=True, blank=True)
+    radio_gps_metros = models.FloatField(null=True, blank=True, default=200.0)
+    porcentaje_proximidad_gps = models.FloatField(null=True, blank=True)
     coincidencia_gps = models.BooleanField(default=False)
     distancia_hamming = models.SmallIntegerField(null=True, blank=True)
     similitud_imagen = models.FloatField(null=True, blank=True)
+    similitud_visual_coseno = models.FloatField(null=True, blank=True)
+    porcentaje_similitud_visual = models.FloatField(null=True, blank=True)
+    metodo_imagen = models.CharField(max_length=40, null=True, blank=True)
     coincidencia_imagen = models.BooleanField(default=False)
     score_combinado = models.FloatField(default=0.0)
     criterios_coincidencia = models.JSONField(default=list, blank=True)
@@ -519,6 +532,23 @@ class PeticionPosibleDuplicado(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
+                    Q(peticion_duplicada__isnull=True)
+                    | Q(peticion_duplicada=F('peticion_menor'))
+                    | Q(peticion_duplicada=F('peticion_mayor'))
+                ),
+                name='chk_pet_dup_duplicada_par',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(peticion_principal__isnull=True)
+                    | Q(peticion_duplicada__isnull=True)
+                    | Q(peticion_principal__lt=F('peticion_duplicada'))
+                    | Q(peticion_principal__gt=F('peticion_duplicada'))
+                ),
+                name='chk_pet_dup_principal_distinta_duplicada',
+            ),
+            models.CheckConstraint(
+                condition=(
                     Q(peticion_origen__isnull=True)
                     | Q(peticion_origen=F('peticion_menor'))
                     | Q(peticion_origen=F('peticion_mayor'))
@@ -542,6 +572,10 @@ class PeticionPosibleDuplicado(models.Model):
             models.Index(
                 fields=['peticion_principal', 'estado_revision'],
                 name='idx_pet_dup_princ_est',
+            ),
+            models.Index(
+                fields=['peticion_duplicada', 'estado_revision'],
+                name='idx_pet_dup_duplicada_est',
             ),
         ]
 
@@ -601,6 +635,17 @@ class PeticionPosibleDuplicado(models.Model):
             if self.peticion_principal_id not in ids_par:
                 errores['peticion_principal'] = (
                     'La petición principal debe corresponder a una de las dos peticiones de la alerta.'
+                )
+
+        if self.peticion_duplicada_id is not None:
+            ids_par = {self.peticion_menor_id, self.peticion_mayor_id} - {None}
+            if self.peticion_duplicada_id not in ids_par:
+                errores['peticion_duplicada'] = (
+                    'La petición duplicada debe corresponder a una de las dos peticiones de la alerta.'
+                )
+            elif self.peticion_principal_id is not None and self.peticion_duplicada_id == self.peticion_principal_id:
+                errores['peticion_duplicada'] = (
+                    'La petición duplicada no puede coincidir con la petición original seleccionada.'
                 )
 
         if self.peticion_origen_id is not None:

@@ -23,10 +23,14 @@ from peticiones.api.serializers import (
 from peticiones.models import (
     EstadoPeticiones,
     EvidenciaPeticiones,
+    HistorialAsignacionPeticion,
     HistorialPeticiones,
     NotificacionJuridico,
+    NotificacionPeticion,
     Peticiones,
+    PeticionImagenEmbedding,
     PeticionPosibleDuplicado,
+    SeguimientoPeticionesVisita,
     TipoPeticion,
     Ubicaciones,
 )
@@ -67,7 +71,11 @@ _MODELOS_ESQUEMA_AISLADO = (
     Peticiones,
     EvidenciaPeticiones,
     NotificacionJuridico,
+    NotificacionPeticion,
+    HistorialAsignacionPeticion,
     HistorialPeticiones,
+    SeguimientoPeticionesVisita,
+    PeticionImagenEmbedding,
     PeticionPosibleDuplicado,
 )
 
@@ -499,12 +507,11 @@ class ConcurrenciaYRestriccionesBDTests(_BaseSqliteAisladoTestCase):
         ]
         self.assertEqual(len(ordenes_peticiones), 2)
 
-        # Ni peticiones ni evidencias reciben UPDATE/DELETE durante el flujo
+        # Ni peticiones ni evidencias reciben DELETE; las evidencias quedan intactas y la otra petición queda Duplicada
         self.assertFalse(
             any(
                 sql.startswith(
                     (
-                        'UPDATE "peticiones"',
                         'DELETE FROM "peticiones"',
                         'UPDATE "evidencia_peticiones"',
                         'DELETE FROM "evidencia_peticiones"',
@@ -513,6 +520,10 @@ class ConcurrenciaYRestriccionesBDTests(_BaseSqliteAisladoTestCase):
                 for sql in sqls
             )
         )
+        p1.refresh_from_db()
+        p2.refresh_from_db()
+        self.assertEqual(p1.id_estado.nombre, 'PENDIENTE')
+        self.assertEqual(p2.id_estado.nombre, 'Duplicada')
 
 
 class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
@@ -658,14 +669,19 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
         self.assertTrue(res_conf.cambiada)
         self.assertEqual(len(res_conf.historial_ids), 2)
 
-        # Repetir exactamente la misma confirmación es idempotente
-        res_conf_rep = confirmar_duplicado(
-            alerta.id_alerta,
-            peticion_principal=p1,
-            usuario_revisor=self.usuario_juridico_2,
-        )
-        self.assertFalse(res_conf_rep.cambiada)
-        self.assertEqual(res_conf_rep.historial_ids, ())
+        # Repetir decisión (incluso con el mismo payload) está prohibido para evitar decisiones repetidas
+        with self.assertRaises(TransicionAlertaInvalidaError):
+            confirmar_duplicado(
+                alerta.id_alerta,
+                peticion_principal=p1,
+                usuario_revisor=self.usuario_juridico_2,
+            )
+
+        # La no seleccionada queda marcada como Duplicada sin borrar sus datos ni evidencias
+        p1.refresh_from_db()
+        p2.refresh_from_db()
+        self.assertEqual(p1.id_estado_id, snapshot_p1[3])
+        self.assertEqual(p2.id_estado.nombre, 'Duplicada')
 
         # Cambiar de decisión sin bandera explícita falla
         with self.assertRaises(TransicionAlertaInvalidaError):
@@ -674,7 +690,7 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
         with self.assertRaises(TransicionAlertaInvalidaError):
             confirmar_duplicado(alerta.id_alerta, peticion_principal=p2, usuario_revisor=self.usuario_juridico)
 
-        # Reapertura explícita a PENDIENTE limpia principal y audita
+        # Reapertura explícita a PENDIENTE limpia principal/duplicada y audita
         res_reabrir = reabrir_alerta_pendiente(
             alerta.id_alerta,
             usuario_revisor=self.usuario_juridico_2,
@@ -684,6 +700,7 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
         self.assertEqual(res_reabrir.estado_anterior, 'CONFIRMADO')
         self.assertEqual(res_reabrir.estado_nuevo, 'PENDIENTE')
         self.assertIsNone(res_reabrir.alerta.peticion_principal_id)
+        self.assertIsNone(res_reabrir.alerta.peticion_duplicada_id)
 
         # Repetir PENDIENTE cuando ya está PENDIENTE es idempotente
         res_pend_idem = gestionar_decision_alerta(alerta.id_alerta, 'PENDIENTE')
@@ -701,9 +718,9 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
         self.assertTrue(res_desc.cambiada)
         self.assertEqual(res_desc.estado_nuevo, 'DESCARTADO')
 
-        # Repetir descarte es idempotente
-        res_desc_idem = descartar_duplicado(alerta.id_alerta)
-        self.assertFalse(res_desc_idem.cambiada)
+        # Repetir descarte ya resuelto también es rechazado
+        with self.assertRaises(TransicionAlertaInvalidaError):
+            descartar_duplicado(alerta.id_alerta)
 
         # Verifica historial completo: detección(2) + confirmación(2) + reapertura(2) + descarte(2) = 8
         tipos = list(HistorialPeticiones.objects.order_by('id_historial').values_list('tipo_cambio', flat=True))
@@ -721,7 +738,7 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
             ],
         )
 
-        # Verificar que ni peticiones ni evidencias originales sufrieron alteración alguna
+        # Verificar que ni peticiones ni evidencias originales sufrieron pérdida de datos
         p1.refresh_from_db()
         p2.refresh_from_db()
         self.assertEqual(
@@ -733,10 +750,13 @@ class DecisionesYRespetoEstadoPrevioTests(_BaseSqliteAisladoTestCase):
         )
         self.assertEqual(
             (
-                p2.numero_radicado, p2.id_tipo_id, p2.id_ubicacion_id, p2.id_estado_id,
+                p2.numero_radicado, p2.id_tipo_id, p2.id_ubicacion_id,
                 p2.responsable_id, p2.asignado_a_id, p2.descripcion, p2.prioridad, p2.foto,
             ),
-            snapshot_p2,
+            (
+                snapshot_p2[0], snapshot_p2[1], snapshot_p2[2],
+                snapshot_p2[4], snapshot_p2[5], snapshot_p2[6], snapshot_p2[7], snapshot_p2[8],
+            ),
         )
         self.assertEqual(
             list(
@@ -911,3 +931,364 @@ class BatchDeteccionYConsultasTests(_BaseSqliteAisladoTestCase):
         res = registrar_alerta_posible_duplicado(p1, p2)
         with self.assertRaises(UsuarioRevisionInvalidoError):
             confirmar_duplicado(res.alerta.id_alerta, peticion_principal=p1, usuario_revisor=888888)
+
+
+class ResolucionDuplicadosEndToEndSqliteTests(_BaseSqliteAisladoTestCase):
+    """
+    Pruebas integradas end-to-end API + ORM sobre SQLite aislado validando:
+    - Métricas separadas (GPS %, DINOv2 %, «No calculada», texto %, combinado %)
+    - Selección flexible de original (incluso la petición más reciente)
+    - Conservación física total sin borrar registros ni evidencias
+    - Marcado como Duplicada y exclusión de listas de asignación y bloqueo 409 al asignar
+    - Prevención de decisiones repetidas y auditoría completa en HistorialPeticiones
+    """
+
+    def setUp(self):
+        super().setUp()
+        from rest_framework.test import APIClient
+
+        self.rol_admin, _ = Rol.objects.get_or_create(id_rol=1, defaults={'nombre_rol': 'Administrador'})
+        self.rol_jur, _ = Rol.objects.get_or_create(id_rol=2, defaults={'nombre_rol': 'Jurídico'})
+        self.rol_vet, _ = Rol.objects.get_or_create(id_rol=3, defaults={'nombre_rol': 'Veterinario'})
+
+        self.admin_user = Usuarios.objects.create(
+            id_rol=self.rol_admin,
+            id_sede=self.sede,
+            nombre='Admin',
+            apellido='Principal',
+            email='admin.e2e@test.local',
+            password='hash',
+            activo=True,
+        )
+        self.jur_user = Usuarios.objects.create(
+            id_rol=self.rol_jur,
+            id_sede=self.sede,
+            nombre='Laura',
+            apellido='Juridico',
+            email='jur.e2e@test.local',
+            password='hash',
+            activo=True,
+        )
+        self.vet_user = Usuarios.objects.create(
+            id_rol=self.rol_vet,
+            id_sede=self.sede,
+            nombre='Carlos',
+            apellido='Veterinario',
+            email='vet.e2e@test.local',
+            password='hash',
+            activo=True,
+        )
+        self.estado_asignada = EstadoPeticiones.objects.create(nombre='Asignada', orden=2, activo=True)
+        self.client = APIClient()
+
+    def test_flujo_completo_seleccion_reciente_exclusion_asignacion_historial_y_conservacion(self):
+        # p_antigua tiene ID menor; p_reciente tiene ID mayor y evidencia adicional
+        p_antigua = self._crear_peticion(
+            radicado='PET-2026-0601',
+            descripcion='Perro herido en vía pública parque central',
+            estado=self.estado_en_revision,
+            foto='https://res.cloudinary.com/demo/image/upload/v1/antigua.jpg',
+        )
+        p_reciente = self._crear_peticion(
+            radicado='PET-2026-0602',
+            descripcion='Canino lastimado parque central con mayor detalle',
+            estado=self.estado_en_revision,
+            ubicacion=self.ubicacion_2,
+            foto='https://res.cloudinary.com/demo/image/upload/v1/reciente.jpg',
+        )
+        EvidenciaPeticiones.objects.create(
+            id_peticion=p_antigua,
+            ruta_archivo='https://res.cloudinary.com/demo/image/upload/v1/ev_antigua.jpg',
+            descripcion='Evidencia reporte antiguo',
+        )
+        EvidenciaPeticiones.objects.create(
+            id_peticion=p_reciente,
+            ruta_archivo='https://res.cloudinary.com/demo/image/upload/v1/ev_reciente.jpg',
+            descripcion='Evidencia reporte reciente',
+        )
+
+        # Alerta registrada inicialmente con proximidad GPS (40 m de 200 m -> 80%) y sin comparación visual
+        alerta = registrar_alerta_posible_duplicado(
+            p_antigua,
+            p_reciente,
+            peticion_origen=p_reciente,
+            evidencia_deteccion={
+                'similitud_texto': 0.72,
+                'coincidencia_texto': True,
+                'distancia_metros': 40.0,
+                'coincidencia_gps': True,
+                'score_combinado': 0.76,
+                'criterios_coincidencia': ['TEXTO', 'GPS'],
+            },
+        ).alerta
+
+        self.client.force_authenticate(user=self.jur_user)
+
+        # 1. Consultar detalle antes de DINOv2: muestra GPS % y visual "No calculada"
+        resp_det1 = self.client.get(f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/')
+        self.assertEqual(resp_det1.status_code, 200)
+        m1 = resp_det1.data['comparacion']['metricas']
+        self.assertEqual(m1['distancia_metros'], 40.0)
+        self.assertEqual(m1['radio_gps_metros'], 200.0)
+        self.assertEqual(m1['porcentaje_proximidad_gps'], 80.0)
+        self.assertFalse(m1['dinov2_calculada'])
+        self.assertIsNone(m1['porcentaje_similitud_visual'])
+        self.assertEqual(m1['estado_comparacion_visual'], 'No calculada')
+
+        # 2. Seleccionar la petición MÁS RECIENTE (p_reciente) como original -> CONFIRMADO
+        resp_res = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/resolver/',
+            {
+                'estado_revision': 'CONFIRMADO',
+                'peticion_principal': p_reciente.id_peticion,
+                'observacion': 'La petición más reciente tiene mejor evidencia y ubicación.',
+            },
+            format='json',
+        )
+        self.assertEqual(resp_res.status_code, 200)
+        self.assertEqual(resp_res.data['peticion_original_id'], p_reciente.id_peticion)
+        self.assertEqual(resp_res.data['peticion_duplicada_id'], p_antigua.id_peticion)
+        self.assertEqual(resp_res.data['alerta']['peticion_duplicada_id'], p_antigua.id_peticion)
+
+        # 3. Intentar repetir o cambiar decisión -> HTTP 409 Conflict
+        resp_rep = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/resolver/',
+            {'estado_revision': 'CONFIRMADO', 'peticion_principal': p_reciente.id_peticion},
+            format='json',
+        )
+        self.assertEqual(resp_rep.status_code, 409)
+        resp_cambio = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/resolver/',
+            {'estado_revision': 'DESCARTADO'},
+            format='json',
+        )
+        self.assertEqual(resp_cambio.status_code, 409)
+
+        # 4. Verificar que p_antigua está marcada Duplicada pero conservada íntegramente con sus evidencias
+        p_antigua.refresh_from_db()
+        p_reciente.refresh_from_db()
+        self.assertEqual(p_antigua.id_estado.nombre, 'Duplicada')
+        self.assertEqual(p_reciente.id_estado.nombre, 'EN REVISION')
+        self.assertTrue(Peticiones.objects.filter(pk=p_antigua.id_peticion).exists())
+        self.assertEqual(EvidenciaPeticiones.objects.filter(id_peticion=p_antigua).count(), 1)
+        self.assertEqual(EvidenciaPeticiones.objects.filter(id_peticion=p_reciente).count(), 1)
+
+        # 5. Excluir petición duplicada de GET /api/peticiones/listar/ y conservar la original
+        resp_lista = self.client.get('/api/peticiones/listar/')
+        self.assertEqual(resp_lista.status_code, 200)
+        ids_listados = [item['id_peticion'] for item in resp_lista.data]
+        self.assertIn(p_reciente.id_peticion, ids_listados)
+        self.assertNotIn(p_antigua.id_peticion, ids_listados)
+
+        # 6. Bloquear asignación veterinaria a la petición duplicada (409) y permitirla en la original (200)
+        resp_asig_dup = self.client.patch(
+            f'/api/peticiones/{p_antigua.id_peticion}/asignar/',
+            {'asignado_a': self.vet_user.id_usuario},
+            format='json',
+        )
+        self.assertEqual(resp_asig_dup.status_code, 409)
+        self.assertEqual(resp_asig_dup.data['codigo'], 'PETICION_DUPLICADA')
+
+        resp_estado_dup = self.client.patch(
+            f'/api/peticiones/{p_antigua.id_peticion}/estado/',
+            {'estado': 'En Proceso'},
+            format='json',
+        )
+        self.assertEqual(resp_estado_dup.status_code, 409)
+
+        resp_asig_orig = self.client.patch(
+            f'/api/peticiones/{p_reciente.id_peticion}/asignar/',
+            {'asignado_a': self.vet_user.id_usuario},
+            format='json',
+        )
+        self.assertEqual(resp_asig_orig.status_code, 200)
+
+        # 7. Verificar trazabilidad en GET /api/peticiones/<id>/historial/ para ambas peticiones
+        for pid in (p_antigua.id_peticion, p_reciente.id_peticion):
+            resp_hist = self.client.get(f'/api/peticiones/{pid}/historial/')
+            self.assertEqual(resp_hist.status_code, 200)
+            eventos_conf = [h for h in resp_hist.data if h['tipo_cambio'] == HISTORIAL_TIPO_DUPLICADO_CONFIRMADO]
+            self.assertEqual(len(eventos_conf), 1)
+            ev = eventos_conf[0]
+            self.assertEqual(ev['id_usuario_accion'], self.jur_user.id_usuario)
+            self.assertIn('Laura Juridico', ev['usuario_accion_nombre'] or '')
+            self.assertIsNotNone(ev['fecha'])
+            self.assertIn('PET-2026-0602', ev['observacion'])
+            self.assertIn('PET-2026-0601', ev['observacion'])
+
+    @patch('peticiones.services.ia_client_service.requests.post')
+    @patch('peticiones.services.imagen_hash_service.descargar_imagen_segura')
+    def test_comparar_visual_dinov2_reutiliza_embeddings_y_no_modifica_alerta(self, mock_descarga, mock_ia_post):
+        from io import BytesIO
+        from unittest.mock import MagicMock
+        import requests as http_requests
+        from django.test import override_settings
+        from PIL import Image
+        from decimal import Decimal
+        from peticiones.models import PeticionImagenEmbedding, Ubicaciones
+
+        ubic1 = Ubicaciones.objects.create(
+            direccion='Punto GPS 1',
+            latitud=Decimal('2.444800'),
+            longitud=Decimal('-76.614700'),
+        )
+        ubic2 = Ubicaciones.objects.create(
+            direccion='Punto GPS 2',
+            latitud=Decimal('2.444890'),
+            longitud=Decimal('-76.614700'),
+        )
+        url1 = 'https://res.cloudinary.com/demo/image/upload/v1/d1.jpg'
+        url2 = 'https://res.cloudinary.com/demo/image/upload/v1/d2.jpg'
+
+        p1 = self._crear_peticion(
+            radicado='PET-2026-0701',
+            foto=url1,
+            ubicacion=ubic1,
+        )
+        p2 = self._crear_peticion(
+            radicado='PET-2026-0702',
+            foto=url2,
+            ubicacion=ubic2,
+        )
+        alerta = registrar_alerta_posible_duplicado(
+            p1,
+            p2,
+            evidencia_deteccion={'distancia_metros': None, 'coincidencia_gps': True, 'score_combinado': 0.55},
+        ).alerta
+
+        # Petición 1 ya cuenta con embedding en caché DB; Petición 2 consulta VetericanoIA
+        vec_cache = [1.0] + [0.0] * 383
+        vec_nuevo = [0.8, 0.6] + [0.0] * 382
+        PeticionImagenEmbedding.objects.create(
+            peticion=p1,
+            url_imagen=url1,
+            modelo_ia='facebook/dinov2-small',
+            dimensiones=384,
+            embedding_vector=vec_cache,
+        )
+
+        buf = BytesIO()
+        Image.new('RGB', (64, 64), color=(180, 120, 60)).save(buf, format='JPEG')
+        img_bytes = buf.getvalue()
+        mock_descarga.return_value = img_bytes
+
+        resp_ia = MagicMock()
+        resp_ia.status_code = 200
+        resp_ia.json.return_value = {'ok': True, 'dimensiones': 384, 'embedding': vec_nuevo}
+        mock_ia_post.return_value = resp_ia
+
+        # Roles no autorizados reciben 401/403 JSON incluso con HTTP_ACCEPT=text/html
+        resp_401 = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+            {},
+            format='json',
+        )
+        self.assertEqual(resp_401.status_code, 401)
+
+        self.client.force_authenticate(user=self.vet_user)
+        resp_vet = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp_vet.status_code, 403)
+        self.assertIn('application/json', resp_vet['Content-Type'])
+
+        with override_settings(
+            DUPLICADOS_DINOV2_BACKEND='microservicio',
+            DUPLICADOS_DINOV2_MICROSERVICIO_URL='http://vetericano-ia.internal:8001',
+            DUPLICADOS_DINOV2_MICROSERVICIO_SECRET='secreto-test-interno',
+        ):
+            # Jurídico autorizado ejecuta comparación visual DINOv2
+            self.client.force_authenticate(user=self.jur_user)
+            historial_antes = HistorialPeticiones.objects.count()
+            resp = self.client.post(
+                f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+                {},
+                format='json',
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn('application/json', resp['Content-Type'])
+            self.assertTrue(resp.data['comparado'])
+            self.assertEqual(resp.data['similitud_imagen_porcentaje'], 80.0)
+            self.assertEqual(resp.data['metodo_imagen'], 'dinov2_small')
+            self.assertIsNotNone(resp.data['distancia_gps_metros'])
+            self.assertGreater(resp.data['distancia_gps_metros'], 5.0)
+            self.assertLess(resp.data['distancia_gps_metros'], 15.0)
+            self.assertFalse(resp.data['alerta_modificada'])
+
+            # Verifica que p1 usó embedding existente y solo p2 descargó y llamó a VetericanoIA
+            self.assertEqual(mock_descarga.call_count, 1)
+            self.assertIn('d2.jpg', mock_descarga.call_args.args[0])
+            mock_ia_post.assert_called_once()
+            self.assertEqual(
+                mock_ia_post.call_args.args[0],
+                'http://vetericano-ia.internal:8001/embed/',
+            )
+
+            # Garantiza que NO se modificó ni resolvió automáticamente la alerta ni las peticiones
+            alerta.refresh_from_db()
+            p1.refresh_from_db()
+            p2.refresh_from_db()
+            self.assertEqual(alerta.estado_revision, PeticionPosibleDuplicado.ESTADO_PENDIENTE)
+            self.assertIsNone(alerta.peticion_principal_id)
+            self.assertIsNone(alerta.peticion_duplicada_id)
+            self.assertIsNone(alerta.similitud_imagen)
+            self.assertIsNone(alerta.porcentaje_similitud_visual)
+            self.assertIsNone(alerta.metodo_imagen)
+            self.assertIsNone(alerta.distancia_metros)
+            self.assertEqual(HistorialPeticiones.objects.count(), historial_antes)
+
+            # Fallback de fallo en VetericanoIA -> JSON 503 explicativo, nunca HTML ni mutación
+            PeticionImagenEmbedding.objects.filter(peticion=p2).delete()
+            mock_ia_post.reset_mock()
+            mock_ia_post.side_effect = http_requests.Timeout('Timeout hacia VetericanoIA')
+
+            self.client.force_authenticate(user=self.admin_user)
+            resp_503 = self.client.post(
+                f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+                {},
+                format='json',
+                HTTP_ACCEPT='text/html',
+            )
+            self.assertEqual(resp_503.status_code, 503)
+            self.assertIn('application/json', resp_503['Content-Type'])
+            self.assertFalse(resp_503.data['comparado'])
+            self.assertEqual(resp_503.data['codigo'], 'DINOV2_NO_DISPONIBLE')
+            self.assertIn('DINOv2', resp_503.data['error'])
+            self.assertIsNotNone(resp_503.data['distancia_gps_metros'])
+
+    @patch('peticiones.services.ia_client_service.requests.post')
+    def test_comparar_visual_dinov2_sin_fotos_retorna_json_explicativo_sin_llamar_ia(self, mock_ia_post):
+        p_sin_foto = self._crear_peticion(radicado='PET-2026-0710', foto=None)
+        p_solo_video = self._crear_peticion(
+            radicado='PET-2026-0711',
+            foto='https://res.cloudinary.com/demo/video/upload/v1/video.mp4',
+        )
+        alerta = registrar_alerta_posible_duplicado(
+            p_sin_foto,
+            p_solo_video,
+            evidencia_deteccion={'distancia_metros': 35.0, 'coincidencia_gps': True, 'score_combinado': 0.45},
+        ).alerta
+
+        self.client.force_authenticate(user=self.admin_user)
+        resp = self.client.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+            {},
+            format='json',
+            HTTP_ACCEPT='text/html',
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn('application/json', resp['Content-Type'])
+        self.assertFalse(resp.data['comparado'])
+        self.assertEqual(resp.data['codigo'], 'SIN_FOTOGRAFIAS')
+        self.assertIsNone(resp.data['similitud_imagen_porcentaje'])
+        self.assertIsNone(resp.data['metodo_imagen'])
+        self.assertEqual(resp.data['distancia_gps_metros'], 35.0)
+        self.assertEqual(sorted(resp.data['peticiones_sin_fotos']), sorted([p_sin_foto.id_peticion, p_solo_video.id_peticion]))
+        self.assertFalse(resp.data['alerta_modificada'])
+        mock_ia_post.assert_not_called()
+
+        alerta.refresh_from_db()
+        self.assertEqual(alerta.estado_revision, PeticionPosibleDuplicado.ESTADO_PENDIENTE)

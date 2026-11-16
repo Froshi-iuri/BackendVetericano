@@ -1454,6 +1454,32 @@ def _enriquecer_datos_juridico_peticion(instance, data: dict, incluir_historial:
     )
 
     tiempos = calcular_tiempos_peticion(instance)
+    estado_obj = getattr(instance, 'id_estado', None)
+    nombre_estado_raw = getattr(estado_obj, 'nombre', None)
+    nombre_estado_norm = (
+        nombre_estado_raw.strip().lower()
+        if isinstance(nombre_estado_raw, str)
+        else ''
+    )
+    flag_duplicada_anotada = getattr(instance, '_es_duplicada_confirmada', None)
+    duplicado_de_id = getattr(instance, '_duplicado_de_id', None)
+    if not isinstance(duplicado_de_id, int) or isinstance(duplicado_de_id, bool):
+        duplicado_de_id = None
+
+    if (
+        duplicado_de_id is None
+        and incluir_historial
+        and getattr(getattr(instance, '_state', None), 'db', None)
+        and getattr(instance, 'pk', None)
+    ):
+        from peticiones.services.alertas_duplicados_service import obtener_peticion_original_de_duplicada
+        duplicado_de_id = obtener_peticion_original_de_duplicada(instance.pk)
+
+    es_duplicada = bool(
+        (isinstance(flag_duplicada_anotada, bool) and flag_duplicada_anotada)
+        or nombre_estado_norm in ('duplicada', 'duplicado')
+        or duplicado_de_id is not None
+    )
 
     data['id_estado'] = getattr(instance, 'id_estado_id', None)
     data['asignado_a'] = getattr(instance, 'asignado_a_id', None)
@@ -1464,7 +1490,9 @@ def _enriquecer_datos_juridico_peticion(instance, data: dict, incluir_historial:
     data['tiempo_desde_asignacion'] = tiempos['tiempo_desde_asignacion']
     data['dias_transcurridos'] = tiempos['dias_transcurridos']
     data['dias_sin_avanzar'] = tiempos['dias_sin_avanzar']
-    data['puede_reasignar'] = tiempos['puede_reasignar']
+    data['puede_reasignar'] = tiempos['puede_reasignar'] and not es_duplicada
+    data['es_duplicada'] = es_duplicada
+    data['duplicado_de_id'] = duplicado_de_id
 
     if incluir_historial:
         data['historial'] = construir_historial_peticion_lista(instance)
@@ -1729,6 +1757,94 @@ def _serializar_peticion_alerta(peticion, *, detallado=False, id_origen=None, id
     return data
 
 
+def _extraer_peticion_duplicada_id(obj) -> int | None:
+    raw_dup = getattr(obj, 'peticion_duplicada_id', None)
+    if isinstance(raw_dup, int) and not isinstance(raw_dup, bool) and raw_dup > 0:
+        return raw_dup
+    estado = getattr(obj, 'estado_revision', None)
+    raw_princ = getattr(obj, 'peticion_principal_id', None)
+    menor = getattr(obj, 'peticion_menor_id', None)
+    mayor = getattr(obj, 'peticion_mayor_id', None)
+    if (
+        estado == PeticionPosibleDuplicado.ESTADO_CONFIRMADO
+        and isinstance(raw_princ, int)
+        and not isinstance(raw_princ, bool)
+        and isinstance(menor, int)
+        and isinstance(mayor, int)
+    ):
+        if raw_princ == menor:
+            return mayor
+        if raw_princ == mayor:
+            return menor
+    return None
+
+
+def _construir_metricas_alerta_dict(obj) -> dict:
+    from peticiones.services.alertas_duplicados_service import (
+        calcular_porcentaje_proximidad_gps,
+        obtener_radio_gps_referencia,
+        resolver_estado_metrica_visual,
+    )
+
+    def _float_o_none(val):
+        if val is None or isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        num = float(val)
+        import math
+        return num if math.isfinite(num) else None
+
+    def _int_o_none(val):
+        if val is None or isinstance(val, bool):
+            return None
+        if isinstance(val, int):
+            return int(val)
+        return None
+
+    sim_texto = _float_o_none(getattr(obj, 'similitud_texto', None))
+    pct_texto = (
+        round(max(0.0, min(1.0, sim_texto)) * 100.0, 2)
+        if sim_texto is not None
+        else None
+    )
+
+    distancia_metros = _float_o_none(getattr(obj, 'distancia_metros', None))
+    radio_gps = obtener_radio_gps_referencia(_float_o_none(getattr(obj, 'radio_gps_metros', None)))
+    pct_gps = _float_o_none(getattr(obj, 'porcentaje_proximidad_gps', None))
+    if pct_gps is None and distancia_metros is not None:
+        pct_gps = calcular_porcentaje_proximidad_gps(distancia_metros, radio_gps)
+
+    info_visual = resolver_estado_metrica_visual(obj)
+
+    score_raw = _float_o_none(getattr(obj, 'score_combinado', None))
+    score_val = score_raw if score_raw is not None else 0.0
+    pct_score = round(max(0.0, min(1.0, score_val)) * 100.0, 2)
+
+    criterios = list(getattr(obj, 'criterios_coincidencia', None) or [])
+
+    return {
+        'similitud_texto': sim_texto,
+        'porcentaje_similitud_texto': pct_texto,
+        'coincidencia_texto': bool(getattr(obj, 'coincidencia_texto', False)),
+        'distancia_metros': round(distancia_metros, 2) if distancia_metros is not None else None,
+        'radio_gps_metros': round(radio_gps, 2),
+        'porcentaje_proximidad_gps': pct_gps,
+        'coincidencia_gps': bool(getattr(obj, 'coincidencia_gps', False)),
+        'distancia_hamming': _int_o_none(getattr(obj, 'distancia_hamming', None)),
+        'similitud_imagen': _float_o_none(getattr(obj, 'similitud_imagen', None)),
+        'coincidencia_imagen': bool(getattr(obj, 'coincidencia_imagen', False)),
+        'metodo_imagen': info_visual['metodo_imagen'],
+        'dinov2_calculada': info_visual['dinov2_calculada'],
+        'visual_calculada': info_visual['visual_calculada'],
+        'similitud_visual_coseno': info_visual['similitud_visual_coseno'],
+        'similitud_visual_dinov2': info_visual['similitud_visual_dinov2'],
+        'porcentaje_similitud_visual': info_visual['porcentaje_similitud_visual'],
+        'estado_comparacion_visual': info_visual['estado_comparacion_visual'],
+        'score_combinado': round(score_val, 4),
+        'porcentaje_score_combinado': pct_score,
+        'criterios_coincidencia': criterios,
+    }
+
+
 class PeticionPosibleDuplicadoListSerializer(serializers.ModelSerializer):
     """Representación resumida de una alerta de posible duplicado para listados."""
 
@@ -1736,6 +1852,12 @@ class PeticionPosibleDuplicadoListSerializer(serializers.ModelSerializer):
     peticion_mayor_id = serializers.IntegerField(read_only=True)
     peticion_origen_id = serializers.IntegerField(read_only=True, allow_null=True)
     peticion_principal_id = serializers.IntegerField(read_only=True, allow_null=True)
+    peticion_duplicada_id = serializers.SerializerMethodField()
+    radio_gps_metros = serializers.SerializerMethodField()
+    porcentaje_proximidad_gps = serializers.SerializerMethodField()
+    metodo_imagen = serializers.SerializerMethodField()
+    similitud_visual_coseno = serializers.SerializerMethodField()
+    porcentaje_similitud_visual = serializers.SerializerMethodField()
     revisado_por = serializers.SerializerMethodField()
     peticion_menor = serializers.SerializerMethodField()
     peticion_mayor = serializers.SerializerMethodField()
@@ -1749,12 +1871,18 @@ class PeticionPosibleDuplicadoListSerializer(serializers.ModelSerializer):
             'peticion_mayor_id',
             'peticion_origen_id',
             'peticion_principal_id',
+            'peticion_duplicada_id',
             'similitud_texto',
             'coincidencia_texto',
             'distancia_metros',
+            'radio_gps_metros',
+            'porcentaje_proximidad_gps',
             'coincidencia_gps',
             'distancia_hamming',
             'similitud_imagen',
+            'similitud_visual_coseno',
+            'porcentaje_similitud_visual',
+            'metodo_imagen',
             'coincidencia_imagen',
             'score_combinado',
             'criterios_coincidencia',
@@ -1768,6 +1896,24 @@ class PeticionPosibleDuplicadoListSerializer(serializers.ModelSerializer):
             'peticion_mayor',
         ]
         read_only_fields = fields
+
+    def get_peticion_duplicada_id(self, obj):
+        return _extraer_peticion_duplicada_id(obj)
+
+    def get_radio_gps_metros(self, obj):
+        return _construir_metricas_alerta_dict(obj)['radio_gps_metros']
+
+    def get_porcentaje_proximidad_gps(self, obj):
+        return _construir_metricas_alerta_dict(obj)['porcentaje_proximidad_gps']
+
+    def get_metodo_imagen(self, obj):
+        return _construir_metricas_alerta_dict(obj)['metodo_imagen']
+
+    def get_similitud_visual_coseno(self, obj):
+        return _construir_metricas_alerta_dict(obj)['similitud_visual_coseno']
+
+    def get_porcentaje_similitud_visual(self, obj):
+        return _construir_metricas_alerta_dict(obj)['porcentaje_similitud_visual']
 
     def get_revisado_por(self, obj):
         return _serializar_usuario_alerta(getattr(obj, 'revisado_por', None))
@@ -1824,26 +1970,22 @@ class PeticionPosibleDuplicadoDetailSerializer(PeticionPosibleDuplicadoListSeria
             except TypeError:
                 diferencia_horas = None
 
-        criterios = list(getattr(obj, 'criterios_coincidencia', None) or [])
+        metricas = _construir_metricas_alerta_dict(obj)
+        id_principal = getattr(obj, 'peticion_principal_id', None)
+        if not isinstance(id_principal, int) or isinstance(id_principal, bool):
+            id_principal = None
+
         return {
             'peticion_menor_id': getattr(obj, 'peticion_menor_id', None),
             'peticion_mayor_id': getattr(obj, 'peticion_mayor_id', None),
+            'peticion_principal_id': id_principal,
+            'peticion_duplicada_id': _extraer_peticion_duplicada_id(obj),
             'mismo_tipo': bool(tipo_menor and tipo_menor == tipo_mayor),
             'mismo_estado': bool(estado_menor and estado_menor == estado_mayor),
             'ambas_asignadas': bool(asig_menor and asig_mayor),
             'mismo_veterinario_asignado': bool(asig_menor and asig_menor == asig_mayor),
             'diferencia_tiempo_horas': diferencia_horas,
-            'metricas': {
-                'similitud_texto': getattr(obj, 'similitud_texto', None),
-                'coincidencia_texto': bool(getattr(obj, 'coincidencia_texto', False)),
-                'distancia_metros': getattr(obj, 'distancia_metros', None),
-                'coincidencia_gps': bool(getattr(obj, 'coincidencia_gps', False)),
-                'distancia_hamming': getattr(obj, 'distancia_hamming', None),
-                'similitud_imagen': getattr(obj, 'similitud_imagen', None),
-                'coincidencia_imagen': bool(getattr(obj, 'coincidencia_imagen', False)),
-                'score_combinado': getattr(obj, 'score_combinado', 0.0),
-                'criterios_coincidencia': criterios,
-            },
+            'metricas': metricas,
         }
 
 
