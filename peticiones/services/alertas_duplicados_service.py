@@ -1698,6 +1698,19 @@ def calcular_comparacion_visual_dinov2_alerta(
 
     cfg = obtener_config_duplicados()
     cache_emb: dict[str, list[float] | None] = {}
+    precargar_fn = getattr(dinov2_service, 'precargar_embeddings_bd', None)
+    if callable(precargar_fn):
+        max_img = cfg['max_imagenes_por_peticion']
+        precargar_fn(
+            list(fotos_menor[:max_img]) + list(fotos_mayor[:max_img]),
+            cache=cache_emb,
+            id_peticiones=[
+                pid
+                for pid in (alerta.peticion_menor_id, alerta.peticion_mayor_id)
+                if pid is not None
+            ],
+            usar_cache_bd=True,
+        )
     try:
         emb_menor = dinov2_service.calcular_embeddings_urls(
             fotos_menor,

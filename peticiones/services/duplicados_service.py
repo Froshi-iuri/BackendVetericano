@@ -436,7 +436,7 @@ def _serializar_candidato(
         'distancia_hamming': int(distancia_hamming) if distancia_hamming is not None else None,
         'similitud_imagen': round(float(similitud_imagen), 4) if similitud_imagen is not None else None,
         'posible_duplicado': (
-            bool(coincidencia_imagen and coincidencia_gps)
+            bool(coincidencia_gps)
             if incluir_meta_dinov2
             else bool(coincidencia_texto or coincidencia_gps or coincidencia_imagen)
         ),
@@ -543,6 +543,8 @@ def _comparar_con_dhash(
 
     candidatos_img_procesados = 0
     for _, item in preseleccionados:
+        if item.get('metodo_imagen') == 'dinov2_small':
+            continue
         if candidatos_img_procesados >= max_candidatos_img:
             break
 
@@ -598,6 +600,25 @@ def _ejecutar_comparacion_visual(
 
     if dinov2_habilitado:
         cache_embeddings: Dict[str, Optional[List[float]]] = {}
+        precargar_fn = getattr(dinov2_service, 'precargar_embeddings_bd', None)
+        if callable(precargar_fn):
+            urls_precarga: List[str] = list(urls_origen)
+            ids_precarga: List[int] = []
+            candidatos_vis = 0
+            for _, item in preseleccionados:
+                if candidatos_vis >= max_candidatos_img:
+                    break
+                pet = item['peticion']
+                _, fotos_cand = extraer_fotografias_peticion(pet)
+                if not fotos_cand:
+                    continue
+                candidatos_vis += 1
+                urls_precarga.extend(fotos_cand[:max_imagenes_pet])
+                pid = getattr(pet, 'id_peticion', None)
+                if pid is not None:
+                    ids_precarga.append(pid)
+            precargar_fn(urls_precarga, cache=cache_embeddings, id_peticiones=ids_precarga)
+
         try:
             embeddings_origen = dinov2_service.calcular_embeddings_urls(
                 urls_origen,
@@ -686,11 +707,14 @@ def _ejecutar_comparacion_visual(
 
         if not dinov2_fallo:
             return False, None
+        for _, item in preseleccionados:
+            if item.get('metodo_imagen') != 'dinov2_small':
+                item['metodo_imagen'] = 'dhash_fallback' if dinov2_fallback_dhash else 'dinov2_no_disponible'
+                item['porcentaje_similitud_visual'] = None
+                item['similitud_visual_coseno'] = None
         if not dinov2_fallback_dhash:
             return False, None
 
-        for _, item in preseleccionados:
-            item['metodo_imagen'] = 'dhash_fallback'
         dhash_ok = _comparar_con_dhash(
             preseleccionados,
             urls_origen=urls_origen,
@@ -770,7 +794,7 @@ def buscar_peticiones_similares_por_descripcion(
     gps_activo = coords_origen is not None
     urls_origen = _normalizar_lista_urls_origen(foto=foto, fotos=fotos) if incluir_imagenes else []
 
-    if dinov2_habilitado and not (gps_activo and urls_origen):
+    if dinov2_habilitado and not gps_activo:
         return _construir_respuesta(
             [],
             umbral=umbral_val,
@@ -780,15 +804,15 @@ def buscar_peticiones_similares_por_descripcion(
             limite=limite_val,
             excluir_id_peticion=excluir_id_peticion,
             texto_activo=texto_activo,
-            gps_activo=gps_activo,
+            gps_activo=False,
             imagen_activo=False,
             umbral_hamming=umbral_hamming_val,
             dinov2_activo=True,
             umbral_dinov2=umbral_dinov2_val,
             metodo_imagen=None,
             mensaje=(
-                'El flujo DINOv2 exige tanto fotografía válida como coordenadas GPS '
-                'dentro del radio configurado para detectar posibles duplicados.'
+                'Se requieren coordenadas GPS válidas dentro del radio configurado '
+                '(200 m) para detectar posibles duplicados.'
             ),
         )
 
@@ -997,7 +1021,7 @@ def buscar_peticiones_similares_por_descripcion(
         coinc_gps = bool(item['coincidencia_gps'])
         coinc_img = bool(item['coincidencia_imagen'])
         if dinov2_habilitado:
-            if not (coinc_img and coinc_gps):
+            if not coinc_gps:
                 continue
         elif not (coinc_txt or coinc_gps or coinc_img):
             continue

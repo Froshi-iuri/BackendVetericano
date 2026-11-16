@@ -60,6 +60,7 @@ class IASettings:
     max_concurrent_inferences: int = 1
     max_pending_queue: int = 4
     queue_wait_seconds: float = 4.0
+    torch_num_threads: int = 1
     preload_model: bool = True
     host: str = '127.0.0.1'
     port: int = 8001
@@ -130,6 +131,12 @@ def cargar_configuracion() -> IASettings:
             4.0,
             0.1,
             30.0,
+        ),
+        torch_num_threads=_leer_int_rango(
+            os.environ.get('IA_TORCH_NUM_THREADS'),
+            1,
+            1,
+            4,
         ),
         preload_model=_leer_bool(os.environ.get('IA_PRELOAD_MODEL'), True),
         host=host,

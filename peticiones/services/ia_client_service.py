@@ -7,16 +7,33 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 HEADER_SECRETO_INTERNO = 'X-Vetericano-IA-Secret'
 TIMEOUT_MICROSERVICIO_DEFAULT = 6.0
+_ORIG_REQUESTS_POST = requests.post
+_thread_local = threading.local()
+
+
+def _obtener_sesion_http() -> requests.Session:
+    """Retorna una sesión HTTP keep-alive aislada por hilo para reutilizar conexiones TCP."""
+    session = getattr(_thread_local, 'ia_session', None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        _thread_local.ia_session = session
+    return session
 
 
 def _leer_timeout_seguro(valor: Any, default: float = TIMEOUT_MICROSERVICIO_DEFAULT) -> float:
@@ -94,8 +111,11 @@ def solicitar_embedding_dinov2(
     endpoint = f'{url_base}/embed/'
 
     resp = None
+    inicio_ms = time.perf_counter()
     try:
-        resp = requests.post(
+        # Si pruebas unitarias parchean `requests.post`, respetamos ese hook directamente.
+        post_fn = requests.post if requests.post is not _ORIG_REQUESTS_POST else _obtener_sesion_http().post
+        resp = post_fn(
             endpoint,
             headers={HEADER_SECRETO_INTERNO: secreto},
             files={'imagen': ('imagen.bin', contenido_imagen, 'application/octet-stream')},
@@ -103,10 +123,21 @@ def solicitar_embedding_dinov2(
             allow_redirects=False,
         )
     except requests.Timeout as exc:
+        logger.warning(
+            'Timeout (%ss) llamando a VetericanoIA tras %.1f ms (bytes=%s).',
+            timeout_val,
+            (time.perf_counter() - inicio_ms) * 1000.0,
+            len(contenido_imagen),
+        )
         raise ModelDinov2NoDisponibleError(
             f'Timeout ({timeout_val}s) esperando respuesta de VetericanoIA.'
         ) from exc
     except requests.RequestException as exc:
+        logger.warning(
+            'Error de conexión llamando a VetericanoIA tras %.1f ms: %s',
+            (time.perf_counter() - inicio_ms) * 1000.0,
+            exc,
+        )
         raise ModelDinov2NoDisponibleError(
             f'No fue posible conectar con VetericanoIA: {exc}'
         ) from exc

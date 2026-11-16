@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -169,6 +171,7 @@ def create_app(
                 engine.liberar_cupo()
 
         try:
+            t_inicio = time.perf_counter()
             try:
                 contenido = await leer_upload_con_limite(imagen, cfg.max_image_bytes)
                 imagen_rgb = decodificar_y_validar_imagen_bytes(
@@ -179,12 +182,14 @@ def create_app(
                 )
             except PayloadDemasiadoGrandeError as exc:
                 _liberar_si_pendiente()
+                logger.warning('Payload excedido en /embed/: %s', exc)
                 raise HTTPException(
                     status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                     detail=str(exc),
                 ) from exc
             except ImagenInvalidaError as exc:
                 _liberar_si_pendiente()
+                logger.warning('Imagen inválida en /embed/: %s', exc)
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=str(exc),
@@ -198,16 +203,26 @@ def create_app(
                     cupo_reservado=True,
                 )
             except ColaSaturadaError as exc:
+                logger.warning('Cola saturada en /embed/: %s', exc)
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     headers={'Retry-After': '1'},
                     content={'ok': False, 'detail': str(exc)},
                 )
             except MotorDinov2Error as exc:
+                logger.error('Error DINOv2 en /embed/: %s', exc)
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={'ok': False, 'detail': str(exc)},
                 )
+        except asyncio.CancelledError:
+            _liberar_si_pendiente()
+            elapsed_ms = round((time.perf_counter() - t_inicio) * 1000.0, 2)
+            logger.warning(
+                'Solicitud /embed/ cancelada por desconexión o timeout del cliente tras %.2f ms.',
+                elapsed_ms,
+            )
+            raise
         except HTTPException:
             raise
         except Exception as exc:
@@ -218,6 +233,16 @@ def create_app(
                 content={'ok': False, 'detail': 'Fallo interno temporal en inferencia visual.'},
             )
 
+        total_ms = round((time.perf_counter() - t_inicio) * 1000.0, 2)
+        logger.info(
+            'POST /embed/ OK: bytes=%d size=%sx%s inferencia_ms=%.2f total_ms=%.2f threads=%d',
+            len(contenido),
+            imagen_rgb.size[0],
+            imagen_rgb.size[1],
+            duracion_ms,
+            total_ms,
+            cfg.torch_num_threads,
+        )
         return {
             'ok': True,
             'modelo': cfg.model_name,

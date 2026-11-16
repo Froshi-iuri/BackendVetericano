@@ -237,25 +237,38 @@ def _mapear_candidato_ciudadano(
     }
 
     if incluir_visual_dinov2:
+        metodo_imagen = candidato.get('metodo_imagen')
         porcentaje_raw = candidato.get('porcentaje_similitud_visual')
-        if porcentaje_raw is None and candidato.get('similitud_imagen') is not None:
+        if (
+            porcentaje_raw is None
+            and metodo_imagen in ('dinov2_small', None)
+            and candidato.get('similitud_imagen') is not None
+        ):
             try:
                 porcentaje_raw = round(float(candidato['similitud_imagen']) * 100.0, 2)
             except (TypeError, ValueError):
                 porcentaje_raw = None
+
+        porcentaje_final = (
+            round(float(porcentaje_raw), 2)
+            if porcentaje_raw is not None and not isinstance(porcentaje_raw, bool)
+            else None
+        )
+        similitud_visual_label = _clasificar_similitud_visual(porcentaje_final)
+        advertencia_default = (
+            'Similitud visual no disponible; advertencia generada por proximidad GPS (<= 200 m).'
+            if porcentaje_final is None
+            else ADVERTENCIA_METRICA_VISUAL_DEFAULT
+        )
         resultado.update({
             'coincidencia_imagen': bool(candidato.get('coincidencia_imagen', False)),
-            'porcentaje_similitud_visual': (
-                round(float(porcentaje_raw), 2)
-                if porcentaje_raw is not None and not isinstance(porcentaje_raw, bool)
-                else None
-            ),
-            'similitud_visual': _clasificar_similitud_visual(porcentaje_raw),
-            'metodo_imagen': candidato.get('metodo_imagen'),
+            'porcentaje_similitud_visual': porcentaje_final,
+            'similitud_visual': similitud_visual_label,
+            'metodo_imagen': metodo_imagen,
             'es_certeza_identidad': False,
             'tipo_metrica_visual': candidato.get('tipo_metrica_visual') or TIPO_METRICA_VISUAL,
             'advertencia_metrica_visual': (
-                candidato.get('advertencia_metrica_visual') or ADVERTENCIA_METRICA_VISUAL_DEFAULT
+                candidato.get('advertencia_metrica_visual') or advertencia_default
             ),
         })
 
@@ -310,7 +323,7 @@ def detectar_duplicados_ciudadano(
         if isinstance(candidato, Mapping)
         and (
             not dinov2_activo
-            or (bool(candidato.get('coincidencia_imagen')) and bool(candidato.get('coincidencia_gps')))
+            or bool(candidato.get('coincidencia_gps'))
         )
     ][:MAX_CANDIDATOS_CIUDADANO]
 

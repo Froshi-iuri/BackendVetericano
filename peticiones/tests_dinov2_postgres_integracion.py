@@ -123,6 +123,24 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
         cls._ia_secret = secrets.token_urlsafe(24)
         cls._ia_url = f'http://127.0.0.1:{puerto}'
 
+        db_cfg = connection.settings_dict
+        if (
+            db_cfg.get('NAME') == 'test_vetericano'
+            and str(db_cfg.get('HOST', '')).lower() in ('127.0.0.1', 'localhost', '::1')
+        ):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    ALTER TABLE public.peticion_posible_duplicado
+                        ADD COLUMN IF NOT EXISTS metodo_imagen varchar(40) NULL,
+                        ADD COLUMN IF NOT EXISTS id_peticion_duplicada integer NULL,
+                        ADD COLUMN IF NOT EXISTS porcentaje_proximidad_gps double precision NULL,
+                        ADD COLUMN IF NOT EXISTS porcentaje_similitud_visual double precision NULL,
+                        ADD COLUMN IF NOT EXISTS radio_gps_metros double precision NULL DEFAULT 200.0,
+                        ADD COLUMN IF NOT EXISTS similitud_visual_coseno double precision NULL;
+                    """
+                )
+
         env = os.environ.copy()
         env.update({
             'IA_HOST': '127.0.0.1',
@@ -131,6 +149,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
             'IA_MODEL_NAME': 'facebook/dinov2-small',
             'IA_DEVICE': 'cpu',
             'IA_PRELOAD_MODEL': 'true',
+            'IA_TORCH_NUM_THREADS': '1',
             'IA_MAX_CONCURRENT_INFERENCES': '1',
             'IA_MAX_PENDING_QUEUE': '4',
             'IA_MAX_QUEUE_WAIT_SECONDS': '10.0',
@@ -477,7 +496,8 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
         DUPLICADOS_RADIO_GPS_METROS=200.0,
     )
     def test_03_sin_coincidencias_animal_diferente_lejos_y_solo_texto_gps(self):
-        # 1) Animal diferente dentro de 200 m incluso con descripción idéntica -> NO coincide
+        # 1) Animal diferente dentro de 200 m -> SÍ genera advertencia por GPS <= 200 m
+        #    usando DINOv2/descripción como información adicional (sin bloquear).
         self._crear_peticion(
             radicado='RAD-DINO-DIF',
             descripcion='Perro atropellado en el parque principal frente a la iglesia central',
@@ -486,7 +506,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
             foto=URL_DIFERENTE,
             responsable=self.peticionario_a,
         )
-        # 2) Mismo animal fuera de 200 m (5 km) -> NO coincide
+        # 2) Mismo animal fuera de 200 m (5 km) -> NUNCA coincide aunque la foto sea idéntica
         self._crear_peticion(
             radicado='RAD-DINO-LEJOS',
             descripcion='Mismo animal muy lejos en otra zona del municipio',
@@ -501,6 +521,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
             'peticiones.services.imagen_hash_service.descargar_imagen_segura',
             side_effect=_simular_descarga_cloudinary_real,
         ):
+            # Consulta junto a RAD-DINO-DIF (30 m): advierte por GPS <= 200 m, aunque animal sea distinto
             resp_dif = client_b.post(
                 URL_CIUDADANO,
                 {
@@ -511,6 +532,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
                 },
                 format='json',
             )
+            # Consulta sin foto dentro de 200 m: advierte por GPS <= 200 m sin similitud visual
             resp_sin_foto = client_b.post(
                 URL_CIUDADANO,
                 {
@@ -520,13 +542,35 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
                 },
                 format='json',
             )
+            # Consulta cerca de RAD-DINO-LEJOS pero desplazada > 200 m (5 km desde BASE):
+            # verificamos desde coordenadas sin nada dentro de 200 m pero foto idéntica a RAD-DINO-DIF
+            resp_lejos = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'descripcion': 'Animal en otro barrio distante',
+                    'latitud': LAT_LEJOS_5KM + 0.01,
+                    'longitud': LON_LEJOS_5KM,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
 
-        for resp in (resp_dif, resp_sin_foto):
-            self.assertEqual(resp.status_code, status.HTTP_200_OK)
-            self.assertFalse(resp.data['advertencia_duplicado'])
-            self.assertFalse(resp.data['posible_duplicado'])
-            self.assertEqual(resp.data['total_candidatos'], 0)
-            self.assertEqual(resp.data['posibles_duplicados'], [])
+        self.assertEqual(resp_dif.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_dif.data['advertencia_duplicado'])
+        self.assertTrue(resp_dif.data['posible_duplicado'])
+        self.assertEqual(resp_dif.data['total_candidatos'], 1)
+        self.assertTrue(resp_dif.data['posibles_duplicados'][0]['coincidencia_gps'])
+        self.assertFalse(resp_dif.data['posibles_duplicados'][0]['coincidencia_imagen'])
+
+        self.assertEqual(resp_sin_foto.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_sin_foto.data['advertencia_duplicado'])
+        self.assertEqual(resp_sin_foto.data['total_candidatos'], 1)
+        self.assertEqual(resp_sin_foto.data['posibles_duplicados'][0]['similitud_visual'], 'no_disponible')
+        self.assertIsNone(resp_sin_foto.data['posibles_duplicados'][0]['porcentaje_similitud_visual'])
+
+        self.assertEqual(resp_lejos.status_code, status.HTTP_200_OK)
+        self.assertFalse(resp_lejos.data['advertencia_duplicado'])
+        self.assertEqual(resp_lejos.data['total_candidatos'], 0)
 
     @override_settings(
         DUPLICADOS_IA_DINOV2_ACTIVA=True,
@@ -545,7 +589,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
         )
         client_b = self._cliente_jwt(self.peticionario_b)
 
-        # A) Fallo descargando imagen desde Cloudinary
+        # A) Fallo descargando imagen desde Cloudinary -> igual advierte por GPS <= 200 m
         with patch(
             'peticiones.services.imagen_hash_service.descargar_imagen_segura',
             return_value=None,
@@ -560,10 +604,14 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
                 format='json',
             )
         self.assertEqual(resp_cloud.status_code, status.HTTP_200_OK)
-        self.assertFalse(resp_cloud.data['posible_duplicado'])
-        self.assertEqual(resp_cloud.data['total_candidatos'], 0)
+        self.assertTrue(resp_cloud.data['posible_duplicado'])
+        self.assertEqual(resp_cloud.data['total_candidatos'], 1)
+        cand_cloud = resp_cloud.data['posibles_duplicados'][0]
+        self.assertEqual(cand_cloud['similitud_visual'], 'no_disponible')
+        self.assertIsNone(cand_cloud['porcentaje_similitud_visual'])
 
-        # B) Microservicio IA caído / no responde -> respaldo controlado sin error 500
+        # B) Microservicio IA caído / no responde -> advierte por GPS <= 200 m sin error 500
+        #    y señala que la similitud visual no está disponible
         with patch(
             'peticiones.services.imagen_hash_service.descargar_imagen_segura',
             side_effect=_simular_descarga_cloudinary_real,
@@ -581,8 +629,13 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
                 format='json',
             )
         self.assertEqual(resp_modelo.status_code, status.HTTP_200_OK)
-        self.assertFalse(resp_modelo.data['posible_duplicado'])
-        self.assertEqual(resp_modelo.data['total_candidatos'], 0)
+        self.assertTrue(resp_modelo.data['posible_duplicado'])
+        self.assertEqual(resp_modelo.data['total_candidatos'], 1)
+        cand_mod = resp_modelo.data['posibles_duplicados'][0]
+        self.assertTrue(cand_mod['coincidencia_gps'])
+        self.assertEqual(cand_mod['similitud_visual'], 'no_disponible')
+        self.assertIsNone(cand_mod['porcentaje_similitud_visual'])
+        self.assertIn('no disponible', cand_mod['advertencia_metrica_visual'].lower())
 
         # C) Radicación /iniciar/ nunca se bloquea si falla DINOv2
         with patch(
@@ -683,3 +736,191 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
             self.assertEqual(cand['metodo_imagen'], 'dinov2_small')
             self.assertGreaterEqual(cand['porcentaje_similitud_visual'], 45.0)
             self.assertEqual(cand['cercania'], 'muy_cerca')
+
+    @override_settings(
+        DUPLICADOS_IA_DINOV2_ACTIVA=True,
+        DUPLICADOS_UMBRAL_DINOV2=0.45,
+        DUPLICADOS_RADIO_GPS_METROS=200.0,
+        DUPLICADOS_DINOV2_CACHE_BD_ACTIVA=True,
+    )
+    def test_07_limites_gps_0_200_201_comparacion_visual_web_y_resolucion_admin(self):
+        import math
+
+        metros_por_grado_lat = 6371000.0 * math.pi / 180.0
+        lat_200 = round(LAT_BASE + (199.95 / metros_por_grado_lat), 7)
+        lat_201 = round(LAT_BASE + (201.10 / metros_por_grado_lat), 7)
+
+        pet_0m = self._crear_peticion(
+            radicado='RAD-LIM-0M',
+            descripcion='Caso exacto a 0 metros',
+            latitud=LAT_BASE,
+            longitud=LON_BASE,
+            foto=URL_MISMO_1,
+            responsable=self.peticionario_a,
+        )
+        pet_200m = self._crear_peticion(
+            radicado='RAD-LIM-200M',
+            descripcion='Caso limite inclusive a 200 metros',
+            latitud=lat_200,
+            longitud=LON_BASE,
+            foto=URL_DIFERENTE,
+            responsable=self.peticionario_a,
+        )
+        pet_201m = self._crear_peticion(
+            radicado='RAD-LIM-201M',
+            descripcion='Caso excluido a 201 metros con misma fotografia',
+            latitud=lat_201,
+            longitud=LON_BASE,
+            foto=URL_MISMO_1,
+            responsable=self.peticionario_a,
+        )
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet_0m,
+            ruta_archivo=URL_MISMO_1,
+            autorizado_por=self.peticionario_a,
+            version_texto='v1',
+        )
+
+        # 1) Endpoint ciudadano a 0m/200m vs >200m
+        client_b = self._cliente_jwt(self.peticionario_b)
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ):
+            resp_ciudadano = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'latitud': LAT_BASE,
+                    'longitud': LON_BASE,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
+        self.assertEqual(resp_ciudadano.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_ciudadano.data['posible_duplicado'])
+        # Solo pet_0m y pet_200m entran (201m queda fuera aunque la foto sea idéntica)
+        self.assertEqual(resp_ciudadano.data['total_candidatos'], 2)
+        c0, c1 = resp_ciudadano.data['posibles_duplicados']
+        self.assertEqual(c0['cercania'], 'muy_cerca')
+        self.assertTrue(c0['tiene_fotografia'])
+        self.assertIsNotNone(c0['foto'])
+        self.assertEqual(c1['cercania'], 'cerca')
+        self.assertFalse(c1['tiene_fotografia'])
+        self.assertIsNone(c1['foto'])
+
+        # 2) Flujo Administrador/Jurídico: alerta, "Calcular con DINOv2" y resolución conservando historial
+        rol_juridico = Rol.objects.filter(pk=2).first() or Rol.objects.create(id_rol=2, nombre='Jurídico')
+        juridico = Usuarios.objects.create(
+            id_rol=rol_juridico,
+            id_sede=self.sede,
+            nombre='Juridico Prueba',
+            email='juridico.int@local.test',
+            password='hash',
+            activo=True,
+        )
+        rol_vet = Rol.objects.filter(pk=3).first() or Rol.objects.create(id_rol=3, nombre='Veterinario')
+        vet = Usuarios.objects.create(
+            id_rol=rol_vet,
+            id_sede=self.sede,
+            nombre='Vet Prueba',
+            email='vet.int@local.test',
+            password='hash',
+            activo=True,
+        )
+
+        # Alerta entre pet_0m y pet_201m (solo para verificar comparación visual web con DINOv2)
+        # Usamos pet_0m y pet_nueva_30m para par real con alerta <= 200 m
+        pet_30m = self._crear_peticion(
+            radicado='RAD-WEB-30M',
+            descripcion='Mismo perro cerca al punto',
+            latitud=LAT_CERCA_30M,
+            longitud=LON_CERCA_30M,
+            foto=URL_MISMO_2,
+            responsable=self.peticionario_b,
+        )
+        p_menor, p_mayor = PeticionPosibleDuplicado.normalizar_par_peticiones(pet_0m, pet_30m)
+        alerta = PeticionPosibleDuplicado.objects.create(
+            peticion_menor=p_menor,
+            peticion_mayor=p_mayor,
+            peticion_origen=pet_30m,
+            distancia_metros=30.0,
+            coincidencia_gps=True,
+            score_combinado=0.85,
+            criterios_coincidencia=['gps'],
+        )
+
+        client_j = self._cliente_jwt(juridico)
+        # Error 503 controlado si VetericanoIA no responde
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ), override_settings(
+            DUPLICADOS_DINOV2_MICROSERVICIO_URL='http://127.0.0.1:59999',
+            DUPLICADOS_DINOV2_MICROSERVICIO_TIMEOUT_SEGUNDOS=0.8,
+        ):
+            resp_503 = client_j.post(
+                f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+                {},
+                format='json',
+            )
+        self.assertEqual(resp_503.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Cálculo DINOv2 real exitoso en web -> muestra similitud visual y proximidad GPS
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ):
+            resp_visual = client_j.post(
+                f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/comparar-visual/',
+                {},
+                format='json',
+            )
+        self.assertEqual(resp_visual.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_visual.data['comparado'])
+        self.assertTrue(resp_visual.data['dinov2_calculada'])
+        self.assertGreaterEqual(resp_visual.data['porcentaje_similitud_visual'], 45.0)
+        self.assertIsNotNone(resp_visual.data['distancia_gps_metros'])
+        self.assertGreaterEqual(
+            PeticionImagenEmbedding.objects.filter(peticion_id__in=[pet_0m.id_peticion, pet_30m.id_peticion]).count(),
+            2,
+        )
+
+        # Resolución administrativa: elegir pet_0m como original -> pet_30m queda Duplicada sin borrar BD
+        total_antes = Peticiones.objects.count()
+        EstadoPeticiones.objects.get_or_create(nombre='Duplicada', defaults={'descripcion': 'Duplicada'})
+        resp_res = client_j.post(
+            f'/api/peticiones/duplicados/alertas/{alerta.id_alerta}/resolver/',
+            {
+                'estado_revision': 'CONFIRMADO',
+                'peticion_principal': pet_0m.id_peticion,
+                'observacion': 'Confirmado mismo animal',
+            },
+            format='json',
+        )
+        self.assertEqual(resp_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_res.data['estado_nuevo'], 'CONFIRMADO')
+        self.assertEqual(resp_res.data['peticion_original_id'], pet_0m.id_peticion)
+        self.assertEqual(resp_res.data['peticion_duplicada_id'], pet_30m.id_peticion)
+        # No borra registros de PostgreSQL
+        self.assertEqual(Peticiones.objects.count(), total_antes)
+        pet_30m.refresh_from_db()
+        self.assertEqual(pet_30m.id_estado.nombre.lower(), 'duplicada')
+
+        # Excluida del listado operativo por defecto y del flujo de asignación
+        resp_listar = client_j.get('/api/peticiones/listar/')
+        self.assertEqual(resp_listar.status_code, status.HTTP_200_OK)
+        ids_listar = {item['id_peticion'] for item in resp_listar.data}
+        self.assertIn(pet_0m.id_peticion, ids_listar)
+        self.assertNotIn(pet_30m.id_peticion, ids_listar)
+
+        resp_asignar = client_j.patch(
+            f'/api/peticiones/{pet_30m.id_peticion}/asignar/',
+            {'asignado_a': vet.id_usuario},
+            format='json',
+        )
+        self.assertEqual(resp_asignar.status_code, status.HTTP_409_CONFLICT)
+
+        resp_dash = client_j.get('/api/peticiones/dashboard-juridico/')
+        self.assertEqual(resp_dash.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(resp_dash.data['peticiones']['pendientes'], total_antes - 1)
+
