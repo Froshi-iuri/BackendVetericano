@@ -579,10 +579,11 @@ class ActualizarEstadoPeticionView(APIView):
             # 5. Si es un estado nuevo que no existe en el catálogo, crearlo
             if not estado_obj:
                 try:
-                    estado_obj = EstadoPeticiones.objects.create(
-                        nombre=nombre_str,
-                        activo=True
-                    )
+                    with transaction.atomic():  # SAVEPOINT: un fallo aquí no aborta la transacción externa
+                        estado_obj = EstadoPeticiones.objects.create(
+                            nombre=nombre_str,
+                            activo=True
+                        )
                 except Exception as e:
                     logger.warning(f"No se pudo crear estado dinámico {nombre_str}: {e}")
                     estado_obj = peticion.id_estado or EstadoPeticiones.objects.filter(activo=True).first()
@@ -610,11 +611,12 @@ class ActualizarEstadoPeticionView(APIView):
             try:
                 vet_usuario = request.user if hasattr(request.user, 'id_usuario') else None
                 if vet_usuario:
-                    SeguimientoPeticionesVisita.objects.create(
-                        id_peticion=peticion,
-                        id_veterinario=vet_usuario,
-                        observacion=f"Cambio de estado a '{estado_obj.nombre}': {observacion}"
-                    )
+                    with transaction.atomic():  # SAVEPOINT: un fallo aquí no aborta la transacción externa
+                        SeguimientoPeticionesVisita.objects.create(
+                            id_peticion=peticion,
+                            id_veterinario=vet_usuario,
+                            observacion=f"Cambio de estado a '{estado_obj.nombre}': {observacion}"
+                        )
             except Exception as e:
                 logger.warning(f"No se pudo registrar seguimiento para cambio de estado: {e}")
 
@@ -1068,6 +1070,8 @@ class MarcarNotificacionPeticionLeidaView(APIView):
             notif.leida = True
             notif.fecha_lectura = timezone.now()
             notif.save(update_fields=['leida', 'fecha_lectura'])
+        # SYNC-01: sincroniza las otras pestañas/dispositivos del usuario (tras el COMMIT, best-effort)
+        rt_notificar.emitir_lectura(user.id_usuario, clave=f'pet-{notif.id_notificacion}')
 
         return Response(NotificacionPeticionSerializer(notif).data, status=status.HTTP_200_OK)
 
@@ -1091,10 +1095,27 @@ class MarcarTodasNotificacionesLeidasView(APIView):
             qs = qs.filter(id_usuario_destino=user)
 
         actualizadas = qs.update(leida=True, fecha_lectura=timezone.now())
+        # SYNC-01: sincroniza las otras pestañas/dispositivos del usuario (tras el COMMIT, best-effort)
+        rt_notificar.emitir_lectura(user.id_usuario, modulo='peticiones', todas=True)
         return Response({
             "mensaje": "Notificaciones marcadas como leídas.",
             "actualizadas": actualizadas,
         }, status=status.HTTP_200_OK)
+
+
+# --- Sistema centralizado de notificaciones en tiempo real (contrato v1) ---
+# NP persistentes en la misma transacción de negocio; WS/FCM solo tras el COMMIT (best-effort).
+from peticiones.utils import crear_notificaciones_peticion_usuarios  # noqa: E402
+from realtime import notificar as rt_notificar  # noqa: E402
+
+ROLES_GESTION_PETICIONES_RT = (1, 2)
+
+
+def _referencia_peticion_rt(peticion):
+    return {
+        'id_peticion': getattr(peticion, 'id_peticion', None),
+        'numero_radicado': getattr(peticion, 'numero_radicado', None),
+    }
 
 
 # --- Extensión aditiva de ListarPeticionesView y DetallePeticionView ---
@@ -1223,36 +1244,48 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
         save_kwargs['asignado_por'] = request.user
         save_kwargs['fecha_asignacion'] = timezone.now()
 
-    peticion = serializer.save(**save_kwargs)
+    # Creación + historial + notificaciones persistentes = todo o nada (PET-01/02/03): se ejecutan
+    # dentro del @transaction.atomic de IniciarPeticionSerializer.create (hook). Si falla una
+    # notificación, se revierte la petición y la respuesta es 500 (sin estado a medias).
+    # WS/FCM salen solo tras el COMMIT; correo y detección de duplicados siguen igual que antes.
+    usuario_actor = request.user
 
-    # 1. Registrar creación en el historial
-    registrar_historial_peticion(
-        peticion=peticion,
-        tipo_cambio='CREACION',
-        estado_anterior=None,
-        estado_nuevo=estado_inicial,
-        veterinario_anterior=None,
-        veterinario_nuevo=None,
-        usuario_accion=request.user,
-        observacion="Petición registrada en el sistema.",
-    )
-
-    # 2. Si se asignó en el mismo acto de creación, registrar también la asignación
-    if veterinario_asignado:
+    def _historial_y_notificaciones_en_transaccion(peticion_creada):
+        # 1. Registrar creación en el historial
         registrar_historial_peticion(
-            peticion=peticion,
-            tipo_cambio='ASIGNACION',
-            estado_anterior=estado_inicial,
-            estado_nuevo=peticion.id_estado,
+            peticion=peticion_creada,
+            tipo_cambio='CREACION',
+            estado_anterior=None,
+            estado_nuevo=estado_inicial,
             veterinario_anterior=None,
-            veterinario_nuevo=veterinario_asignado,
-            usuario_accion=request.user,
-            observacion=f"Asignada al veterinario {veterinario_asignado.nombre} {veterinario_asignado.apellido}".strip(),
+            veterinario_nuevo=None,
+            usuario_accion=usuario_actor,
+            observacion="Petición registrada en el sistema.",
+            raise_on_error=True,
         )
-        crear_notificacion_asignacion(peticion, veterinario_asignado, es_reasignacion=False)
+        notificaciones_rt = []
+        # 2. Si se asignó en el mismo acto de creación, registrar también la asignación
+        if veterinario_asignado:
+            registrar_historial_peticion(
+                peticion=peticion_creada,
+                tipo_cambio='ASIGNACION',
+                estado_anterior=estado_inicial,
+                estado_nuevo=peticion_creada.id_estado,
+                veterinario_anterior=None,
+                veterinario_nuevo=veterinario_asignado,
+                usuario_accion=usuario_actor,
+                observacion=f"Asignada al veterinario {veterinario_asignado.nombre} {veterinario_asignado.apellido}".strip(),
+                raise_on_error=True,
+            )
+            notificaciones_rt.append(crear_notificacion_asignacion(
+                peticion_creada, veterinario_asignado, es_reasignacion=False, raise_on_error=True,
+            ))
+        # 3. Crear notificaciones dentro de la aplicación web para Jurídico / Admin
+        notificaciones_rt.extend(crear_notificaciones_nueva_peticion(peticion_creada, raise_on_error=True) or [])
+        rt_notificar.entregar_notificaciones_peticion(notificaciones_rt)
 
-    # 3. Crear notificaciones dentro de la aplicación web para Jurídico / Admin
-    crear_notificaciones_nueva_peticion(peticion)
+    save_kwargs['_tras_crear_en_transaccion'] = _historial_y_notificaciones_en_transaccion
+    peticion = serializer.save(**save_kwargs)
 
     # 4. Si es una petición urgente, enviar correo automático a Jurídico
     info_correo = enviar_correo_peticion_urgente_juridico(peticion)
@@ -1349,49 +1382,79 @@ def _juridico_asignar_peticion_update(self, request, *args, **kwargs):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-    response = _orig_asignar_peticion_update(self, request, *args, **kwargs)
+    # Asignación + historiales + notificaciones = una sola transacción (D10, estricta en PostgreSQL).
+    # El atomic interno de la vista original pasa a ser un SAVEPOINT. Si la notificación falla, se
+    # revierte la asignación y la respuesta es 500. WS/FCM salen solo tras el COMMIT.
+    with transaction.atomic():
+        response = _orig_asignar_peticion_update(self, request, *args, **kwargs)
 
-    if response.status_code == status.HTTP_200_OK and es_modelo_real:
-        peticion_actualizada = (
-            Peticiones.objects
-            .select_related('id_estado', 'asignado_a', 'asignado_por')
-            .filter(pk=peticion.pk)
-            .first()
-        ) or peticion
-        veterinario_nuevo = getattr(peticion_actualizada, 'asignado_a', None)
-        tipo_cambio = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
-        observacion_input = request.data.get('observacion') or request.data.get('motivo')
-        if not observacion_input and veterinario_nuevo:
-            nombre_nuevo = f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
-            if es_reasignacion and veterinario_anterior:
-                nombre_ant = f"{veterinario_anterior.nombre or ''} {veterinario_anterior.apellido or ''}".strip()
-                observacion_input = f"Reasignada de {nombre_ant} a {nombre_nuevo} tras {DIAS_PARA_REASIGNAR}+ días sin avance."
-            else:
-                observacion_input = f"Asignada al veterinario {nombre_nuevo}."
+        if response.status_code == status.HTTP_200_OK and es_modelo_real:
+            peticion_actualizada = (
+                Peticiones.objects
+                .select_related('id_estado', 'asignado_a', 'asignado_por')
+                .filter(pk=peticion.pk)
+                .first()
+            ) or peticion
+            veterinario_nuevo = getattr(peticion_actualizada, 'asignado_a', None)
+            tipo_cambio = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
+            observacion_input = request.data.get('observacion') or request.data.get('motivo')
+            if not observacion_input and veterinario_nuevo:
+                nombre_nuevo = f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+                if es_reasignacion and veterinario_anterior:
+                    nombre_ant = f"{veterinario_anterior.nombre or ''} {veterinario_anterior.apellido or ''}".strip()
+                    observacion_input = f"Reasignada de {nombre_ant} a {nombre_nuevo} tras {DIAS_PARA_REASIGNAR}+ días sin avance."
+                else:
+                    observacion_input = f"Asignada al veterinario {nombre_nuevo}."
 
-        registrar_historial_peticion(
-            peticion=peticion_actualizada,
-            tipo_cambio=tipo_cambio,
-            estado_anterior=estado_anterior,
-            estado_nuevo=getattr(peticion_actualizada, 'id_estado', None),
-            veterinario_anterior=veterinario_anterior,
-            veterinario_nuevo=veterinario_nuevo,
-            usuario_accion=request.user,
-            observacion=observacion_input,
-        )
-        if veterinario_nuevo:
-            crear_notificacion_asignacion(peticion_actualizada, veterinario_nuevo, es_reasignacion=es_reasignacion)
-
-        if isinstance(response.data, dict):
-            response.data['tipo_operacion'] = tipo_cambio
-            response.data['estado'] = (
-                peticion_actualizada.id_estado.nombre
-                if getattr(peticion_actualizada, 'id_estado', None) else None
+            registrar_historial_peticion(
+                peticion=peticion_actualizada,
+                tipo_cambio=tipo_cambio,
+                estado_anterior=estado_anterior,
+                estado_nuevo=getattr(peticion_actualizada, 'id_estado', None),
+                veterinario_anterior=veterinario_anterior,
+                veterinario_nuevo=veterinario_nuevo,
+                usuario_accion=request.user,
+                observacion=observacion_input,
+                raise_on_error=True,
             )
+            notificaciones_rt = []
             if veterinario_nuevo:
-                response.data['veterinario_responsable'] = (
-                    f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+                notificaciones_rt.append(crear_notificacion_asignacion(
+                    peticion_actualizada, veterinario_nuevo, es_reasignacion=es_reasignacion, raise_on_error=True,
+                ))
+            # PET-04: aviso al veterinario saliente
+            if (
+                es_reasignacion and veterinario_anterior is not None
+                and getattr(veterinario_anterior, 'id_usuario', None) != getattr(veterinario_nuevo, 'id_usuario', None)
+            ):
+                radicado = getattr(peticion_actualizada, 'numero_radicado', None) or f"#{peticion_actualizada.pk}"
+                notificaciones_rt.extend(crear_notificaciones_peticion_usuarios(
+                    peticion_actualizada,
+                    [veterinario_anterior],
+                    'DESASIGNACION',
+                    f"Petición reasignada: {radicado}",
+                    f"La petición {radicado} fue reasignada a otro veterinario y ya no está a tu cargo.",
+                    raise_on_error=True,
+                ))
+            rt_notificar.entregar_notificaciones_peticion(notificaciones_rt)
+            # PET-05: refresco silencioso de tableros de Admin/Jurídico
+            rt_notificar.actualizacion_silenciosa(
+                'peticion.asignacion_actualizada',
+                accion='reasignada' if es_reasignacion else 'asignada',
+                roles=ROLES_GESTION_PETICIONES_RT,
+                referencia=_referencia_peticion_rt(peticion_actualizada),
+            )
+
+            if isinstance(response.data, dict):
+                response.data['tipo_operacion'] = tipo_cambio
+                response.data['estado'] = (
+                    peticion_actualizada.id_estado.nombre
+                    if getattr(peticion_actualizada, 'id_estado', None) else None
                 )
+                if veterinario_nuevo:
+                    response.data['veterinario_responsable'] = (
+                        f"{veterinario_nuevo.nombre or ''} {veterinario_nuevo.apellido or ''}".strip()
+                    )
 
     return response
 
@@ -1423,27 +1486,61 @@ def _juridico_actualizar_estado_patch(self, request, id_peticion):
     estado_anterior = peticion_prev.id_estado if peticion_prev else None
     vet_anterior = peticion_prev.asignado_a if peticion_prev else None
 
-    response = _orig_actualizar_estado_patch(self, request, id_peticion)
+    # Casos que la vista original rechaza sin escribir nada (404, peticionario, veterinario no
+    # asignado → 403): se delegan tal cual, sin abrir transacción (mismo contrato y códigos).
+    rol_id_actor = getattr(request.user, 'id_rol_id', None)
+    if (
+        peticion_prev is None
+        or rol_id_actor == 4
+        or (rol_id_actor == 3 and peticion_prev.asignado_a_id != getattr(request.user, 'id_usuario', None))
+    ):
+        return _orig_actualizar_estado_patch(self, request, id_peticion)
 
-    if response.status_code == status.HTTP_200_OK:
-        peticion_actual = (
-            Peticiones.objects
-            .select_related('id_estado', 'asignado_a')
-            .filter(pk=id_peticion)
-            .first()
-        )
-        if peticion_actual:
-            obs = request.data.get('observacion') or f"Cambio de estado a '{peticion_actual.id_estado.nombre}'."
-            registrar_historial_peticion(
-                peticion=peticion_actual,
-                tipo_cambio='CAMBIO_ESTADO',
-                estado_anterior=estado_anterior,
-                estado_nuevo=peticion_actual.id_estado,
-                veterinario_anterior=vet_anterior,
-                veterinario_nuevo=peticion_actual.asignado_a,
-                usuario_accion=request.user,
-                observacion=obs,
+    # Cambio de estado + historial + NP (PET-06) = una sola transacción. WS/FCM tras el COMMIT.
+    with transaction.atomic():
+        response = _orig_actualizar_estado_patch(self, request, id_peticion)
+
+        if response.status_code == status.HTTP_200_OK:
+            peticion_actual = (
+                Peticiones.objects
+                .select_related('id_estado', 'asignado_a', 'responsable')
+                .filter(pk=id_peticion)
+                .first()
             )
+            if peticion_actual:
+                obs = request.data.get('observacion') or f"Cambio de estado a '{peticion_actual.id_estado.nombre}'."
+                registrar_historial_peticion(
+                    peticion=peticion_actual,
+                    tipo_cambio='CAMBIO_ESTADO',
+                    estado_anterior=estado_anterior,
+                    estado_nuevo=peticion_actual.id_estado,
+                    veterinario_anterior=vet_anterior,
+                    veterinario_nuevo=peticion_actual.asignado_a,
+                    usuario_accion=request.user,
+                    observacion=obs,
+                    raise_on_error=True,
+                )
+                if getattr(estado_anterior, 'pk', None) != peticion_actual.id_estado_id:
+                    radicado = peticion_actual.numero_radicado or f"#{peticion_actual.pk}"
+                    nombre_estado = getattr(peticion_actual.id_estado, 'nombre', '') or ''
+                    destinatarios = [
+                        u for u in (peticion_actual.responsable, peticion_actual.asignado_a)
+                        if u is not None and getattr(u, 'activo', True)
+                    ]
+                    rt_notificar.entregar_notificaciones_peticion(crear_notificaciones_peticion_usuarios(
+                        peticion_actual,
+                        destinatarios,
+                        'CAMBIO_ESTADO',
+                        f"Estado actualizado: {radicado}",
+                        f"La petición {radicado} cambió al estado '{nombre_estado}'.",
+                        excluir=[request.user],
+                        raise_on_error=True,
+                    ))
+                    rt_notificar.actualizacion_silenciosa(
+                        'peticion.estado_actualizado',
+                        roles=ROLES_GESTION_PETICIONES_RT,
+                        referencia={**_referencia_peticion_rt(peticion_actual), 'id_estado': peticion_actual.id_estado_id},
+                    )
 
     return response
 
