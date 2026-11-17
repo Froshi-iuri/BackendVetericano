@@ -5,6 +5,7 @@ from .permissions import EsGestorOLecturaStaffLegacy, PermisoInventariosLegacy
 from django.db import transaction
 from django.db.models import Sum, Count
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
+from inventario import notificaciones_realtime as notif_rt
 from medicamentos.models import Medicamentos
 from .serializers import (
     ProveedoresSerializer,
@@ -75,3 +76,18 @@ class InventariosViewSet(viewsets.ModelViewSet):
     queryset = Inventarios.objects.all()
     serializer_class = InventariosSerializer
     permission_classes = [PermisoInventariosLegacy]
+
+    # Tiempo real INV-02 (AO a rol_1/rol_2, tras el COMMIT): alta, ajuste y baja de lotes de bodega.
+    # No cambian la respuesta: las evaluaciones son tolerantes y corren en su propio SAVEPOINT.
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        notif_rt.alertar_bodega(inventario_ids=[serializer.instance.pk])
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        notif_rt.alertar_bodega(inventario_ids=[serializer.instance.pk])
+
+    def perform_destroy(self, instance):
+        med_ids = notif_rt.medicamentos_de_lotes([instance.pk])
+        super().perform_destroy(instance)
+        notif_rt.alertar_bodega(med_ids=med_ids)
