@@ -140,6 +140,23 @@ class EstadoTolerantePreexistenteTests(BaseRT):
         self.assertTrue(HistorialPeticiones.objects.filter(id_peticion=p, tipo_cambio='CAMBIO_ESTADO').exists())
 
 
+class EstadoDinamicoErrorRealDeBDTests(BaseRT):
+    """
+    Auditoría M1 con un error REAL de BD (no un mock): un nombre de estado de 150 caracteres hace fallar el
+    INSERT del estado dinámico (varchar(100)). En PostgreSQL, sin SAVEPOINT, la transacción quedaría abortada y
+    la respuesta sería 500; con el SAVEPOINT la vista original aplica su respaldo y responde 200.
+    (En SQLite no hay límite de longitud: la prueba pasa sin ejercitar el aborto.)
+    """
+
+    def test_estado_dinamico_invalido_no_aborta_la_transaccion(self):
+        p = self.peticion(asignado=self.vet1, radicado='RAD-RT-0310')
+        nombre_largo = 'Estado dinamico ' + 'x' * 150
+        with self.captureOnCommitCallbacks(execute=False):
+            resp = self.cliente(self.vet1).patch(f'/api/peticiones/{p.pk}/estado/', {'estado': nombre_largo}, format='json')
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        self.assertTrue(HistorialPeticiones.objects.filter(id_peticion=p, tipo_cambio='CAMBIO_ESTADO').exists())
+
+
 class CreacionPeticionRealtimeTests(BaseRT):
     PAYLOAD = {'descripcion': 'Canino herido en prueba realtime', 'direccion': 'Calle RT 1',
                'latitud': '2.4419', 'longitud': '-76.6063', 'prioridad': 'ALTA'}
