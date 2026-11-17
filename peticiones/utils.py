@@ -247,6 +247,7 @@ def obtener_multimedia_acta(seguimiento) -> dict:
 
 import unicodedata
 from datetime import datetime, timezone as dt_timezone, timedelta
+from django.db import transaction
 from django.utils import timezone
 
 
@@ -415,33 +416,41 @@ def registrar_historial_peticion(
     veterinario_nuevo=None,
     usuario_accion=None,
     observacion: str = None,
+    raise_on_error: bool = False,
 ):
     """
     Registra un evento en la tabla historial_peticiones de manera segura.
+    raise_on_error=True: propaga el error (la vista que lo llama revierte toda la operación).
+    raise_on_error=False (por defecto, comportamiento previo): registra un warning y devuelve None;
+    el INSERT va en un SAVEPOINT para no dejar abortada una transacción externa.
     """
     try:
         from peticiones.models import HistorialPeticiones
         user_obj = usuario_accion if (usuario_accion and getattr(usuario_accion, 'id_usuario', None)) else None
-        return HistorialPeticiones.objects.create(
-            id_peticion=peticion,
-            tipo_cambio=tipo_cambio,
-            id_estado_anterior=estado_anterior,
-            id_estado_nuevo=estado_nuevo,
-            id_veterinario_anterior=veterinario_anterior,
-            id_veterinario_nuevo=veterinario_nuevo,
-            id_usuario_accion=user_obj,
-            observacion=observacion,
-            fecha=timezone.now(),
-        )
+        with transaction.atomic():
+            return HistorialPeticiones.objects.create(
+                id_peticion=peticion,
+                tipo_cambio=tipo_cambio,
+                id_estado_anterior=estado_anterior,
+                id_estado_nuevo=estado_nuevo,
+                id_veterinario_anterior=veterinario_anterior,
+                id_veterinario_nuevo=veterinario_nuevo,
+                id_usuario_accion=user_obj,
+                observacion=observacion,
+                fecha=timezone.now(),
+            )
     except Exception as exc:
         logger.warning(f"Error al registrar historial de petición #{getattr(peticion, 'pk', None)}: {exc}")
+        if raise_on_error:
+            raise
         return None
 
 
-def crear_notificaciones_nueva_peticion(peticion):
+def crear_notificaciones_nueva_peticion(peticion, raise_on_error: bool = False):
     """
     Crea notificaciones dentro de la aplicación web para los usuarios activos de Jurídico (rol 2)
     y Administrador (rol 1) cuando se registra una nueva petición.
+    raise_on_error=True: propaga el error (creación estricta, PET-01/PET-02).
     """
     try:
         from peticiones.models import NotificacionPeticion
@@ -465,12 +474,25 @@ def crear_notificaciones_nueva_peticion(peticion):
         )
         notificaciones_creadas = []
         ahora = timezone.now()
-        if destinatarios:
-            for u in destinatarios:
+        with transaction.atomic():
+            if destinatarios:
+                for u in destinatarios:
+                    notificaciones_creadas.append(
+                        NotificacionPeticion.objects.create(
+                            id_peticion=peticion,
+                            id_usuario_destino=u,
+                            tipo=tipo_notif,
+                            titulo=titulo,
+                            mensaje=mensaje,
+                            leida=False,
+                            fecha_creacion=ahora,
+                        )
+                    )
+            else:
                 notificaciones_creadas.append(
                     NotificacionPeticion.objects.create(
                         id_peticion=peticion,
-                        id_usuario_destino=u,
+                        id_usuario_destino=None,
                         tipo=tipo_notif,
                         titulo=titulo,
                         mensaje=mensaje,
@@ -478,27 +500,18 @@ def crear_notificaciones_nueva_peticion(peticion):
                         fecha_creacion=ahora,
                     )
                 )
-        else:
-            notificaciones_creadas.append(
-                NotificacionPeticion.objects.create(
-                    id_peticion=peticion,
-                    id_usuario_destino=None,
-                    tipo=tipo_notif,
-                    titulo=titulo,
-                    mensaje=mensaje,
-                    leida=False,
-                    fecha_creacion=ahora,
-                )
-            )
         return notificaciones_creadas
     except Exception as exc:
         logger.warning(f"Error al crear notificaciones web para petición #{getattr(peticion, 'pk', None)}: {exc}")
+        if raise_on_error:
+            raise
         return []
 
 
-def crear_notificacion_asignacion(peticion, veterinario, es_reasignacion: bool = False):
+def crear_notificacion_asignacion(peticion, veterinario, es_reasignacion: bool = False, raise_on_error: bool = False):
     """
     Crea una notificación en la aplicación web para el veterinario cuando se le asigna o reasigna una petición.
+    raise_on_error=True: propaga el error (asignación estricta, PET-03/PET-04).
     """
     if not veterinario or not getattr(veterinario, 'id_usuario', None):
         return None
@@ -509,18 +522,69 @@ def crear_notificacion_asignacion(peticion, veterinario, es_reasignacion: bool =
         tipo_notif = 'REASIGNACION' if es_reasignacion else 'ASIGNACION'
         titulo = f"Petición {accion}: {radicado}"
         mensaje = f"Se te ha {accion[:-1]}o la petición {radicado} con prioridad '{getattr(peticion, 'prioridad', None) or 'Normal'}'."
-        return NotificacionPeticion.objects.create(
-            id_peticion=peticion,
-            id_usuario_destino=veterinario,
-            tipo=tipo_notif,
-            titulo=titulo,
-            mensaje=mensaje,
-            leida=False,
-            fecha_creacion=timezone.now(),
-        )
+        with transaction.atomic():
+            return NotificacionPeticion.objects.create(
+                id_peticion=peticion,
+                id_usuario_destino=veterinario,
+                tipo=tipo_notif,
+                titulo=titulo,
+                mensaje=mensaje,
+                leida=False,
+                fecha_creacion=timezone.now(),
+            )
     except Exception as exc:
         logger.warning(f"Error al crear notificación de asignación para petición #{getattr(peticion, 'pk', None)}: {exc}")
+        if raise_on_error:
+            raise
         return None
+
+
+def crear_notificaciones_peticion_usuarios(
+    peticion,
+    usuarios,
+    tipo: str,
+    titulo: str,
+    mensaje: str,
+    excluir=None,
+    raise_on_error: bool = False,
+):
+    """
+    Crea una notificación individual (notificaciones_peticiones) por cada usuario indicado.
+    Eventos en tiempo real: DESASIGNACION (PET-04, vet saliente), CAMBIO_ESTADO (PET-06)
+    y POSIBLE_DUPLICADO (PET-07). Omite nulos, repetidos y los de `excluir` (quien hace el cambio).
+    """
+    try:
+        from peticiones.models import NotificacionPeticion
+        excluidos = {getattr(u, 'id_usuario', u) for u in (excluir or []) if u is not None}
+        vistos = set()
+        destinatarios = []
+        for u in usuarios or []:
+            uid = getattr(u, 'id_usuario', None)
+            if not uid or uid in vistos or uid in excluidos:
+                continue
+            vistos.add(uid)
+            destinatarios.append(u)
+        if not destinatarios:
+            return []
+        ahora = timezone.now()
+        with transaction.atomic():
+            return [
+                NotificacionPeticion.objects.create(
+                    id_peticion=peticion,
+                    id_usuario_destino=u,
+                    tipo=tipo[:50],
+                    titulo=titulo[:200],
+                    mensaje=mensaje,
+                    leida=False,
+                    fecha_creacion=ahora,
+                )
+                for u in destinatarios
+            ]
+    except Exception as exc:
+        logger.warning(f"Error al crear notificaciones {tipo} para petición #{getattr(peticion, 'pk', None)}: {exc}")
+        if raise_on_error:
+            raise
+        return []
 
 
 def enviar_correo_peticion_urgente_juridico(peticion) -> dict:
