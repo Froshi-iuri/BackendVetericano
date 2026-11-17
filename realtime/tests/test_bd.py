@@ -107,12 +107,13 @@ class AsignacionRealtimeTests(BaseRT):
 
     def test_pet04_reasignacion_avisa_al_vet_saliente(self):
         p = self.peticion(asignado=self.vet1, radicado='RAD-RT-0002')
+        # Regla de negocio existente: solo se reasigna tras 5+ días sin avance -> se envejece la petición.
+        Peticiones.objects.filter(pk=p.pk).update(fecha=timezone.now() - timedelta(days=10))
         with self.captureOnCommitCallbacks(execute=False):
             resp = self.cliente(self.juridico).put(f'/api/peticiones/{p.pk}/asignar/', {'asignado_a': self.vet2.pk}, format='json')
-        self.assertIn(resp.status_code, (200, 400), resp.content)  # 400 si la regla de 5 días no se cumple
-        if resp.status_code == 200:
-            self.assertTrue(NotificacionPeticion.objects.filter(id_peticion=p, id_usuario_destino=self.vet2, tipo='REASIGNACION').exists())
-            self.assertTrue(NotificacionPeticion.objects.filter(id_peticion=p, id_usuario_destino=self.vet1, tipo='DESASIGNACION').exists())
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(NotificacionPeticion.objects.filter(id_peticion=p, id_usuario_destino=self.vet2, tipo='REASIGNACION').exists())
+        self.assertTrue(NotificacionPeticion.objects.filter(id_peticion=p, id_usuario_destino=self.vet1, tipo='DESASIGNACION').exists())
 
     def test_pet06_cambio_de_estado_notifica_responsable_y_excluye_al_actor(self):
         p = self.peticion(asignado=self.vet1, radicado='RAD-RT-0003')
@@ -290,4 +291,77 @@ class ApiCentralSinMigracionTests(BaseRT):
         sql = ' '.join(q['sql'] for q in ctx.captured_queries).lower()
         self.assertNotIn('notificaciones_sistema', sql)
         self.assertNotIn('dispositivos_fcm', sql)
+
+
+@override_settings(WS_PUBLICAR_EVENTOS=True, NOTIFICACIONES_SISTEMA_HABILITADAS=True)
+class EventosPorSenalYDuplicadoBDTests(BaseRT):
+    """PET-07, PET-09 y eventos derivados de señales (AS) con filas reales y destinatarios exactos."""
+
+    def _publicados(self, accion):
+        with patch('realtime.publicar.publicar_evento', return_value=True) as pub,                 self.captureOnCommitCallbacks(execute=True):
+            accion()
+        return [(c.args[0], c.args[1], tuple(sorted(c.kwargs.get('roles') or ())), tuple(c.kwargs.get('usuarios') or ()))
+                for c in pub.call_args_list]
+
+    def test_pet07_np_individual_admin_juridico_y_ao(self):
+        from peticiones.services.alertas_duplicados_service import _notificar_posible_duplicado_tiempo_real
+        a, b = self.peticion(radicado='RAD-RT-0400'), self.peticion(radicado='RAD-RT-0401')
+        pubs = self._publicados(lambda: _notificar_posible_duplicado_tiempo_real(a, b))
+        destinos = set(NotificacionPeticion.objects.filter(id_peticion=a, tipo='POSIBLE_DUPLICADO')
+                       .values_list('id_usuario_destino_id', flat=True))
+        self.assertEqual(destinos, {self.admin.pk, self.juridico.pk})
+        self.assertIn(('peticion.posible_duplicado', 'AO', (1, 2), ()), pubs)
+        np_usuarios = {u for ev, cat, _, us in pubs if ev == 'peticion.posible_duplicado' and cat == 'NP' for u in us}
+        self.assertEqual(np_usuarios, {self.admin.pk, self.juridico.pk})
+
+    def test_pet09_seguimiento_creado_ao_a_gestion(self):
+        from peticiones.models import SeguimientoPeticionesVisita
+        p = self.peticion(asignado=self.vet1, radicado='RAD-RT-0402')
+        pubs = self._publicados(lambda: SeguimientoPeticionesVisita.objects.create(
+            id_peticion=p, id_veterinario=self.vet1, observacion='visita'))
+        self.assertIn(('peticion.seguimiento_creado', 'AO', (1, 2), ()), pubs)
+
+    def test_as_por_senal_con_roles_del_contrato(self):
+        from especies.models import Especie
+        from inventario.tests.factories import crear_lote_bodega, crear_medicamento
+        from users.models import Sede
+        from voluntariado.models import EventoVoluntariado
+
+        casos = [
+            (lambda: Sede.objects.create(nombre='Sede RT', direccion='d', ciudad='c', telefono='1', codigo='RT1'),
+             'admin.sede_actualizada', (5,)),
+            (lambda: EventoVoluntariado.objects.create(titulo='J', descripcion='d', imagen='x.jpg', fecha='2026-12-01'),
+             'voluntariado.evento_actualizado', (1, 2, 3, 4)),
+            (lambda: Especie.objects.create(nombre='Felino RT', activo=True), 'catalogo.clinico_actualizado', (1, 3)),
+            (lambda: crear_medicamento(), 'catalogo.medicamentos_actualizado', (1, 2, 3)),
+            (lambda: crear_lote_bodega(crear_medicamento(), cantidad=5), 'inventario.movimiento_bodega', (1, 2)),
+        ]
+        for accion, evento, roles in casos:
+            with self.subTest(evento=evento):
+                pubs = self._publicados(accion)
+                self.assertIn((evento, 'AS', roles, ()), pubs)
+                # Coalescencia: un solo evento AS por tipo y destinatarios dentro de la transacción
+                self.assertEqual(len([p for p in pubs if p[0] == evento]), 1)
+
+    def test_cli01_historia_clinica_solo_admin_y_vets(self):
+        from inventario.tests.factories import crear_animal_con_historia
+        from especies.models import Especie, Raza
+        especie, _ = Especie.objects.get_or_create(id_especie=1, defaults={'nombre': 'Canino', 'activo': True})
+        Raza.objects.get_or_create(id_raza=1, defaults={'id_especie': especie, 'nombre': 'Mestizo', 'activo': True})
+        pubs = self._publicados(lambda: crear_animal_con_historia())
+        self.assertIn(('clinica.atencion_registrada', 'AS', (1, 3), ()), pubs)
+        self.assertFalse([p for p in pubs if p[0] == 'clinica.atencion_registrada' and 2 in p[2]])
+
+    def test_usr01_gestion_de_usuario_a_admin_y_superadmin(self):
+        # setUpTestData creó usuarios dentro de la transacción de la clase (nunca confirmada): su USR-01 queda
+        # pendiente y la coalescencia por transacción lo reutilizaría. En una petición real cada transacción
+        # empieza sin callbacks pendientes; se reproduce eso aquí.
+        connection.run_on_commit.clear()
+
+        def editar():
+            self.vet1.nombre = 'Vet renombrado'
+            self.vet1.save()
+        pubs = self._publicados(editar)
+        self.assertIn(('admin.usuario_gestionado', 'AS', (1, 5), ()), pubs)
+        self.assertFalse([p for p in pubs if p[0] == 'sesion.revocada'])
 
