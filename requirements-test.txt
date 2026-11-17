@@ -1,0 +1,4 @@
+# Solo para pruebas locales/CI (no se instala en Railway).
+# channels.testing importa daphne aunque las pruebas usen WebsocketCommunicator en memoria.
+-r requirements.txt
+daphne==4.2.3

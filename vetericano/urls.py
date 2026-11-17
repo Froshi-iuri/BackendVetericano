@@ -28,6 +28,9 @@ urlpatterns = [
     # Autenticacion JWT (Refresh Token compatible con Usuarios)
     path('api/token/refresh/', UsuariosTokenRefreshView.as_view(), name='token_refresh'),
 
+    # Notificaciones centralizadas (tiempo real: REST de recuperacion y dispositivos FCM)
+    path('api/notificaciones/', include('realtime.urls')),
+
     # Endpoints de Usuarios
     path('api/usuarios/', include('users.api.urls')),
 

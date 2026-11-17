@@ -70,6 +70,7 @@ INSTALLED_APPS = [
     'clinica',
     'inventario',
     'dashboard',
+    'realtime',
 ]
 
 MIDDLEWARE = [
@@ -110,7 +111,7 @@ WSGI_APPLICATION = 'vetericano.wsgi.application'
 DATABASES = {
     'default': dj_database_url.config(
         default=os.getenv('DATABASE_URL'),
-        conn_max_age=600,
+        conn_max_age=int(os.getenv('DB_CONN_MAX_AGE', '600')),
         ssl_require=True,
     )
 }
@@ -473,3 +474,53 @@ DUPLICADOS_DINOV2_MICROSERVICIO_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
     min_val=0.5,
     max_val=30.0,
 )
+
+
+# ─── Tiempo real: WebSockets (servicio vetericano-ws) y FCM ─────────────────────────────
+# Todo apagado por defecto. El web publica eventos en Redis solo si WS_PUBLICAR_EVENTOS=True
+# y existe CHANNEL_REDIS_URL. Se usa un nombre distinto de REDIS_URL a propósito: REDIS_URL
+# cambia CACHES (OTP y throttles) y eso es una decisión aparte.
+CHANNEL_REDIS_URL = os.environ.get('CHANNEL_REDIS_URL', '').strip()
+if CHANNEL_REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                'hosts': [{
+                    'address': CHANNEL_REDIS_URL,
+                    # Hallazgo T-01: redis-py 8.x usa socket_timeout=5 s por defecto, igual al BZPOPMIN de
+                    # 5 s de channels-redis 4.3 -> el consumer del servicio ws caía al estar inactivo.
+                    # Debe ser MAYOR que brpop_timeout. El web acota cada publicación a 3 s con
+                    # asyncio.wait_for (realtime/publicar.py), así que no depende de este valor.
+                    'socket_connect_timeout': 2,
+                    'socket_timeout': 15,
+                    'socket_keepalive': True,
+                }],
+                'expiry': 60,
+                'group_expiry': 86400,
+                'capacity': 200,
+            },
+        },
+    }
+else:
+    CHANNEL_LAYERS = {}
+
+WS_PUBLICAR_EVENTOS = _leer_env_bool('WS_PUBLICAR_EVENTOS', default=False)
+# Persistencia de NP fuera de peticiones (tabla notificaciones_sistema, migración realtime).
+# Apagada hasta aplicar la migración en la BD: así el código puede desplegarse en oscuro.
+NOTIFICACIONES_SISTEMA_HABILITADAS = _leer_env_bool('NOTIFICACIONES_SISTEMA_HABILITADAS', default=False)
+WS_ALLOWED_ORIGINS = [
+    o.strip().rstrip('/')
+    for o in os.environ.get('WS_ALLOWED_ORIGINS', 'http://localhost:4200,http://127.0.0.1:4200').split(',')
+    if o.strip()
+]
+WS_AUTH_TIMEOUT_SEGUNDOS = 5
+WS_MAX_SIN_AUTENTICAR = int(os.environ.get('WS_MAX_SIN_AUTENTICAR', '200'))
+WS_MAX_MENSAJE_BYTES = 16384
+WS_RECHEQUEO_SEGUNDOS = 300
+
+FCM_HABILITADO = _leer_env_bool('FCM_HABILITADO', default=False)
+FCM_PROJECT_ID = os.environ.get('FCM_PROJECT_ID', '').strip()
+FCM_CREDENTIALS_JSON = os.environ.get('FCM_CREDENTIALS_JSON', '').strip()
+FCM_CREDENTIALS_FILE = os.environ.get('FCM_CREDENTIALS_FILE', '').strip()
+
