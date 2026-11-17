@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.db import transaction
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
+from inventario import notificaciones_realtime as notif_rt
 from .permissions import _es_gestor
 
 
@@ -58,7 +59,9 @@ class CompraSerializer(serializers.ModelSerializer):
                 cantidad_actual=cantidad,
                 estado='Disponible'
             )
-            
+
+        # Tiempo real INV-02: AO a rol_1/rol_2 si los medicamentos comprados siguen en 0 o ≤10 (tras el COMMIT).
+        notif_rt.alertar_bodega(med_ids=[d.get('id_medicamento') for d in detalles_data if isinstance(d, dict)])
         return compra
 
 
@@ -115,7 +118,9 @@ class DetalleSalidaSerializer(serializers.ModelSerializer):
                 cantidad_a_descontar -= lote.cantidad_actual
                 lote.cantidad_actual = 0
                 lote.save()
-                
+
+        # Tiempo real INV-02: AO a rol_1/rol_2 si el medicamento/lotes quedan en 0, ≤10 o vencen en ≤30 días.
+        notif_rt.alertar_bodega(med_ids=[getattr(medicamento, 'pk', None)], inventario_ids=[lote.pk for lote in lotes])
         return detalle_salida
 
 

@@ -57,6 +57,7 @@ from inventario.services.kit_service import (
     _obtener_fecha_hoy,
     _normalizar_fecha_compra,
 )
+from inventario import notificaciones_realtime as notif_rt
 
 
 def _sort_key_fifo_directo(fecha_compra, id_inventario: int):
@@ -519,6 +520,9 @@ def descontar_consumo_kit(
                 )
                 existentes_map[it['client_uuid']] = reg_post
 
+    # Tiempo real (KIT-02): foto del kit antes del descuento para detectar cruces de umbral.
+    estado_kit_previo = notif_rt.capturar_estado_kit(id_veterinario, [it['id_medicamento'] for it in items_nuevos])
+
     # 6. Organizar lotes vigentes bajo lock en colas FIFO Directo por medicamento
     # Regla de vigencia: fecha_vencimiento is None o fecha_vencimiento >= hoy (== hoy es vigente; < hoy es vencido).
     hoy = _obtener_fecha_hoy()
@@ -785,6 +789,9 @@ def descontar_consumo_kit(
             'idempotente': False,
             'lotes_afectados': lotes_afectados,
         })
+
+    # Tiempo real: KIT-06 NP ESTRICTA (misma transacción que los RECHAZADO_CONFLICTO nuevos) + AO, y KIT-02 AO.
+    notif_rt.tras_consumo_kit(id_veterinario, conflictos, estado_kit_previo)
 
     return {
         'aplicados': aplicados,

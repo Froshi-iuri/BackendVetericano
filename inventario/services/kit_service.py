@@ -57,6 +57,7 @@ from inventario.services.exceptions import (
     SolicitudInvalidaError,
     CantidadInvalidaError,
 )
+from inventario import notificaciones_realtime as notif_rt
 
 
 def _es_entero_valido(val, minimo: int | None = None) -> bool:
@@ -366,6 +367,9 @@ def asignar_stock_a_kit(
 
         plan_asignaciones[med_id] = asignaciones_med
 
+    # Tiempo real (KIT-02): foto del kit antes del movimiento para detectar cruces de umbral.
+    estado_kit_previo = notif_rt.capturar_estado_kit(id_veterinario, [item['id_medicamento'] for item in items])
+
     # 7. Ejecutar modificaciones y registrar kardex granular
     resultado = []
 
@@ -529,6 +533,8 @@ def asignar_stock_a_kit(
             'lotes_asignados': lotes_resultado,
         })
 
+    # Tiempo real: KIT-01 NP al vet (tolerante, solo asignación directa), KIT-02 AO e INV-02 AO.
+    notif_rt.tras_asignacion_kit(id_gestor, id_veterinario, resultado, estado_kit_previo, id_solicitud=id_solicitud)
     return resultado
 
 
@@ -646,6 +652,9 @@ def retirar_stock_de_kit(
         reverse=True
     )
 
+    # Tiempo real (KIT-02): foto del kit antes del movimiento para detectar cruces de umbral.
+    estado_kit_previo = notif_rt.capturar_estado_kit(id_veterinario, [id_medicamento])
+
     restante = cantidad
     unidades_baja_vencimiento = 0
     bajas_vencimiento = []
@@ -751,7 +760,7 @@ def retirar_stock_de_kit(
         })
         restante -= a_retirar
 
-    return {
+    resultado_retiro = {
         'id_medicamento': id_medicamento,
         'nombre_medicamento': med_obj.nombre,
         'id_veterinario': id_veterinario,
@@ -761,6 +770,9 @@ def retirar_stock_de_kit(
         'lotes_reintegrados_bodega': lotes_reintegrados,
         'bajas_vencimiento': bajas_vencimiento,
     }
+    # Tiempo real: KIT-01 NP al vet (tolerante) y KIT-02 AO.
+    notif_rt.tras_retiro_kit(id_gestor, id_veterinario, resultado_retiro, estado_kit_previo)
+    return resultado_retiro
 
 
 @transaction.atomic
@@ -902,6 +914,9 @@ def procesar_devolucion_aprobada(
             codigo="CONFLICTO_CONCURRENCIA_REINTENTO",
             extra={'id_solicitud': id_solicitud, 'lotes_faltantes': faltantes_dev}
         )
+
+    # Tiempo real (KIT-02): foto del kit antes del movimiento para detectar cruces de umbral.
+    estado_kit_previo = notif_rt.capturar_estado_kit(solicitud.id_veterinario_id, [d.id_medicamento_id for d in detalles_qs])
 
     # 7. Procesar cada detalle con aprobación > 0 aplicando la Regla Única de Vencidos (Punto 3)
     hoy = _obtener_fecha_hoy()
@@ -1240,6 +1255,9 @@ def procesar_devolucion_aprobada(
 
     total_bajas = sum(dp['unidades_baja_vencimiento'] for dp in detalles_procesados)
     total_reintegradas = sum(dp['unidades_reintegradas_bodega'] for dp in detalles_procesados)
+
+    # Tiempo real: KIT-02 AO (la NP KIT-04 al vet la emite solicitudes_service.aprobar_solicitud).
+    notif_rt.alertar_kit_tras_movimiento(solicitud.id_veterinario_id, estado_kit_previo)
 
     return {
         'id_solicitud': solicitud.id_solicitud,

@@ -56,6 +56,7 @@ from inventario.services.exceptions import (
 )
 from inventario.services import kit_service
 from inventario.services.kit_service import _obtener_fecha_hoy, _es_entero_valido
+from inventario import notificaciones_realtime as notif_rt
 
 
 def _bloquear_y_validar_veterinario(id_veterinario: int) -> Usuarios:
@@ -274,6 +275,9 @@ def crear_solicitud_reposicion(
         )
         detalles_creados.append(det)
 
+    # Tiempo real KIT-03: NP ESTRICTA a gestores activos dentro de esta transacción.
+    notif_rt.solicitud_kit_creada(solicitud.id_solicitud, solicitud.tipo_solicitud, id_veterinario, len(detalles_creados))
+
     return {
         'id_solicitud': solicitud.id_solicitud,
         'tipo_solicitud': solicitud.tipo_solicitud,
@@ -435,6 +439,9 @@ def crear_solicitud_devolucion(
         )
         detalles_creados.append(det)
 
+    # Tiempo real KIT-03: NP ESTRICTA a gestores activos dentro de esta transacción.
+    notif_rt.solicitud_kit_creada(solicitud.id_solicitud, solicitud.tipo_solicitud, id_veterinario, len(detalles_creados))
+
     return {
         'id_solicitud': solicitud.id_solicitud,
         'tipo_solicitud': solicitud.tipo_solicitud,
@@ -585,6 +592,9 @@ def aprobar_solicitud(
             sol.observaciones_gestor = observaciones_gestor.strip()
         sol.save(update_fields=['estado', 'id_gestor', 'fecha_resolucion', 'observaciones_gestor'])
 
+        # Tiempo real KIT-04: NP ESTRICTA al vet solicitante + AS a rol_1/rol_2.
+        notif_rt.solicitud_kit_resuelta(sol.id_solicitud, sol.tipo_solicitud, sol.estado, sol.id_veterinario_id, id_gestor)
+
         return {
             'id_solicitud': sol.id_solicitud,
             'tipo_solicitud': sol.tipo_solicitud,
@@ -618,12 +628,15 @@ def aprobar_solicitud(
 
         # procesar_devolucion_aprobada ya actualiza detalles, cabecera (APROBADA/PARCIAL) y kardex.
         # No se vuelve a guardar la cabecera aquí para evitar pisar su estado.
-        return kit_service.procesar_devolucion_aprobada(
+        resultado_devolucion = kit_service.procesar_devolucion_aprobada(
             id_gestor=id_gestor,
             id_solicitud=sol.id_solicitud,
             aprobaciones=aprobaciones_devolucion,
             observaciones_gestor=observaciones_gestor,
         )
+        # Tiempo real KIT-04: NP ESTRICTA al vet solicitante + AS a rol_1/rol_2.
+        notif_rt.solicitud_kit_resuelta(sol.id_solicitud, sol.tipo_solicitud, resultado_devolucion['estado'], sol.id_veterinario_id, id_gestor)
+        return resultado_devolucion
 
     else:
         raise SolicitudInvalidaError(f"Tipo de solicitud no reconocido: {sol.tipo_solicitud}")
@@ -674,6 +687,9 @@ def rechazar_solicitud(
     sol.fecha_resolucion = ahora
     sol.observaciones_gestor = observaciones_gestor.strip()
     sol.save(update_fields=['estado', 'id_gestor', 'fecha_resolucion', 'observaciones_gestor'])
+
+    # Tiempo real KIT-04: NP ESTRICTA al vet solicitante + AS a rol_1/rol_2.
+    notif_rt.solicitud_kit_resuelta(sol.id_solicitud, sol.tipo_solicitud, sol.estado, sol.id_veterinario_id, id_gestor)
 
     return {
         'id_solicitud': sol.id_solicitud,
@@ -733,6 +749,9 @@ def cancelar_solicitud(
     sol.estado = SOLICITUD_ESTADO_CANCELADA
     sol.fecha_resolucion = ahora
     sol.save(update_fields=['estado', 'fecha_resolucion'])
+
+    # Tiempo real KIT-05: AS a rol_1/rol_2 (tras el COMMIT).
+    notif_rt.solicitud_kit_cancelada(sol.id_solicitud, id_veterinario)
 
     detalles = list(sol.detalles.all().order_by('id_detalle_solicitud'))
 
