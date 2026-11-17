@@ -1,5 +1,8 @@
 from pathlib import Path
+import logging
 import os
+import re
+import sys
 from typing import Optional
 import dj_database_url
 from dotenv import load_dotenv
@@ -22,7 +25,15 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'True') == 'True'
+# Seguro por defecto: sin la variable DEBUG -> False.
+# Solo se activa en desarrollo local definiendo explícitamente DEBUG=True (p. ej. en el .env local).
+# En Railway (que inyecta RAILWAY_PROJECT_ID / RAILWAY_ENVIRONMENT_ID en cada despliegue) DEBUG
+# se fuerza a False aunque la variable diga True: la página técnica de Django nunca llega a producción.
+_DEBUG_SOLICITADO = os.environ.get('DEBUG', 'False').strip().lower() in ('true', '1', 'yes', 'on')
+_EN_RAILWAY = bool(os.environ.get('RAILWAY_PROJECT_ID') or os.environ.get('RAILWAY_ENVIRONMENT_ID'))
+DEBUG = _DEBUG_SOLICITADO and not _EN_RAILWAY
+if _DEBUG_SOLICITADO and _EN_RAILWAY:
+    sys.stderr.write('[settings] DEBUG=True ignorado: en Railway DEBUG siempre es False.\n')
 
 
 # ALLOWED_HOSTS = [
@@ -140,7 +151,71 @@ USE_TZ = False
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+# STATICFILES_STORAGE se eliminó en Django 5.1: Django 6.1 lo ignoraba en silencio. Se declara STORAGES
+# explícito con el almacenamiento simple (sin manifest): el build de Railway NO ejecuta collectstatic,
+# y un storage con manifest sin collectstatic provocaría HTTP 500 en /admin/ y /swagger/.
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
+# Con DEBUG=False, WhiteNoise sirve los estáticos de admin, DRF y drf-yasg directamente desde las apps
+# instaladas (finders), indexándolos una sola vez al arrancar cada worker (sin autorefresh).
+WHITENOISE_USE_FINDERS = True
+WHITENOISE_AUTOREFRESH = DEBUG
+
+
+# Logging (los errores 500 y avisos de django.request deben verse en los logs de Railway con DEBUG=False).
+# El formateador redacta JWT, cabeceras Bearer, contraseñas/claves y credenciales en URLs de BD
+# antes de escribir cada línea (incluidas las trazas de excepción).
+_PATRONES_SECRETOS = (
+    (re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'), '[JWT-REDACTADO]'),
+    (re.compile(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+'), r'\1[REDACTADO]'),
+    (re.compile(
+        r'(?i)((?:password|passwd|contrase(?:ñ|n)a|secret|api[_-]?key|access|refresh|token)["\']?\s*[:=]\s*["\']?)'
+        r'[^\s"\',;&}]+'
+    ), r'\1[REDACTADO]'),
+    (re.compile(r'(?i)((?:postgres(?:ql)?|redis|rediss)://[^:/\s@]+:)[^@\s]+@'), r'\1[REDACTADO]@'),
+)
+
+
+class FormateadorSinSecretos(logging.Formatter):
+    """Formatter de consola que redacta secretos en el mensaje y en la traza ya formateados."""
+
+    def format(self, record):
+        texto = super().format(record)
+        for patron, reemplazo in _PATRONES_SECRETOS:
+            texto = patron.sub(reemplazo, texto)
+        return texto
+
+
+_NIVEL_LOG = os.environ.get('DJANGO_LOG_LEVEL', 'INFO').strip().upper() or 'INFO'
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'consola': {
+            '()': FormateadorSinSecretos,
+            'format': '{asctime} {levelname} {name} [pid={process}] {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'consola': {
+            'class': 'logging.StreamHandler',
+            'stream': 'ext://sys.stdout',
+            'formatter': 'consola',
+        },
+    },
+    'root': {'handlers': ['consola'], 'level': _NIVEL_LOG},
+    'loggers': {
+        'django': {'handlers': ['consola'], 'level': 'INFO', 'propagate': False},
+        # 4xx -> WARNING, 5xx -> ERROR con traza (sin cabeceras ni cuerpo de la petición).
+        'django.request': {'handlers': ['consola'], 'level': 'WARNING', 'propagate': False},
+        'django.security': {'handlers': ['consola'], 'level': 'WARNING', 'propagate': False},
+        # Nunca volcar SQL con parámetros a los logs.
+        'django.db.backends': {'handlers': ['consola'], 'level': 'WARNING', 'propagate': False},
+    },
+}
 
 
 
