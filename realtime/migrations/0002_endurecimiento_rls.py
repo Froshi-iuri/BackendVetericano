@@ -43,7 +43,9 @@ ALTER TABLE public.dispositivos_fcm DISABLE ROW LEVEL SECURITY;
 def _solo_postgres(sql):
     def aplicar(apps, schema_editor):
         if schema_editor.connection.vendor == 'postgresql':
-            schema_editor.execute(sql)
+            # params=None: el SQL usa format('%I', ...) de PostgreSQL; con params=() psycopg interpretaría los
+            # '%' como marcadores y fallaría (detectado al verificar la migración en PostgreSQL 17 real).
+            schema_editor.execute(sql, params=None)
     return aplicar
 
 
