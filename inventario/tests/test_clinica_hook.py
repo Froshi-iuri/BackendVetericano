@@ -1011,14 +1011,17 @@ class KitClinicaHookTestCase(TestCase):
 
     def test_cli_14_usuario_no_veterinario_con_consumos_kit(self):
         """
-        TEST-CLI-14: Usuario no veterinario (Rol 4 Peticionario) con medicamentos_usados no vacío.
-        - El endpoint /api/clinica/expediente-completo/ permite IsAuthenticated.
-        - Al enviar medicamentos_usados, validar_payload_consumo_kit rechaza con UsuarioNoVeterinarioError.
-        - Retorna HTTP 400 Bad Request con error='USUARIO_NO_VETERINARIO'.
+        TEST-CLI-14: Usuario no veterinario con medicamentos_usados no vacío en /api/clinica/expediente-completo/.
+        - Rol 4 (Peticionario): bloqueado en capa de permisos (PermisoClinica) -> HTTP 403 Forbidden.
+        - Rol 1 (Administrador): autorizado por PermisoClinica (ROLES_ATENCION_CLINICA=[1, 3]), pero al enviar
+          medicamentos_usados, validar_payload_consumo_kit rechaza con UsuarioNoVeterinarioError -> HTTP 400
+          con error='USUARIO_NO_VETERINARIO'.
         - BD inalterada: cero consultas creadas, cero consumos, cero kardex, kit intacto.
         """
         peticionario = crear_usuario(rol_id=4, email="peticionario_cli14@cba.gov.co")
+        admin = crear_usuario(rol_id=1, email="admin_cli14@cba.gov.co")
         headers_pet = obtener_headers_jwt(peticionario)
+        headers_admin = obtener_headers_jwt(admin)
 
         animal, historia = crear_animal_con_historia()
         b = crear_lote_bodega(self.med_a, cantidad=20, fecha_vencimiento=self.hoy + timedelta(days=60))
@@ -1031,9 +1034,14 @@ class KitClinicaHookTestCase(TestCase):
             offline=False,
         )
 
-        resp = self.client.post("/api/clinica/expediente-completo/", payload, format="json", **headers_pet)
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get("error"), "USUARIO_NO_VETERINARIO")
+        # 1. Peticionario (Rol 4) bloqueado estrictamente por PermisoClinica -> 403
+        resp_pet = self.client.post("/api/clinica/expediente-completo/", payload, format="json", **headers_pet)
+        self.assertEqual(resp_pet.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 2. Administrador (Rol 1) pasa PermisoClinica pero no es titular de kit -> 400 USUARIO_NO_VETERINARIO
+        resp_admin = self.client.post("/api/clinica/expediente-completo/", payload, format="json", **headers_admin)
+        self.assertEqual(resp_admin.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp_admin.data.get("error"), "USUARIO_NO_VETERINARIO")
 
         # Invariantes en base de datos
         self.assertEqual(Consulta.objects.filter(id_historia=historia).count(), 0)
