@@ -391,12 +391,9 @@ class LegacyCompatVeterinarioTests(TestCase):
 
     def test_l06_get_recursos_inventario_veterinario_y_juridico(self):
         """
-        L-06: GET 200 en inventarios, detalles-compra, salidas, detalles-salida para rol 3 y rol 2.
-        Payload: Ninguno (GET).
-        Referencias web:
-        - adminVetericano/src/app/services/compras.service.ts:140 (GET /api/inventario/detalles-compra/)
-        - adminVetericano/src/app/services/compras.service.ts:173 (GET /api/inventario/inventarios/)
-        - inventario/api/views.py:49-58 (GET /api/inventario/salidas/, GET /api/inventario/detalles-salida/)
+        L-06: GET en inventarios, detalles-compra, salidas, detalles-salida:
+        - Rol 2 (Jurídico): HTTP 200 OK (gestor de inventario en INVENTARIO_LECTURA_LEGACY_ROLES=[1, 2]).
+        - Rol 3 (Veterinario): HTTP 403 Forbidden (bloqueado de bodega general tras separación de roles).
         """
         recursos = [
             "/api/inventario/inventarios/",
@@ -404,28 +401,26 @@ class LegacyCompatVeterinarioTests(TestCase):
             "/api/inventario/salidas/",
             "/api/inventario/detalles-salida/",
         ]
+        esperado_por_rol = {
+            2: status.HTTP_200_OK,
+            3: status.HTTP_403_FORBIDDEN,
+        }
         for rol_nombre, rol_id, headers in self.roles_test:
+            codigo_esperado = esperado_por_rol[rol_id]
             for url in recursos:
                 with self.subTest(rol=rol_nombre, endpoint=url):
                     resp = self.client.get(url, **headers)
                     self.assertEqual(
                         resp.status_code,
-                        status.HTTP_200_OK,
+                        codigo_esperado,
                         f"Rol {rol_nombre} recibio {resp.status_code} en {url}",
                     )
 
     def test_l07_patch_inventario_acta_web_veterinario_y_juridico(self):
         """
-        L-07: PATCH /inventarios/{id}/ con payload EXACTO del acta web
-        {cantidad_actual: valor menor al actual, estado: 'Disponible'} -> 200 y BD actualizada;
-        PATCH a 0 con estado 'Agotado' -> 200.
-        Probado para Veterinario (rol 3) y Juridico (rol 2).
-        Payloads:
-        - Disminuir: {"cantidad_actual": 30, "estado": "Disponible"}
-        - Agotar: {"cantidad_actual": 0, "estado": "Agotado"}
-        Referencias web:
-        - adminVetericano/src/app/services/compras.service.ts:720-727
-        - adminVetericano/src/app/inventario/inventario.ts:434-453
+        L-07: PATCH /inventarios/{id}/ con payload del acta web:
+        - Rol 2 (Jurídico): HTTP 200 OK y BD actualizada (disminuir a 30 Disponible y agotar a 0 Agotado).
+        - Rol 3 (Veterinario): HTTP 403 Forbidden y BD inalterada (solo consume su kit personal).
         """
         for rol_nombre, rol_id, headers in self.roles_test:
             with self.subTest(rol=rol_nombre):
@@ -439,6 +434,13 @@ class LegacyCompatVeterinarioTests(TestCase):
                     format="json",
                     **headers,
                 )
+                if rol_id == 3:
+                    self.assertEqual(resp_menor.status_code, status.HTTP_403_FORBIDDEN)
+                    lote_test.refresh_from_db()
+                    self.assertEqual(lote_test.cantidad_actual, 50)
+                    self.assertEqual(lote_test.estado, "Disponible")
+                    continue
+
                 self.assertEqual(resp_menor.status_code, status.HTTP_200_OK)
                 lote_test.refresh_from_db()
                 self.assertEqual(lote_test.cantidad_actual, 30)
@@ -558,9 +560,9 @@ class LegacyEndurecidoTests(TestCase):
 
     def test_h04_veterinario_patch_inventario_inflar_stock_rechazado_400(self):
         """
-        H-04: veterinario PATCH /inventarios/{id}/ {cantidad_actual: MAYOR} -> 400 Bad Request code 'AJUSTE_STOCK_AUMENTO_NO_PERMITIDO' (valor anterior: 200 OK).
-        Payload mayor: {"cantidad_actual": 100} (stock original 50). Payload igual: {"cantidad_actual": 50}.
-        Por que existe: Impide que el veterinario infle stock ficticio en bodega mediante el endpoint legacy de actas. Se permite mantener el valor igual (200).
+        H-04: veterinario (rol 3) PATCH /inventarios/{id}/ -> 403 Forbidden (bloqueado en capa de permisos).
+        Tras la separación de roles (INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES=[1, 2]), el veterinario no puede
+        alterar ni consultar lotes de bodega general; sus consumos operan únicamente sobre su kit.
         """
         lote = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
         resp = self.client.patch(
@@ -569,20 +571,18 @@ class LegacyEndurecidoTests(TestCase):
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        codigos = _extraer_codigos_error(resp.data)
-        self.assertIn("AJUSTE_STOCK_AUMENTO_NO_PERMITIDO", codigos)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 50)
 
-        # Caso valor IGUAL al actual -> 200
+        # Incluso enviando el mismo valor, el rol Veterinario permanece bloqueado con 403
         resp_igual = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"cantidad_actual": 50},
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp_igual.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_igual.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 50)
 
@@ -633,9 +633,9 @@ class LegacyEndurecidoTests(TestCase):
 
     def test_h08_veterinario_patch_inventario_desvincular_rechazado_400(self):
         """
-        H-08: veterinario PATCH /inventarios/{id}/ {id_detalle_compra: null} -> 400 Bad Request code 'AJUSTE_STOCK_CAMPOS_NO_PERMITIDOS' (valor anterior: 200 OK).
-        Payload desvincular: {"id_detalle_compra": None}. Payload mixto: {"cantidad_actual": 10, "id_detalle_compra": None}.
-        Por que existe: El veterinario solo puede ajustar 'cantidad_actual' y 'estado'; no puede desvincular lotes de sus compras de origen.
+        H-08: veterinario (rol 3) PATCH /inventarios/{id}/ {id_detalle_compra: null} -> 403 Forbidden.
+        Tras la separación de roles (INVENTARIO_AJUSTE_STOCK_LEGACY_ROLES=[1, 2]), el veterinario queda
+        bloqueado por PermisoInventariosLegacy antes de alcanzar el serializer; BD intacta.
         """
         lote = crear_lote_bodega(medicamento=self.med, cantidad=20, estado="Disponible")
         id_detalle_orig = lote.id_detalle_compra_id
@@ -648,9 +648,7 @@ class LegacyEndurecidoTests(TestCase):
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        codigos = _extraer_codigos_error(resp.data)
-        self.assertIn("AJUSTE_STOCK_CAMPOS_NO_PERMITIDOS", codigos)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.id_detalle_compra_id, id_detalle_orig)
 
@@ -661,9 +659,7 @@ class LegacyEndurecidoTests(TestCase):
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp_mixto.status_code, status.HTTP_400_BAD_REQUEST)
-        codigos_mixto = _extraer_codigos_error(resp_mixto.data)
-        self.assertIn("AJUSTE_STOCK_CAMPOS_NO_PERMITIDOS", codigos_mixto)
+        self.assertEqual(resp_mixto.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 20)
         self.assertEqual(lote.id_detalle_compra_id, id_detalle_orig)
@@ -739,15 +735,9 @@ class LegacyEndurecidoTests(TestCase):
 
     def test_n02_veterinario_y_juridico_mutaciones_salidas_y_detalles_compra_403(self):
         """
-        N-02: veterinario (rol 3) y juridico (rol 2): POST/PATCH/DELETE sobre salidas y detalles-compra -> 403.
-        Payloads:
-        - POST salidas: {"motivo": "Salida no permitida"}
-        - PATCH salidas: {"motivo": "Ajuste motivo"}
-        - DELETE salidas: Ninguno
-        - POST detalles-compra: {"id_compra": <id>, "id_medicamento": <id_med>, "cantidad": 10}
-        - PATCH detalles-compra: {"cantidad": 15}
-        - DELETE detalles-compra: Ninguno
-        Por que existe: Garantiza que staff clinico y juridico solo puedan consultar (lectura SAFE) compras y salidas, impidiendo mutaciones.
+        N-02: control de mutaciones sobre salidas y detalles-compra (Opción A, INVENTARIO_GESTOR_ROLES=[1, 2]):
+        - Veterinario (rol 3) y Peticionario (rol 4): POST/PATCH/DELETE -> 403 Forbidden.
+        - Jurídico (rol 2, gestor de inventario): POST (201), PATCH (200), DELETE (204) permitidos.
         """
         compra = Compra.objects.create(id_proveedor=self.prov)
         det_compra = DetalleCompra.objects.create(
@@ -757,12 +747,12 @@ class LegacyEndurecidoTests(TestCase):
         )
         salida = Salidas.objects.create(motivo="Salida inicial base")
 
-        roles_staff = [
+        roles_bloqueados = [
             ("Veterinario", self.headers_vet),
-            ("Juridico", self.headers_juridico),
+            ("Peticionario", self.headers_pet),
         ]
 
-        for rol_nombre, headers in roles_staff:
+        for rol_nombre, headers in roles_bloqueados:
             with self.subTest(rol=rol_nombre, metodo="POST", recurso="salidas"):
                 resp = self.client.post("/api/inventario/salidas/", {"motivo": "Prueba"}, format="json", **headers)
                 self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
@@ -797,11 +787,45 @@ class LegacyEndurecidoTests(TestCase):
                 resp = self.client.delete(f"/api/inventario/detalles-compra/{det_compra.id_detalle_compra}/", **headers)
                 self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
+        # Jurídico (Rol 2) como gestor autorizado de inventario general
+        with self.subTest(rol="Juridico", metodo="POST", recurso="salidas"):
+            resp = self.client.post("/api/inventario/salidas/", {"motivo": "Prueba Juridico"}, format="json", **self.headers_juridico)
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        with self.subTest(rol="Juridico", metodo="PATCH", recurso="salidas"):
+            resp = self.client.patch(f"/api/inventario/salidas/{salida.id_salida}/", {"motivo": "Modificado Juridico"}, format="json", **self.headers_juridico)
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        with self.subTest(rol="Juridico", metodo="DELETE", recurso="salidas"):
+            resp = self.client.delete(f"/api/inventario/salidas/{salida.id_salida}/", **self.headers_juridico)
+            self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+        with self.subTest(rol="Juridico", metodo="POST", recurso="detalles-compra"):
+            resp = self.client.post(
+                "/api/inventario/detalles-compra/",
+                {"id_compra": compra.id_compra, "id_medicamento": self.med.id_medicamento, "cantidad": 5},
+                format="json",
+                **self.headers_juridico,
+            )
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        with self.subTest(rol="Juridico", metodo="PATCH", recurso="detalles-compra"):
+            resp = self.client.patch(
+                f"/api/inventario/detalles-compra/{det_compra.id_detalle_compra}/",
+                {"cantidad": 20},
+                format="json",
+                **self.headers_juridico,
+            )
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        with self.subTest(rol="Juridico", metodo="DELETE", recurso="detalles-compra"):
+            resp = self.client.delete(f"/api/inventario/detalles-compra/{det_compra.id_detalle_compra}/", **self.headers_juridico)
+            self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
     def test_n03_veterinario_patch_cantidad_negativa_400(self):
         """
-        N-03: veterinario PATCH cantidad_actual negativa -> 400 Bad Request code 'AJUSTE_STOCK_NEGATIVO' y BD intacta.
-        Payload: {"cantidad_actual": -5}
-        Por que existe: El stock fisico no puede ser negativo; protege contra inconsistencias aritmeticas en inventarios.
+        N-03: veterinario (rol 3) PATCH cantidad_actual negativa -> 403 Forbidden (bloqueado en capa de permisos).
+        Tras la separación de roles, el rol Veterinario no tiene acceso de escritura ni lectura a /inventarios/.
         """
         lote = crear_lote_bodega(medicamento=self.med, cantidad=30, estado="Disponible")
         resp = self.client.patch(
@@ -810,9 +834,7 @@ class LegacyEndurecidoTests(TestCase):
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        codigos = _extraer_codigos_error(resp.data)
-        self.assertIn("AJUSTE_STOCK_NEGATIVO", codigos)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 30)
 
@@ -836,23 +858,23 @@ class LegacyEndurecidoTests(TestCase):
 
     def test_n05_forma_respuesta_patch_acta_web_paridad_con_admin(self):
         """
-        N-05: FORMA DE RESPUESTA: el PATCH exacto del acta web (veterinario, {"cantidad_actual": menor, "estado": "Disponible"})
-        responde 200 con el MISMO conjunto de claves que el PATCH equivalente del administrador sobre otro lote (compara set(resp.data.keys())).
-        Payload: {"cantidad_actual": 25, "estado": "Disponible"}
-        Por que existe: Verifica que el contrato de respuesta JSON sea identico entre roles para evitar roturas en el cliente web Angular.
+        N-05: FORMA DE RESPUESTA: el PATCH de ajuste sobre /inventarios/{id}/ por Jurídico (rol 2)
+        responde 200 con el MISMO conjunto de claves que el PATCH equivalente del Administrador (rol 1),
+        mientras Veterinario (rol 3) recibe 403 Forbidden sin alterar el lote.
         """
-        lote_vet = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
+        lote_jur = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
         lote_admin = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
+        lote_vet = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
 
         payload = {"cantidad_actual": 25, "estado": "Disponible"}
 
-        resp_vet = self.client.patch(
-            f"/api/inventario/inventarios/{lote_vet.id_inventario}/",
+        resp_jur = self.client.patch(
+            f"/api/inventario/inventarios/{lote_jur.id_inventario}/",
             payload,
             format="json",
-            **self.headers_vet,
+            **self.headers_juridico,
         )
-        self.assertEqual(resp_vet.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_jur.status_code, status.HTTP_200_OK)
 
         resp_admin = self.client.patch(
             f"/api/inventario/inventarios/{lote_admin.id_inventario}/",
@@ -862,38 +884,57 @@ class LegacyEndurecidoTests(TestCase):
         )
         self.assertEqual(resp_admin.status_code, status.HTTP_200_OK)
 
-        self.assertEqual(set(resp_vet.data.keys()), set(resp_admin.data.keys()))
+        self.assertEqual(set(resp_jur.data.keys()), set(resp_admin.data.keys()))
+
+        # Veterinario (rol 3) permanece bloqueado en bodega general
+        resp_vet = self.client.patch(
+            f"/api/inventario/inventarios/{lote_vet.id_inventario}/",
+            payload,
+            format="json",
+            **self.headers_vet,
+        )
+        self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
+        lote_vet.refresh_from_db()
+        self.assertEqual(lote_vet.cantidad_actual, 50)
 
     def test_n06_descuentos_sucesivos_y_obsoleto_400(self):
         """
-        N-06: DESCUENTOS SUCESIVOS Y OBSOLETO: veterinario hace PATCH 50->40 (200) y luego un PATCH con valor 45
-        sobre el mismo lote (obsoleto, mayor que el actual) -> 400 Bad Request y la BD queda en 40.
-        Payloads: primer PATCH {"cantidad_actual": 40}, segundo PATCH {"cantidad_actual": 45}.
-        Por que existe: Valida que la verificacion bajo lock proteja contra estados obsoletos en el cliente web y descarte aumentos no autorizados.
+        N-06: DESCUENTOS SUCESIVOS Y BLOQUEO DE VETERINARIO:
+        - Jurídico (gestor) realiza PATCH 50->40 -> 200 OK y BD queda en 40.
+        - Veterinario (rol 3) intentando PATCH sobre el mismo lote recibe 403 Forbidden y la BD queda en 40.
         """
         lote = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
 
-        # 1. Primer PATCH: 50 -> 40 (valido)
-        resp1 = self.client.patch(
+        # 1. Veterinario bloqueado antes de cualquier mutación -> 403
+        resp_vet_pre = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"cantidad_actual": 40},
             format="json",
             **self.headers_vet,
         )
+        self.assertEqual(resp_vet_pre.status_code, status.HTTP_403_FORBIDDEN)
+        lote.refresh_from_db()
+        self.assertEqual(lote.cantidad_actual, 50)
+
+        # 2. Jurídico (gestor) aplica descuento 50 -> 40 -> 200 OK
+        resp1 = self.client.patch(
+            f"/api/inventario/inventarios/{lote.id_inventario}/",
+            {"cantidad_actual": 40},
+            format="json",
+            **self.headers_juridico,
+        )
         self.assertEqual(resp1.status_code, status.HTTP_200_OK)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 40)
 
-        # 2. Segundo PATCH: 45 (mayor que el stock actual de 40) -> 400
+        # 3. Veterinario intentando PATCH posterior -> 403 Forbidden, BD intacta en 40
         resp2 = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"cantidad_actual": 45},
             format="json",
             **self.headers_vet,
         )
-        self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST)
-        codigos = _extraer_codigos_error(resp2.data)
-        self.assertIn("AJUSTE_STOCK_AUMENTO_NO_PERMITIDO", codigos)
+        self.assertEqual(resp2.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 40)
 

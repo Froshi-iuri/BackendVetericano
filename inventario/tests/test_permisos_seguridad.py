@@ -62,29 +62,27 @@ class KitPermisosSeguridadTestCase(TestCase):
     def test_sec_56_matriz_rbac_endpoints_kit(self):
         """
         TEST-SEC-56: Matriz RBAC contra todos los endpoints de /api/inventario/kit/.
-        - Construida leyendo directamente urls.py, kit_views.py y permissions.py:
-          1. POST /api/inventario/kit/asignar/ -> EsGestorInventario (Autorizado: Rol 1)
-          2. POST /api/inventario/kit/retiro-directo/ -> EsGestorInventario (Autorizado: Rol 1)
-             * NOTA H-C2: kit_views.py:273 tiene un bug conocido (KeyError al acceder a
-               resultado['lotes_afectados'] en retiros exitosos). Para evitar detonar el bug
-               en esta matriz, para el rol autorizado se envía un cuerpo vacío ({}) que el
+        - Construida leyendo directamente urls.py, kit_views.py, permissions.py y constants.py (INVENTARIO_GESTOR_ROLES=[1, 2]):
+          1. POST /api/inventario/kit/asignar/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
+          2. POST /api/inventario/kit/retiro-directo/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
+             * NOTA H-C2: para evitar efectos en BD, para el rol autorizado se envía un cuerpo vacío ({}) que el
                serializer rechaza con HTTP 400 antes de llegar al servicio de dominio.
-          3. GET /api/inventario/kit/veterinario/{id}/ -> EsGestorInventario (Autorizado: Rol 1)
-          4. POST /api/inventario/kit/solicitudes/{id}/aprobar/ -> EsGestorInventario (Autorizado: Rol 1)
-          5. POST /api/inventario/kit/solicitudes/{id}/rechazar/ -> EsGestorInventario (Autorizado: Rol 1)
-          6. GET /api/inventario/kit/conflictos/ -> EsGestorInventario (Autorizado: Rol 1)
+          3. GET /api/inventario/kit/veterinario/{id}/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
+          4. POST /api/inventario/kit/solicitudes/{id}/aprobar/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
+          5. POST /api/inventario/kit/solicitudes/{id}/rechazar/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
+          6. GET /api/inventario/kit/conflictos/ -> EsGestorInventario (Autorizados: Rol 1 y Rol 2)
           7. GET /api/inventario/kit/mi-kit/ -> EsVeterinario (Autorizado: Rol 3)
           8. GET /api/inventario/kit/snapshot-movil/ -> EsVeterinario (Autorizado: Rol 3)
           9. POST /api/inventario/kit/solicitudes/{id}/cancelar/ -> EsVeterinario (Autorizado: Rol 3)
           10. POST /api/inventario/kit/sincronizar-offline/ -> EsVeterinario (Autorizado: Rol 3)
-          11. GET /api/inventario/kit/solicitudes/ -> EsGestorOVeterinario (Autorizados: Rol 1 y Rol 3)
+          11. GET /api/inventario/kit/solicitudes/ -> EsGestorOVeterinario (Autorizados: Rol 1, Rol 2 y Rol 3)
           12. POST /api/inventario/kit/solicitudes/ -> EsGestorOVeterinario (Autorizado: Rol 3)
               * NOTA DE VISTA: SolicitudesKitListCreateView.post (kit_views.py:327) restringe la
                 creación exclusivamente a veterinarios activos (if not _es_veterinario: 403).
-                Por tanto, solo Rol 3 está autorizado en POST; Rol 1 recibe 403.
-          13. GET /api/inventario/kit/solicitudes/{id}/ -> EsGestorOVeterinario (Autorizados: Rol 1 y Rol 3)
-          14. GET /api/inventario/kit/alertas/ -> EsGestorOVeterinario (Autorizados: Rol 1 y Rol 3)
-          15. GET /api/inventario/kit/kardex/ -> EsGestorOVeterinario (Autorizados: Rol 1 y Rol 3)
+                Por tanto, solo Rol 3 está autorizado en POST; Rol 1 y Rol 2 reciben 403.
+          13. GET /api/inventario/kit/solicitudes/{id}/ -> EsGestorOVeterinario (Autorizados: Rol 1, Rol 2 y Rol 3)
+          14. GET /api/inventario/kit/alertas/ -> EsGestorOVeterinario (Autorizados: Rol 1, Rol 2 y Rol 3)
+          15. GET /api/inventario/kit/kardex/ -> EsGestorOVeterinario (Autorizados: Rol 1, Rol 2 y Rol 3)
         - Para cada combinación (rol x endpoint):
           * Roles NO autorizados: deben recibir estrictamente HTTP 403 Forbidden y la BD
             debe quedar 100% inalterada (sin kardex, sin lotes de kit, sin solicitudes, sin consumos).
@@ -93,21 +91,21 @@ class KitPermisosSeguridadTestCase(TestCase):
         """
         # Lista canónica de tuplas: (ruta, método, clase_permiso, roles_autorizados)
         endpoints = [
-            ("/api/inventario/kit/asignar/", "POST", "EsGestorInventario", [1]),
-            ("/api/inventario/kit/retiro-directo/", "POST", "EsGestorInventario", [1]),
-            (f"/api/inventario/kit/veterinario/{self.user_vet.id_usuario}/", "GET", "EsGestorInventario", [1]),
-            ("/api/inventario/kit/solicitudes/99999/aprobar/", "POST", "EsGestorInventario", [1]),
-            ("/api/inventario/kit/solicitudes/99999/rechazar/", "POST", "EsGestorInventario", [1]),
-            ("/api/inventario/kit/conflictos/", "GET", "EsGestorInventario", [1]),
+            ("/api/inventario/kit/asignar/", "POST", "EsGestorInventario", [1, 2]),
+            ("/api/inventario/kit/retiro-directo/", "POST", "EsGestorInventario", [1, 2]),
+            (f"/api/inventario/kit/veterinario/{self.user_vet.id_usuario}/", "GET", "EsGestorInventario", [1, 2]),
+            ("/api/inventario/kit/solicitudes/99999/aprobar/", "POST", "EsGestorInventario", [1, 2]),
+            ("/api/inventario/kit/solicitudes/99999/rechazar/", "POST", "EsGestorInventario", [1, 2]),
+            ("/api/inventario/kit/conflictos/", "GET", "EsGestorInventario", [1, 2]),
             ("/api/inventario/kit/mi-kit/", "GET", "EsVeterinario", [3]),
             ("/api/inventario/kit/snapshot-movil/", "GET", "EsVeterinario", [3]),
             ("/api/inventario/kit/solicitudes/99999/cancelar/", "POST", "EsVeterinario", [3]),
             ("/api/inventario/kit/sincronizar-offline/", "POST", "EsVeterinario", [3]),
-            ("/api/inventario/kit/solicitudes/", "GET", "EsGestorOVeterinario", [1, 3]),
+            ("/api/inventario/kit/solicitudes/", "GET", "EsGestorOVeterinario", [1, 2, 3]),
             ("/api/inventario/kit/solicitudes/", "POST", "EsGestorOVeterinario", [3]),
-            ("/api/inventario/kit/solicitudes/99999/", "GET", "EsGestorOVeterinario", [1, 3]),
-            ("/api/inventario/kit/alertas/", "GET", "EsGestorOVeterinario", [1, 3]),
-            ("/api/inventario/kit/kardex/", "GET", "EsGestorOVeterinario", [1, 3]),
+            ("/api/inventario/kit/solicitudes/99999/", "GET", "EsGestorOVeterinario", [1, 2, 3]),
+            ("/api/inventario/kit/alertas/", "GET", "EsGestorOVeterinario", [1, 2, 3]),
+            ("/api/inventario/kit/kardex/", "GET", "EsGestorOVeterinario", [1, 2, 3]),
         ]
 
         total_subtests = 0
