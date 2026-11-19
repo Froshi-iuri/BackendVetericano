@@ -22,6 +22,11 @@ from inventario.services.exceptions import (
     SolicitudPermisoError,
     KitCompletoError,
     SolicitudSinCantidadAprobadaError,
+    ConflictoOperacionInventarioError,
+)
+from inventario.services.compras_service import (
+    registrar_compra,
+    agregar_detalle_compra,
 )
 from inventario.services.kit_service import (
     asignar_stock_a_kit,
@@ -57,6 +62,7 @@ __all__ = [
     'SolicitudPermisoError',
     'KitCompletoError',
     'SolicitudSinCantidadAprobadaError',
+    'ConflictoOperacionInventarioError',
     'asignar_stock_a_kit',
     'retirar_stock_de_kit',
     'procesar_devolucion_aprobada',
@@ -66,6 +72,8 @@ __all__ = [
     'aprobar_solicitud',
     'rechazar_solicitud',
     'cancelar_solicitud',
+    'registrar_compra',
+    'agregar_detalle_compra',
 ]
 
 
