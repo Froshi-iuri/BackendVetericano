@@ -514,6 +514,12 @@ WS_ALLOWED_ORIGINS = [
     for o in os.environ.get('WS_ALLOWED_ORIGINS', 'http://localhost:4200,http://127.0.0.1:4200').split(',')
     if o.strip()
 ]
+# Identificadores explícitos de clientes nativos (sin header Origin de navegador; nunca comodines '*').
+WS_ALLOWED_NATIVE_CLIENTS = [
+    c.strip().lower()
+    for c in os.environ.get('WS_ALLOWED_NATIVE_CLIENTS', 'android-petvetericano').split(',')
+    if c.strip() and c.strip() != '*'
+]
 WS_AUTH_TIMEOUT_SEGUNDOS = 5
 WS_MAX_SIN_AUTENTICAR = int(os.environ.get('WS_MAX_SIN_AUTENTICAR', '200'))
 WS_MAX_MENSAJE_BYTES = 16384
