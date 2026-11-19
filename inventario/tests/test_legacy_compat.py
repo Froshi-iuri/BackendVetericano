@@ -202,6 +202,7 @@ class LegacyCompatAdminTests(TestCase):
         compra = Compra.objects.create(id_proveedor=self.prov)
 
         # PATCH /compras/{id}/
+        # PATCH /compras/{id}/ {id_proveedor} cuando aún no tiene detalles -> 200 OK
         resp_patch_compra = self.client.patch(
             f"/api/inventario/compras/{compra.id_compra}/",
             {"id_proveedor": prov2.id_proveedor},
@@ -212,8 +213,7 @@ class LegacyCompatAdminTests(TestCase):
         compra.refresh_from_db()
         self.assertEqual(compra.id_proveedor_id, prov2.id_proveedor)
 
-        # POST /detalles-compra/
-        # Nota: precio_unitario es enviado por la web compras.service.ts:150 pero el modelo DetalleCompra no tiene ese campo
+        # POST /detalles-compra/ -> 201 y crea lote + Kardex ENTRADA_COMPRA automáticamente
         payload_detalle = {
             "id_compra": compra.id_compra,
             "id_medicamento": self.med.id_medicamento,
@@ -230,35 +230,46 @@ class LegacyCompatAdminTests(TestCase):
         id_det = resp_post_det.data["id_detalle_compra"]
         det_obj = DetalleCompra.objects.get(pk=id_det)
         self.assertEqual(det_obj.cantidad, 25)
+        lote_creado = Inventarios.objects.get(id_detalle_compra=det_obj)
+        self.assertEqual(lote_creado.cantidad_actual, 25)
 
-        # PATCH /detalles-compra/{id}/
+        # Con detalles asociados, cambiar proveedor en compra -> 409 Conflict
+        resp_patch_compra_blocked = self.client.patch(
+            f"/api/inventario/compras/{compra.id_compra}/",
+            {"id_proveedor": self.prov.id_proveedor},
+            format="json",
+            **self.headers_admin,
+        )
+        self.assertEqual(resp_patch_compra_blocked.status_code, status.HTTP_409_CONFLICT)
+
+        # PATCH /detalles-compra/{id}/ sobre detalle con lote/Kardex -> 409 Conflict
         resp_patch_det = self.client.patch(
             f"/api/inventario/detalles-compra/{id_det}/",
             {"cantidad": 30},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_patch_det.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_patch_det.status_code, status.HTTP_409_CONFLICT)
         det_obj.refresh_from_db()
-        self.assertEqual(det_obj.cantidad, 30)
+        self.assertEqual(det_obj.cantidad, 25)
 
-        # DELETE /detalles-compra/{id}/ (en detalle sin lote vinculado)
+        # DELETE /detalles-compra/{id}/ sobre detalle con lote vinculado -> 409 Conflict
         resp_del_det = self.client.delete(
             f"/api/inventario/detalles-compra/{id_det}/",
             **self.headers_admin,
         )
-        self.assertEqual(resp_del_det.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(DetalleCompra.objects.filter(pk=id_det).exists())
+        self.assertEqual(resp_del_det.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(DetalleCompra.objects.filter(pk=id_det).exists())
 
-        # DELETE /compras/{id}/ (en compra sin detalles)
+        # DELETE /compras/{id}/ sobre compra con detalles -> 409 Conflict
         resp_del_compra = self.client.delete(
             f"/api/inventario/compras/{compra.id_compra}/",
             **self.headers_admin,
         )
-        self.assertEqual(resp_del_compra.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Compra.objects.filter(pk=compra.id_compra).exists())
+        self.assertEqual(resp_del_compra.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(Compra.objects.filter(pk=compra.id_compra).exists())
 
-        # Flujo replicado de compras.service.ts:181-208 con desvinculacion de lotes
+        # Desvincular lote legacy (PATCH inventarios id_detalle_compra: null) está bloqueado -> 400
         compra_web = Compra.objects.create(id_proveedor=self.prov)
         det_web = DetalleCompra.objects.create(
             id_compra=compra_web,
@@ -271,42 +282,43 @@ class LegacyCompatAdminTests(TestCase):
             estado="Disponible",
         )
 
-        # Desvincular lote (PATCH inventarios id_detalle_compra: null)
         resp_unlink = self.client.patch(
             f"/api/inventario/inventarios/{lote_web.id_inventario}/",
             {"id_detalle_compra": None},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_unlink.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_unlink.status_code, status.HTTP_400_BAD_REQUEST)
         lote_web.refresh_from_db()
-        self.assertIsNone(lote_web.id_detalle_compra)
+        self.assertEqual(lote_web.id_detalle_compra_id, det_web.id_detalle_compra)
 
-        # Eliminar detalle de compra
         resp_del_det_web = self.client.delete(
             f"/api/inventario/detalles-compra/{det_web.id_detalle_compra}/",
             **self.headers_admin,
         )
-        self.assertEqual(resp_del_det_web.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(DetalleCompra.objects.filter(pk=det_web.id_detalle_compra).exists())
+        self.assertEqual(resp_del_det_web.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(DetalleCompra.objects.filter(pk=det_web.id_detalle_compra).exists())
 
-        # Eliminar compra
-        resp_del_compra_web = self.client.delete(
-            f"/api/inventario/compras/{compra_web.id_compra}/",
+        # Eliminar compra vacía sí está permitido -> 204
+        compra_vacia = Compra.objects.create(id_proveedor=self.prov)
+        resp_del_compra_vacia = self.client.delete(
+            f"/api/inventario/compras/{compra_vacia.id_compra}/",
             **self.headers_admin,
         )
-        self.assertEqual(resp_del_compra_web.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Compra.objects.filter(pk=compra_web.id_compra).exists())
+        self.assertEqual(resp_del_compra_vacia.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Compra.objects.filter(pk=compra_vacia.id_compra).exists())
 
     def test_l05_inventarios_post_patch_desvincular_y_ajustes_stock(self):
         """
-        L-05: inventarios: POST {id_detalle_compra, cantidad_actual, estado:'Disponible'} 201;
+        L-05: inventarios: POST {id_detalle_compra, cantidad_actual, estado:'Disponible'} 409
+        CREACION_DIRECTA_LOTE_NO_PERMITIDA sin insertar lote ni Kardex (las entradas a Bodega General
+        solo se registran por POST /compras/ o /detalles-compra/); el lote para los PATCH se crea por ORM;
         PATCH {id_detalle_compra: null} 200;
         PATCH {cantidad_actual: MAYOR} 200 (aumenta);
         PATCH {cantidad_actual: menor, estado} 200;
         verifica BD tras cada uno.
         Payloads:
-        - POST: {"id_detalle_compra": <id_det>, "cantidad_actual": 100, "estado": "Disponible"}
+        - POST (bloqueado 409): {"id_detalle_compra": <id_det>, "cantidad_actual": 100, "estado": "Disponible"}
         - PATCH desvincular: {"id_detalle_compra": None}
         - PATCH aumentar: {"cantidad_actual": 150}
         - PATCH reducir: {"cantidad_actual": 20, "estado": "Disponible"}
@@ -321,53 +333,75 @@ class LegacyCompatAdminTests(TestCase):
             cantidad=100,
         )
 
-        # POST /inventarios/
+        # POST /inventarios/ -> bloqueado 409, sin insertar lote ni Kardex
         payload_post = {
             "id_detalle_compra": detalle.id_detalle_compra,
             "cantidad_actual": 100,
             "estado": "Disponible",
         }
+        lotes_antes = Inventarios.objects.count()
+        kardex_antes = InventarioKardex.objects.count()
         resp_post = self.client.post("/api/inventario/inventarios/", payload_post, format="json", **self.headers_admin)
-        self.assertEqual(resp_post.status_code, status.HTTP_201_CREATED)
-        id_inv = resp_post.data["id_inventario"]
+        self.assertEqual(resp_post.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(resp_post.data.get("error"), "CREACION_DIRECTA_LOTE_NO_PERMITIDA")
+        self.assertEqual(Inventarios.objects.count(), lotes_antes)
+        self.assertEqual(InventarioKardex.objects.count(), kardex_antes)
+        self.assertFalse(Inventarios.objects.filter(id_detalle_compra=detalle).exists())
+
+        # Lote para los PATCH siguientes creado por ORM (mismos valores que el antiguo POST)
+        id_inv = Inventarios.objects.create(
+            id_detalle_compra=detalle,
+            cantidad_actual=100,
+            estado="Disponible",
+        ).id_inventario
         lote = Inventarios.objects.get(pk=id_inv)
         self.assertEqual(lote.id_detalle_compra_id, detalle.id_detalle_compra)
         self.assertEqual(lote.cantidad_actual, 100)
         self.assertEqual(lote.estado, "Disponible")
 
-        # PATCH desvincular id_detalle_compra: null
+        # PATCH desvincular id_detalle_compra: null -> bloqueado 400
         resp_patch_null = self.client.patch(
             f"/api/inventario/inventarios/{id_inv}/",
             {"id_detalle_compra": None},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_patch_null.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_patch_null.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertIsNone(lote.id_detalle_compra)
+        self.assertEqual(lote.id_detalle_compra_id, detalle.id_detalle_compra)
 
-        # PATCH cantidad_actual mayor
+        # PATCH cantidad_actual mayor -> bloqueado 400
         resp_patch_mayor = self.client.patch(
             f"/api/inventario/inventarios/{id_inv}/",
             {"cantidad_actual": 150},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_patch_mayor.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_patch_mayor.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertEqual(lote.cantidad_actual, 150)
+        self.assertEqual(lote.cantidad_actual, 100)
 
-        # PATCH cantidad_actual menor y estado
+        # PATCH cantidad_actual menor -> bloqueado 400; PATCH estado válido -> 200
         resp_patch_menor = self.client.patch(
             f"/api/inventario/inventarios/{id_inv}/",
             {"cantidad_actual": 20, "estado": "Disponible"},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_patch_menor.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_patch_menor.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertEqual(lote.cantidad_actual, 20)
-        self.assertEqual(lote.estado, "Disponible")
+        self.assertEqual(lote.cantidad_actual, 100)
+
+        resp_patch_estado = self.client.patch(
+            f"/api/inventario/inventarios/{id_inv}/",
+            {"estado": "Cuarentena"},
+            format="json",
+            **self.headers_admin,
+        )
+        self.assertEqual(resp_patch_estado.status_code, status.HTTP_200_OK)
+        lote.refresh_from_db()
+        self.assertEqual(lote.cantidad_actual, 100)
+        self.assertEqual(lote.estado, "Cuarentena")
 
 
 class LegacyCompatVeterinarioTests(TestCase):
@@ -418,46 +452,43 @@ class LegacyCompatVeterinarioTests(TestCase):
 
     def test_l07_patch_inventario_acta_web_veterinario_y_juridico(self):
         """
-        L-07: PATCH /inventarios/{id}/ con payload del acta web:
-        - Rol 2 (Jurídico): HTTP 200 OK y BD actualizada (disminuir a 30 Disponible y agotar a 0 Agotado).
-        - Rol 3 (Veterinario): HTTP 403 Forbidden y BD inalterada (solo consume su kit personal).
+        L-07: PATCH /inventarios/{id}/:
+        - Rol 2 (Jurídico): PATCH seguro {"estado": "Cuarentena"} -> 200 OK; ajuste directo de cantidad_actual -> 400 Bad Request.
+        - Rol 3 (Veterinario): HTTP 403 Forbidden y BD inalterada.
         """
         for rol_nombre, rol_id, headers in self.roles_test:
             with self.subTest(rol=rol_nombre):
                 lote_test = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
 
-                # Disminucion ordinaria
-                payload_menor = {"cantidad_actual": 30, "estado": "Disponible"}
-                resp_menor = self.client.patch(
+                # Intento de modificar cantidad_actual directamente
+                resp_cantidad = self.client.patch(
                     f"/api/inventario/inventarios/{lote_test.id_inventario}/",
-                    payload_menor,
+                    {"cantidad_actual": 30, "estado": "Disponible"},
                     format="json",
                     **headers,
                 )
                 if rol_id == 3:
-                    self.assertEqual(resp_menor.status_code, status.HTTP_403_FORBIDDEN)
+                    self.assertEqual(resp_cantidad.status_code, status.HTTP_403_FORBIDDEN)
                     lote_test.refresh_from_db()
                     self.assertEqual(lote_test.cantidad_actual, 50)
                     self.assertEqual(lote_test.estado, "Disponible")
                     continue
 
-                self.assertEqual(resp_menor.status_code, status.HTTP_200_OK)
+                self.assertEqual(resp_cantidad.status_code, status.HTTP_400_BAD_REQUEST)
                 lote_test.refresh_from_db()
-                self.assertEqual(lote_test.cantidad_actual, 30)
-                self.assertEqual(lote_test.estado, "Disponible")
+                self.assertEqual(lote_test.cantidad_actual, 50)
 
-                # Agotar stock a 0
-                payload_agotado = {"cantidad_actual": 0, "estado": "Agotado"}
-                resp_agotado = self.client.patch(
+                # Cambio de estado permitido (Cuarentena -> Disponible mientras hay stock)
+                resp_cuarentena = self.client.patch(
                     f"/api/inventario/inventarios/{lote_test.id_inventario}/",
-                    payload_agotado,
+                    {"estado": "Cuarentena"},
                     format="json",
                     **headers,
                 )
-                self.assertEqual(resp_agotado.status_code, status.HTTP_200_OK)
+                self.assertEqual(resp_cuarentena.status_code, status.HTTP_200_OK)
                 lote_test.refresh_from_db()
-                self.assertEqual(lote_test.cantidad_actual, 0)
-                self.assertEqual(lote_test.estado, "Agotado")
+                self.assertEqual(lote_test.estado, "Cuarentena")
+                self.assertEqual(lote_test.cantidad_actual, 50)
 
     def test_l08_sin_token_get_inventarios_401(self):
         """
@@ -858,7 +889,7 @@ class LegacyEndurecidoTests(TestCase):
 
     def test_n05_forma_respuesta_patch_acta_web_paridad_con_admin(self):
         """
-        N-05: FORMA DE RESPUESTA: el PATCH de ajuste sobre /inventarios/{id}/ por Jurídico (rol 2)
+        N-05: FORMA DE RESPUESTA: el PATCH permitido sobre /inventarios/{id}/ por Jurídico (rol 2)
         responde 200 con el MISMO conjunto de claves que el PATCH equivalente del Administrador (rol 1),
         mientras Veterinario (rol 3) recibe 403 Forbidden sin alterar el lote.
         """
@@ -866,7 +897,7 @@ class LegacyEndurecidoTests(TestCase):
         lote_admin = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
         lote_vet = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
 
-        payload = {"cantidad_actual": 25, "estado": "Disponible"}
+        payload = {"estado": "Cuarentena"}
 
         resp_jur = self.client.patch(
             f"/api/inventario/inventarios/{lote_jur.id_inventario}/",
@@ -895,13 +926,14 @@ class LegacyEndurecidoTests(TestCase):
         )
         self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
         lote_vet.refresh_from_db()
-        self.assertEqual(lote_vet.cantidad_actual, 50)
+        self.assertEqual(lote_vet.estado, "Disponible")
 
     def test_n06_descuentos_sucesivos_y_obsoleto_400(self):
         """
-        N-06: DESCUENTOS SUCESIVOS Y BLOQUEO DE VETERINARIO:
-        - Jurídico (gestor) realiza PATCH 50->40 -> 200 OK y BD queda en 40.
-        - Veterinario (rol 3) intentando PATCH sobre el mismo lote recibe 403 Forbidden y la BD queda en 40.
+        N-06: PROTECCIÓN DE STOCK Y BLOQUEO DE VETERINARIO:
+        - Veterinario (rol 3) recibe 403 Forbidden.
+        - Jurídico (gestor) intentando modificar cantidad_actual recibe 400 sin alterar BD,
+          y puede cambiar estado permitido -> 200 OK.
         """
         lote = crear_lote_bodega(medicamento=self.med, cantidad=50, estado="Disponible")
 
@@ -916,36 +948,43 @@ class LegacyEndurecidoTests(TestCase):
         lote.refresh_from_db()
         self.assertEqual(lote.cantidad_actual, 50)
 
-        # 2. Jurídico (gestor) aplica descuento 50 -> 40 -> 200 OK
-        resp1 = self.client.patch(
+        # 2. Jurídico tampoco puede alterar cantidad_actual -> 400
+        resp_jur_cant = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"cantidad_actual": 40},
             format="json",
             **self.headers_juridico,
         )
-        self.assertEqual(resp1.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_jur_cant.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertEqual(lote.cantidad_actual, 40)
+        self.assertEqual(lote.cantidad_actual, 50)
 
-        # 3. Veterinario intentando PATCH posterior -> 403 Forbidden, BD intacta en 40
+        # 3. Jurídico sí puede cambiar estado a Cuarentena -> 200
+        resp_jur_est = self.client.patch(
+            f"/api/inventario/inventarios/{lote.id_inventario}/",
+            {"estado": "Cuarentena"},
+            format="json",
+            **self.headers_juridico,
+        )
+        self.assertEqual(resp_jur_est.status_code, status.HTTP_200_OK)
+        lote.refresh_from_db()
+        self.assertEqual(lote.estado, "Cuarentena")
+
+        # 4. Veterinario intentando PATCH posterior -> 403 Forbidden
         resp2 = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
-            {"cantidad_actual": 45},
+            {"estado": "Disponible"},
             format="json",
             **self.headers_vet,
         )
         self.assertEqual(resp2.status_code, status.HTTP_403_FORBIDDEN)
         lote.refresh_from_db()
-        self.assertEqual(lote.cantidad_actual, 40)
+        self.assertEqual(lote.estado, "Cuarentena")
 
     def test_n07_administrador_gestor_control_aumentar_desvincular_borrar(self):
         """
-        N-07: administrador (gestor) sigue pudiendo aumentar, desvincular y borrar con 200/204.
-        Payloads:
-        - Aumentar: {"cantidad_actual": 80}
-        - Desvincular: {"id_detalle_compra": None}
-        - Borrar: DELETE
-        Por que existe: Test de control en la suite endurecida para verificar que el gestor conserva todas sus capacidades operativas.
+        N-07: incluso Administrador (rol 1) queda bloqueado para aumentar cantidad_actual (400),
+        desvincular id_detalle_compra (400) o eliminar lotes con dependencias/stock (409).
         """
         compra = Compra.objects.create(id_proveedor=self.prov)
         detalle = DetalleCompra.objects.create(
@@ -959,33 +998,33 @@ class LegacyEndurecidoTests(TestCase):
             estado="Disponible",
         )
 
-        # 1. Aumentar stock a 80 -> 200 OK
+        # 1. Aumentar stock a 80 -> 400 Bad Request
         resp_aumento = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"cantidad_actual": 80},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_aumento.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_aumento.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertEqual(lote.cantidad_actual, 80)
+        self.assertEqual(lote.cantidad_actual, 50)
 
-        # 2. Desvincular id_detalle_compra -> 200 OK
+        # 2. Desvincular id_detalle_compra -> 400 Bad Request
         resp_desvincular = self.client.patch(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             {"id_detalle_compra": None},
             format="json",
             **self.headers_admin,
         )
-        self.assertEqual(resp_desvincular.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_desvincular.status_code, status.HTTP_400_BAD_REQUEST)
         lote.refresh_from_db()
-        self.assertIsNone(lote.id_detalle_compra)
+        self.assertEqual(lote.id_detalle_compra_id, detalle.id_detalle_compra)
 
-        # 3. Borrar lote -> 204 No Content
+        # 3. Borrar lote con stock y compra asociada -> 409 Conflict
         resp_borrar = self.client.delete(
             f"/api/inventario/inventarios/{lote.id_inventario}/",
             **self.headers_admin,
         )
-        self.assertEqual(resp_borrar.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Inventarios.objects.filter(pk=lote.id_inventario).exists())
+        self.assertEqual(resp_borrar.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(Inventarios.objects.filter(pk=lote.id_inventario).exists())
 

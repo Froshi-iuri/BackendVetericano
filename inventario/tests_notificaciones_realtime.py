@@ -237,31 +237,27 @@ class Inv02DisparadoresBodegaTests(_SinBDMixin, SimpleTestCase):
     def test_compra_serializer_create(self):
         from inventario.api.serializers import CompraSerializer
 
-        for nombre in ('Compra', 'DetalleCompra', 'Inventarios'):
-            self._parche(f'inventario.api.serializers.{nombre}')
-        serializer = CompraSerializer()
-        serializer.initial_data = {'detalles': [{'id_medicamento': 9, 'cantidad': 5}, {'id_medicamento': '12', 'cantidad': 1}]}
-        serializer.create({'id_proveedor': SimpleNamespace()})
-        self.alertar.assert_called_once_with(med_ids=[9, '12'])
+        for nombre in ('Compra', 'DetalleCompra', 'Inventarios', 'InventarioKardex', 'Proveedores'):
+            self._parche(f'inventario.services.compras_service.{nombre}')
+        medicamentos_mock = self._parche('inventario.services.compras_service.Medicamentos')
+        medicamentos_mock.objects.filter.return_value.first.side_effect = [
+            SimpleNamespace(pk=9, activo=True, nombre='Med 9'),
+            SimpleNamespace(pk=12, activo=True, nombre='Med 12'),
+        ]
+        self._parche('inventario.services.compras_service._validar_gestor', return_value=SimpleNamespace(pk=1))
+        self._parche('inventario.services.compras_service.notif_rt.alertar_bodega', side_effect=self.alertar)
+        serializer = CompraSerializer(context={'request': SimpleNamespace(user=SimpleNamespace(pk=1, is_authenticated=True))})
+        serializer.initial_data = {'detalles': [{'id_medicamento': 9, 'cantidad': 5}, {'id_medicamento': 12, 'cantidad': 1}]}
+        serializer.create({'id_proveedor': SimpleNamespace(pk=3)})
+        self.alertar.assert_called_once_with(med_ids=[9, 12])
 
-    def test_detalle_salida_serializer_create(self):
+    def test_detalle_salida_serializer_create_bloqueado(self):
         from inventario.api.serializers import DetalleSalidaSerializer
+        from inventario.services.exceptions import ConflictoOperacionInventarioError
 
-        detalle = SimpleNamespace(cantidad=3, id_administracion=SimpleNamespace(id_medicamento=SimpleNamespace(pk=9)))
-        self._parche('rest_framework.serializers.ModelSerializer.create', return_value=detalle)
-        inventarios = self._parche('inventario.api.serializers.Inventarios')
-        lote = SimpleNamespace(pk=100, cantidad_actual=5, save=mock.Mock())
-        inventarios.objects.filter.return_value.order_by.return_value = [lote]
-        self.assertIs(DetalleSalidaSerializer().create({}), detalle)
-        self.assertEqual(lote.cantidad_actual, 2)
-        self.alertar.assert_called_once_with(med_ids=[9], inventario_ids=[100])
-
-    def test_detalle_salida_sin_cantidad_no_alerta(self):
-        from inventario.api.serializers import DetalleSalidaSerializer
-
-        detalle = SimpleNamespace(cantidad=0, id_administracion=None)
-        self._parche('rest_framework.serializers.ModelSerializer.create', return_value=detalle)
-        DetalleSalidaSerializer().create({})
+        with self.assertRaises(ConflictoOperacionInventarioError) as ctx:
+            DetalleSalidaSerializer().create({})
+        self.assertEqual(ctx.exception.codigo, 'SALIDA_LEGACY_BLOQUEADA')
         self.alertar.assert_not_called()
 
 

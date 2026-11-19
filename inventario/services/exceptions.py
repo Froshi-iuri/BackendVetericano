@@ -171,3 +171,14 @@ class SolicitudSinCantidadAprobadaError(InventarioDomainError):
         super().__init__(message, codigo="SOLICITUD_SIN_CANTIDAD_APROBADA", extra=extra)
 
 
+class ConflictoOperacionInventarioError(InventarioDomainError):
+    """
+    Lanzada cuando una operación sobre compras, detalles de compra, lotes de bodega
+    o salidas legacy entra en conflicto con la integridad referencial, la trazabilidad
+    del Kardex o las reglas de bloqueo del inventario en dos niveles.
+    Corresponde a HTTP 409 Conflict.
+    """
+    def __init__(self, message: str, codigo: str = "CONFLICTO_INVENTARIO", extra: dict | None = None):
+        super().__init__(message, codigo=codigo, extra=extra)
+
+

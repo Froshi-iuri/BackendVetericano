@@ -44,6 +44,7 @@ from inventario.services.exceptions import (
     SolicitudEstadoInvalidaError,
     SolicitudDuplicadaError,
     KitCompletoError,
+    ConflictoOperacionInventarioError,
 )
 from inventario.services import (
     kit_service,
@@ -93,7 +94,7 @@ def traducir_error_inventario(exc: InventarioDomainError) -> Response:
         status_code = status.HTTP_404_NOT_FOUND
     elif isinstance(exc, (PermisoGestorRequeridoError, SolicitudPermisoError)):
         status_code = status.HTTP_403_FORBIDDEN
-    elif isinstance(exc, (SolicitudEstadoInvalidaError, SolicitudDuplicadaError, KitCompletoError)):
+    elif isinstance(exc, (SolicitudEstadoInvalidaError, SolicitudDuplicadaError, KitCompletoError, ConflictoOperacionInventarioError)):
         status_code = status.HTTP_409_CONFLICT
 
     data = {
