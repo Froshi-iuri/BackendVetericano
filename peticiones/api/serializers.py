@@ -66,6 +66,9 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        # Hook opcional (lo pasa IniciarPeticionView): historial y notificaciones persistentes en ESTA
+        # misma transacción (todo o nada, contrato de notificaciones v1). No forma parte del modelo.
+        tras_crear_en_transaccion = validated_data.pop('_tras_crear_en_transaccion', None)
         direccion = validated_data.pop('direccion', None)
         latitud = validated_data.pop('latitud', None)
         longitud = validated_data.pop('longitud', None)
@@ -130,6 +133,9 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
             urls_autorizadas=fotos_autorizadas_input,
             urls_procesadas=urls_procesadas,
         )
+
+        if tras_crear_en_transaccion is not None:
+            tras_crear_en_transaccion(peticion)
 
         return peticion
 

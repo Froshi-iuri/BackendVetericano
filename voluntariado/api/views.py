@@ -1,3 +1,4 @@
+from django.db import transaction
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -18,6 +19,7 @@ from .serializers import (
     EventosSerializer,
     VoluntarioEventoSerializer,
 )
+from voluntariado import notificaciones_realtime as notif_vol
 
 
 class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
@@ -59,16 +61,19 @@ class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
         telefono = request.data.get('telefono') or getattr(usuario, 'telefono', '') or ''
         nombre_completo = f"{usuario.nombre} {usuario.apellido}".strip()
 
-        postulacion = PostulacionVoluntariado.objects.create(
-            evento=evento,
-            usuario=usuario,
-            nombre_completo=nombre_completo,
-            identificacion=usuario.identificacion or "",
-            correo=usuario.email,
-            telefono=telefono,
-            edad=0,
-            estado='PENDIENTE'
-        )
+        # Postulación + NP VOL-01 (ESTRICTA) en una sola transacción; WS/FCM tras el COMMIT.
+        with transaction.atomic():
+            postulacion = PostulacionVoluntariado.objects.create(
+                evento=evento,
+                usuario=usuario,
+                nombre_completo=nombre_completo,
+                identificacion=usuario.identificacion or "",
+                correo=usuario.email,
+                telefono=telefono,
+                edad=0,
+                estado='PENDIENTE'
+            )
+            notif_vol.postulacion_creada(postulacion, actor=usuario)
 
         return Response(
             {
@@ -92,6 +97,13 @@ class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
         if evento_id:
             queryset = queryset.filter(evento_id=evento_id)
         return queryset
+
+    def perform_update(self, serializer):
+        # Cambio de estado + NP VOL-02 (ESTRICTA) en una sola transacción; WS/FCM tras el COMMIT.
+        estado_anterior = serializer.instance.estado
+        with transaction.atomic():
+            postulacion = serializer.save()
+            notif_vol.postulacion_resuelta(postulacion, estado_anterior, actor=self.request.user)
 
 
 class TiposEventosViewSet(viewsets.ModelViewSet):

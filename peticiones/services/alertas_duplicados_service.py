@@ -761,7 +761,7 @@ def _crear_notificacion_alerta_si_no_existe(
         else peticion_mayor
     )
 
-    return NotificacionJuridico.objects.create(
+    notificacion = NotificacionJuridico.objects.create(
         id_peticion=peticion_notificada,
         tipo=TIPO_NOTIFICACION_POSIBLE_DUPLICADO,
         mensaje=_construir_mensaje_notificacion(
@@ -771,6 +771,39 @@ def _crear_notificacion_alerta_si_no_existe(
         ),
         leida=False,
     )
+    _notificar_posible_duplicado_tiempo_real(peticion_notificada, peticion_contraparte)
+    return notificacion
+
+
+def _notificar_posible_duplicado_tiempo_real(peticion_notificada, peticion_contraparte) -> None:
+    """
+    PET-07 (contrato v1): NP individual para cada Admin/Jurídico activo (lectura individual en la
+    campana central; la NotificacionJuridico compartida se mantiene intacta) + AO a rol_1/rol_2.
+    Tolerante: si falla, no afecta al registro de la alerta (SAVEPOINT en el helper). WS/FCM tras el COMMIT.
+    """
+    try:
+        from peticiones.utils import crear_notificaciones_peticion_usuarios
+        from realtime import notificar as rt_notificar
+
+        rad_a = getattr(peticion_notificada, 'numero_radicado', None) or f"#{peticion_notificada.id_peticion}"
+        rad_b = getattr(peticion_contraparte, 'numero_radicado', None) or f"#{peticion_contraparte.id_peticion}"
+        titulo = f"Posible duplicado: {rad_a}"
+        mensaje = f"La petición {rad_a} podría ser un duplicado de {rad_b}. Revísala en Alertas de duplicados."
+        destinatarios = list(Usuarios.objects.filter(id_rol_id__in=[1, 2], activo=True))
+        notifs = crear_notificaciones_peticion_usuarios(
+            peticion_notificada, destinatarios, 'POSIBLE_DUPLICADO', titulo, mensaje, raise_on_error=False,
+        )
+        rt_notificar.entregar_notificaciones_peticion(notifs)
+        rt_notificar.alerta_operativa(
+            'peticion.posible_duplicado', titulo, mensaje, nivel='warning', roles=(1, 2),
+            referencia={
+                'id_peticion': peticion_notificada.id_peticion,
+                'numero_radicado': getattr(peticion_notificada, 'numero_radicado', None),
+                'id_peticion_relacionada': peticion_contraparte.id_peticion,
+            },
+        )
+    except Exception as exc:  # nunca rompe la detección de duplicados
+        logger.warning('PET-07: no se pudo emitir el aviso en tiempo real: %s', type(exc).__name__)
 
 
 def _registrar_auditoria_par(

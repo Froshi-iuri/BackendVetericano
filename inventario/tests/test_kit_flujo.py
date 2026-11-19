@@ -1427,10 +1427,9 @@ class KitFlujoTestCase(TestCase):
         TEST-KIT-42B: Consulta de Kit por Gestor (/api/inventario/kit/veterinario/{id}/).
         Gestor autenticado consulta kit de Vet A con stock y veterinario inexistente #99999.
         Verifica:
-        - Gestor consultando Vet A: HTTP 200 OK con estructura {'total_unidades': 12, 'items': [...]}.
+        - Gestor (Rol 1 Admin y Rol 2 Jurídico) consultando Vet A: HTTP 200 OK con estructura {'total_unidades': 12, 'items': [...]}.
         - Gestor con id=99999 inexistente: HTTP 404 Not Found, error='VETERINARIO_NO_ENCONTRADO'.
         - Vet A (Rol 3): HTTP 403 Forbidden (EsGestorInventario).
-        - Jurídico (Rol 2): HTTP 403 Forbidden (EsGestorInventario).
         - Peticionario (Rol 4): HTTP 403 Forbidden (EsGestorInventario).
         - Base de datos inalterada (solo lectura).
         """
@@ -1449,16 +1448,17 @@ class KitFlujoTestCase(TestCase):
             InventarioConsumosRegistro.objects.count(),
         )
 
-        # 1. Gestor consultando Vet A existente -> 200 OK
-        resp_gestor = self.client.get(
-            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
-            **self.headers_gestor
-        )
-        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
-        self.assertIn("total_unidades", resp_gestor.data)
-        self.assertIn("items", resp_gestor.data)
-        self.assertEqual(resp_gestor.data["total_unidades"], 12)
-        self.assertGreater(len(resp_gestor.data["items"]), 0)
+        # 1. Gestor (Admin y Jurídico) consultando Vet A existente -> 200 OK
+        for headers_g in (self.headers_gestor, headers_rol2):
+            resp_gestor = self.client.get(
+                f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
+                **headers_g
+            )
+            self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+            self.assertIn("total_unidades", resp_gestor.data)
+            self.assertIn("items", resp_gestor.data)
+            self.assertEqual(resp_gestor.data["total_unidades"], 12)
+            self.assertGreater(len(resp_gestor.data["items"]), 0)
 
         # 2. Gestor consultando veterinario inexistente -> 404 Not Found
         resp_404 = self.client.get(
@@ -1475,12 +1475,6 @@ class KitFlujoTestCase(TestCase):
             **self.headers_vet_a
         )
         self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
-
-        resp_rol2 = self.client.get(
-            f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
-            **headers_rol2
-        )
-        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
 
         resp_rol4 = self.client.get(
             f"/api/inventario/kit/veterinario/{self.vet_a.id_usuario}/",
@@ -1574,11 +1568,11 @@ class KitFlujoTestCase(TestCase):
     def test_kit_42d_consulta_alertas_filtros(self):
         """
         TEST-KIT-42D: Consulta y Filtros de Alertas (/api/inventario/kit/alertas/).
-        Gestor y Veterinario autenticados. Kit con lote vencido y lote en stock critico (< 5 unidades).
+        Gestores (Rol 1 Admin y Rol 2 Jurídico) y Veterinario autenticados. Kit con lote vencido y lote en stock critico (< 5 unidades).
         Verifica:
-        - Gestor y Vet: HTTP 200 OK (EsGestorOVeterinario) con estructura {'agotados': [], 'criticos': [...], 'bajos': [], 'vencidos': [...], 'proximos_a_vencer': [...]}.
+        - Gestores (Admin/Jurídico) y Vet: HTTP 200 OK (EsGestorOVeterinario) con estructura {'agotados': [], 'criticos': [...], 'bajos': [], 'vencidos': [...], 'proximos_a_vencer': [...]}.
         - Gestor puede filtrar por ?id_veterinario={id_vet}; si no existe -> 404 VETERINARIO_NO_ENCONTRADO.
-        - Jurídico (Rol 2) y Peticionario (Rol 4): HTTP 403 Forbidden.
+        - Peticionario (Rol 4): HTTP 403 Forbidden.
         - Base de datos inalterada (solo lectura).
         """
         b_ven = crear_lote_bodega(self.med_a, cantidad=0, fecha_vencimiento=self.hoy - timedelta(days=5), estado="Agotado")
@@ -1614,14 +1608,15 @@ class KitFlujoTestCase(TestCase):
         vencidos_vet = [v for v in resp_vet.data["vencidos"] if v["id_medicamento"] == self.med_a.id_medicamento]
         self.assertEqual(len(vencidos_vet), 1)
 
-        # 2. Gestor consulta alertas globales y con filtro por veterinario -> 200 OK
-        resp_gestor = self.client.get(
-            f"/api/inventario/kit/alertas/?id_veterinario={self.vet_a.id_usuario}",
-            **self.headers_gestor
-        )
-        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
-        self.assertIn("criticos", resp_gestor.data)
-        self.assertIn("vencidos", resp_gestor.data)
+        # 2. Gestores (Admin y Jurídico) consultan alertas globales y con filtro por veterinario -> 200 OK
+        for headers_g in (self.headers_gestor, headers_rol2):
+            resp_gestor = self.client.get(
+                f"/api/inventario/kit/alertas/?id_veterinario={self.vet_a.id_usuario}",
+                **headers_g
+            )
+            self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+            self.assertIn("criticos", resp_gestor.data)
+            self.assertIn("vencidos", resp_gestor.data)
 
         # Gestor con id_veterinario inexistente -> 404 VETERINARIO_NO_ENCONTRADO
         resp_gestor_404 = self.client.get(
@@ -1631,10 +1626,7 @@ class KitFlujoTestCase(TestCase):
         self.assertEqual(resp_gestor_404.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(resp_gestor_404.data.get("error"), "VETERINARIO_NO_ENCONTRADO")
 
-        # 3. Roles no autorizados -> 403 Forbidden (EsGestorOVeterinario)
-        resp_rol2 = self.client.get("/api/inventario/kit/alertas/", **headers_rol2)
-        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
-
+        # 3. Rol no autorizado -> 403 Forbidden (EsGestorOVeterinario)
         resp_rol4 = self.client.get("/api/inventario/kit/alertas/", **headers_rol4)
         self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -1650,12 +1642,12 @@ class KitFlujoTestCase(TestCase):
     def test_kit_42e_consulta_kardex_filtros(self):
         """
         TEST-KIT-42E: Consulta y Filtros de Kardex del Kit (/api/inventario/kit/kardex/).
-        Gestor y Veterinario autenticados. Movimientos de kardex existentes en BD.
+        Gestores (Rol 1 Admin y Rol 2 Jurídico) y Veterinario autenticados. Movimientos de kardex existentes en BD.
         Verifica:
-        - Gestor y Vet: HTTP 200 OK (EsGestorOVeterinario) con respuesta paginada ('count', 'results').
+        - Gestores (Admin/Jurídico) y Vet: HTTP 200 OK (EsGestorOVeterinario) con respuesta paginada ('count', 'results').
         - Vet solo observa sus propios movimientos; Gestor puede filtrar por ?id_veterinario=.
         - Filtros de fecha (?desde=&hasta=) y tipo (?tipo_movimiento=) aplicados correctamente.
-        - Jurídico (Rol 2) y Peticionario (Rol 4): HTTP 403 Forbidden.
+        - Peticionario (Rol 4): HTTP 403 Forbidden.
         - Base de datos inalterada (solo lectura).
         """
         b_a = crear_lote_bodega(self.med_a, cantidad=50, fecha_vencimiento=self.hoy + timedelta(days=180))
@@ -1710,26 +1702,24 @@ class KitFlujoTestCase(TestCase):
         self.assertIn(k1.id_kardex, ids_encontrados)
         self.assertNotIn(k2.id_kardex, ids_encontrados)
 
-        # 2. Gestor consulta kardex con filtros de fecha y tipo_movimiento -> 200 OK
+        # 2. Gestores (Admin y Jurídico) consultan kardex con filtros de fecha y tipo_movimiento -> 200 OK
         hoy_str = self.hoy.isoformat()
-        resp_gestor = self.client.get(
-            f"/api/inventario/kit/kardex/?desde={hoy_str}&hasta={hoy_str}&tipo_movimiento={TIPO_KARDEX_CONSUMO_HISTORIA}",
-            **self.headers_gestor
-        )
-        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
-        self.assertIn("results", resp_gestor.data)
-        for r in resp_gestor.data["results"]:
-            self.assertEqual(r["tipo_movimiento"], TIPO_KARDEX_CONSUMO_HISTORIA)
+        for headers_g in (self.headers_gestor, headers_rol2):
+            resp_gestor = self.client.get(
+                f"/api/inventario/kit/kardex/?desde={hoy_str}&hasta={hoy_str}&tipo_movimiento={TIPO_KARDEX_CONSUMO_HISTORIA}",
+                **headers_g
+            )
+            self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+            self.assertIn("results", resp_gestor.data)
+            for r in resp_gestor.data["results"]:
+                self.assertEqual(r["tipo_movimiento"], TIPO_KARDEX_CONSUMO_HISTORIA)
 
-        # Estructura del registro retornado
-        r0 = resp_gestor.data["results"][0]
-        for campo in ["id_kardex", "tipo_movimiento", "ubicacion", "id_veterinario", "nombre_medicamento", "cantidad", "saldo_anterior", "saldo_resultante"]:
-            self.assertIn(campo, r0)
+            # Estructura del registro retornado
+            r0 = resp_gestor.data["results"][0]
+            for campo in ["id_kardex", "tipo_movimiento", "ubicacion", "id_veterinario", "nombre_medicamento", "cantidad", "saldo_anterior", "saldo_resultante"]:
+                self.assertIn(campo, r0)
 
-        # 3. Roles no autorizados -> 403 Forbidden (EsGestorOVeterinario)
-        resp_rol2 = self.client.get("/api/inventario/kit/kardex/", **headers_rol2)
-        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
-
+        # 3. Rol no autorizado -> 403 Forbidden (EsGestorOVeterinario)
         resp_rol4 = self.client.get("/api/inventario/kit/kardex/", **headers_rol4)
         self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -1747,11 +1737,10 @@ class KitFlujoTestCase(TestCase):
         TEST-KIT-42F: Bandeja de Conflictos Offline para Gestor (/api/inventario/kit/conflictos/).
         Consumos previos en InventarioConsumosRegistro con estado='RECHAZADO_CONFLICTO'.
         Verifica:
-        - Gestor: HTTP 200 OK (EsGestorInventario) con respuesta paginada y estructura de ConflictoOutputSerializer
+        - Gestores (Rol 1 Admin y Rol 2 Jurídico): HTTP 200 OK (EsGestorInventario) con respuesta paginada y estructura de ConflictoOutputSerializer
           ('id_consumo', 'client_uuid', 'id_veterinario', 'id_medicamento', 'stock_disponible_al_rechazo', 'motivo_rechazo', 'fecha_consumo').
         - Filtros opcionales (?resuelto=false, ?id_veterinario=) aplicados en el QuerySet.
         - Vet A (Rol 3): HTTP 403 Forbidden (EsGestorInventario).
-        - Jurídico (Rol 2): HTTP 403 Forbidden (EsGestorInventario).
         - Peticionario (Rol 4): HTTP 403 Forbidden (EsGestorInventario).
         - Base de datos inalterada (solo lectura).
         """
@@ -1783,25 +1772,26 @@ class KitFlujoTestCase(TestCase):
             InventarioConsumosRegistro.objects.count(),
         )
 
-        # 1. Gestor consulta la bandeja de conflictos -> 200 OK paginado
-        resp_gestor = self.client.get(
-            "/api/inventario/kit/conflictos/",
-            **self.headers_gestor
-        )
-        self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
-        self.assertIn("count", resp_gestor.data)
-        self.assertIn("results", resp_gestor.data)
-        self.assertGreaterEqual(resp_gestor.data["count"], 1)
+        # 1. Gestores (Admin y Jurídico) consultan la bandeja de conflictos -> 200 OK paginado
+        for headers_g in (self.headers_gestor, headers_rol2):
+            resp_gestor = self.client.get(
+                "/api/inventario/kit/conflictos/",
+                **headers_g
+            )
+            self.assertEqual(resp_gestor.status_code, status.HTTP_200_OK)
+            self.assertIn("count", resp_gestor.data)
+            self.assertIn("results", resp_gestor.data)
+            self.assertGreaterEqual(resp_gestor.data["count"], 1)
 
-        encontrado = next((c for c in resp_gestor.data["results"] if c["client_uuid"] == str(u_conf)), None)
-        self.assertIsNotNone(encontrado)
-        self.assertEqual(encontrado["id_consumo"], conflicto_reg.id_consumo)
-        self.assertEqual(encontrado["id_veterinario"], self.vet_a.id_usuario)
-        self.assertEqual(encontrado["id_medicamento"], self.med_a.id_medicamento)
-        self.assertEqual(encontrado["cantidad_solicitada"], 4)
-        self.assertEqual(encontrado["stock_disponible_al_rechazo"], 0)
-        self.assertIn("Stock insuficiente", encontrado["motivo_rechazo"])
-        self.assertIn("fecha_consumo", encontrado)
+            encontrado = next((c for c in resp_gestor.data["results"] if c["client_uuid"] == str(u_conf)), None)
+            self.assertIsNotNone(encontrado)
+            self.assertEqual(encontrado["id_consumo"], conflicto_reg.id_consumo)
+            self.assertEqual(encontrado["id_veterinario"], self.vet_a.id_usuario)
+            self.assertEqual(encontrado["id_medicamento"], self.med_a.id_medicamento)
+            self.assertEqual(encontrado["cantidad_solicitada"], 4)
+            self.assertEqual(encontrado["stock_disponible_al_rechazo"], 0)
+            self.assertIn("Stock insuficiente", encontrado["motivo_rechazo"])
+            self.assertIn("fecha_consumo", encontrado)
 
         # Filtro por resuelto=false y por id_veterinario
         resp_filtro = self.client.get(
@@ -1814,9 +1804,6 @@ class KitFlujoTestCase(TestCase):
         # 2. Roles no autorizados -> 403 Forbidden (EsGestorInventario)
         resp_vet = self.client.get("/api/inventario/kit/conflictos/", **self.headers_vet_a)
         self.assertEqual(resp_vet.status_code, status.HTTP_403_FORBIDDEN)
-
-        resp_rol2 = self.client.get("/api/inventario/kit/conflictos/", **headers_rol2)
-        self.assertEqual(resp_rol2.status_code, status.HTTP_403_FORBIDDEN)
 
         resp_rol4 = self.client.get("/api/inventario/kit/conflictos/", **headers_rol4)
         self.assertEqual(resp_rol4.status_code, status.HTTP_403_FORBIDDEN)

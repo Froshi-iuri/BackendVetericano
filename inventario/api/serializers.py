@@ -1,7 +1,38 @@
 from rest_framework import serializers
 from django.db import transaction
+
 from inventario.models import Proveedores, Compra, DetalleCompra, Salidas, DetalleSalida, Inventarios
-from .permissions import _es_gestor
+from inventario.services.compras_service import (
+    ESTADOS_LOTE_PERMITIDOS,
+    agregar_detalle_compra,
+    lote_tiene_historial_operativo,
+    registrar_compra,
+    validar_item_detalle_compra,
+    verificar_compra_sin_dependencias,
+    verificar_detalle_compra_sin_dependencias,
+)
+from inventario.services.exceptions import (
+    ConflictoOperacionInventarioError,
+    InventarioDomainError,
+    PermisoGestorRequeridoError,
+)
+from inventario.services.kit_service import _es_entero_valido
+
+
+MENSAJE_CREACION_DIRECTA_LOTE_NO_PERMITIDA = (
+    "No se permite crear lotes directamente en /api/inventario/inventarios/. Las entradas a "
+    "Bodega General deben registrarse mediante el flujo autorizado de compras "
+    "(POST /api/inventario/compras/ o POST /api/inventario/detalles-compra/), que crea el lote "
+    "junto con su movimiento ENTRADA_COMPRA en Kardex."
+)
+
+
+def _obtener_id_usuario_request(serializer_self) -> int:
+    request = serializer_self.context.get('request')
+    user = getattr(request, 'user', None) if request else None
+    if not user or not getattr(user, 'is_authenticated', False):
+        raise PermisoGestorRequeridoError("Se requiere un usuario gestor autenticado para realizar esta operación.")
+    return user.pk
 
 
 class ProveedoresSerializer(serializers.ModelSerializer):
@@ -11,10 +42,76 @@ class ProveedoresSerializer(serializers.ModelSerializer):
 
 
 class DetalleCompraSerializer(serializers.ModelSerializer):
+    fecha_vencimiento = serializers.DateField(required=False, allow_null=True, write_only=True)
+
     class Meta:
         model = DetalleCompra
-        fields = '__all__'
-        extra_kwargs = {'id_compra': {'required': False}}
+        fields = ['id_detalle_compra', 'id_compra', 'id_medicamento', 'cantidad', 'fecha_vencimiento']
+        extra_kwargs = {
+            'id_compra': {'required': True},
+            'id_medicamento': {'required': True},
+            'cantidad': {'required': True},
+        }
+
+    def validate(self, attrs):
+        raw = self.initial_data if isinstance(getattr(self, 'initial_data', None), dict) else {}
+
+        for campo_int in ('id_compra', 'id_medicamento', 'cantidad'):
+            if campo_int in raw and isinstance(raw.get(campo_int), bool):
+                raise serializers.ValidationError(
+                    {campo_int: "No se permiten valores booleanos."},
+                    code='DATO_BOOLEANO_NO_PERMITIDO',
+                )
+
+        if self.instance is None:
+            medicamento = attrs.get('id_medicamento')
+            cantidad = attrs.get('cantidad')
+            if medicamento is None or not medicamento.activo:
+                raise serializers.ValidationError(
+                    {"id_medicamento": "El medicamento debe existir y encontrarse activo."},
+                    code='MEDICAMENTO_INVALIDO',
+                )
+            if not _es_entero_valido(cantidad, minimo=1):
+                raise serializers.ValidationError(
+                    {"cantidad": "La cantidad debe ser un número entero mayor a cero."},
+                    code='CANTIDAD_INVALIDA',
+                )
+        else:
+            if 'cantidad' in attrs and not _es_entero_valido(attrs.get('cantidad'), minimo=1):
+                raise serializers.ValidationError(
+                    {"cantidad": "La cantidad debe ser un número entero mayor a cero."},
+                    code='CANTIDAD_INVALIDA',
+                )
+            if 'id_medicamento' in attrs and (attrs.get('id_medicamento') is None or not attrs['id_medicamento'].activo):
+                raise serializers.ValidationError(
+                    {"id_medicamento": "El medicamento debe existir y encontrarse activo."},
+                    code='MEDICAMENTO_INVALIDO',
+                )
+
+        return super().validate(attrs)
+
+    def create(self, validated_data):
+        usuario_id = _obtener_id_usuario_request(self)
+        compra = validated_data['id_compra']
+        medicamento = validated_data['id_medicamento']
+        cantidad = validated_data['cantidad']
+        fecha_vencimiento = validated_data.get('fecha_vencimiento')
+        return agregar_detalle_compra(
+            id_usuario=usuario_id,
+            id_compra=compra.pk,
+            id_medicamento=medicamento.pk,
+            cantidad=cantidad,
+            fecha_vencimiento=fecha_vencimiento,
+        )
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        raw = self.initial_data if isinstance(getattr(self, 'initial_data', None), dict) else {}
+        campos_inmutables = {'id_compra', 'id_medicamento', 'cantidad'}
+        if any(campo in raw for campo in campos_inmutables) or any(campo in validated_data for campo in campos_inmutables):
+            verificar_detalle_compra_sin_dependencias(instance.pk, "modificar")
+        validated_data.pop('fecha_vencimiento', None)
+        return super().update(instance, validated_data)
 
 
 class CompraSerializer(serializers.ModelSerializer):
@@ -34,32 +131,64 @@ class CompraSerializer(serializers.ModelSerializer):
     def get_total_unidades(self, obj):
         return sum(detalle.cantidad for detalle in obj.detallecompra_set.all() if detalle.cantidad)
 
-    @transaction.atomic
+    def validate(self, attrs):
+        raw = self.initial_data if isinstance(getattr(self, 'initial_data', None), dict) else {}
+
+        if isinstance(raw.get('id_proveedor'), bool):
+            raise serializers.ValidationError(
+                {"id_proveedor": "Identificador de proveedor inválido."},
+                code='PROVEEDOR_INVALIDO',
+            )
+
+        if self.instance is None:
+            if 'detalles' not in raw:
+                raise serializers.ValidationError(
+                    {"detalles": "Debe enviar la lista de detalles de compra."},
+                    code='DETALLES_COMPRA_REQUERIDOS',
+                )
+            detalles_data = raw.get('detalles')
+            if not isinstance(detalles_data, list) or len(detalles_data) == 0:
+                raise serializers.ValidationError(
+                    {"detalles": "El campo 'detalles' debe ser una lista no vacía."},
+                    code='DETALLES_COMPRA_REQUERIDOS',
+                )
+            try:
+                for item in detalles_data:
+                    validar_item_detalle_compra(item)
+            except InventarioDomainError as exc:
+                raise serializers.ValidationError({"detalles": exc.message}, code=exc.codigo) from exc
+        else:
+            campos_simulacion = [c for c in ('estado', 'motivo_anulacion') if c in raw]
+            if campos_simulacion:
+                raise serializers.ValidationError(
+                    f"La tabla 'compra' no soporta anulación ni campos {campos_simulacion}.",
+                    code='CAMPOS_COMPRA_NO_SOPORTADOS',
+                )
+            if 'detalles' in raw:
+                raise ConflictoOperacionInventarioError(
+                    "No se permite modificar los detalles de una compra registrada mediante PATCH/PUT /compras/{id}/.",
+                    codigo='COMPRA_DETALLES_INMUTABLES',
+                )
+
+        return super().validate(attrs)
+
     def create(self, validated_data):
-        # Extraemos los detalles desde el initial_data, ya que no son validados automáticamente porque read_only=True en el campo o están fuera de validated_data
-        detalles_data = self.initial_data.get('detalles', [])
-        
-        compra = Compra.objects.create(**validated_data)
-        
-        for detalle_data in detalles_data:
-            medicamento_id = detalle_data.get('id_medicamento')
-            cantidad = detalle_data.get('cantidad', 0)
-            
-            # Crear detalle de compra
-            detalle = DetalleCompra.objects.create(
-                id_compra=compra,
-                id_medicamento_id=medicamento_id,
-                cantidad=cantidad
-            )
-            
-            # Crear lote en el inventario automáticamente
-            Inventarios.objects.create(
-                id_detalle_compra=detalle,
-                cantidad_actual=cantidad,
-                estado='Disponible'
-            )
-            
-        return compra
+        usuario_id = _obtener_id_usuario_request(self)
+        detalles_data = self.initial_data.get('detalles') if isinstance(self.initial_data, dict) else None
+        proveedor = validated_data['id_proveedor']
+        return registrar_compra(
+            id_usuario=usuario_id,
+            id_proveedor=proveedor.pk,
+            detalles=detalles_data,
+        )
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        compra_bloqueada = Compra.objects.select_for_update(no_key=True).get(pk=instance.pk)
+        nuevo_proveedor = validated_data.get('id_proveedor')
+        if nuevo_proveedor is not None and nuevo_proveedor.pk != compra_bloqueada.id_proveedor_id:
+            verificar_compra_sin_dependencias(compra_bloqueada.pk, "cambiar el proveedor de")
+        return super().update(compra_bloqueada, validated_data)
 
 
 class SalidasSerializer(serializers.ModelSerializer):
@@ -73,50 +202,11 @@ class DetalleSalidaSerializer(serializers.ModelSerializer):
         model = DetalleSalida
         fields = '__all__'
 
-    @transaction.atomic
     def create(self, validated_data):
-        from django.db.models import Q
-        
-        # 1. Crear el registro de salida
-        detalle_salida = super().create(validated_data)
-        
-        cantidad_a_descontar = detalle_salida.cantidad
-        if not cantidad_a_descontar or cantidad_a_descontar <= 0:
-            return detalle_salida
-            
-        # 2. Identificar qué medicamento es
-        medicamento = detalle_salida.id_administracion.id_medicamento
-        
-        # 3. Buscar los lotes de inventario que correspondan a este medicamento y tengan stock
-        # (Puede estar enlazado por compra o por otra salida anterior según la BD)
-        lotes = Inventarios.objects.filter(
-            Q(id_detalle_compra__id_medicamento=medicamento) | 
-            Q(id_detalle_salida__id_administracion__id_medicamento=medicamento),
-            cantidad_actual__gt=0
-        ).order_by('id_inventario')  # Orden FIFO (los más viejos primero)
-        
-        # 4. Validar si hay stock suficiente
-        total_stock = sum(lote.cantidad_actual for lote in lotes)
-        if cantidad_a_descontar > total_stock:
-            raise serializers.ValidationError({
-                "error": f"Stock insuficiente. Intentaste sacar {cantidad_a_descontar}, pero solo hay {total_stock} disponibles."
-            })
-            
-        # 5. Descontar en cascada (FIFO)
-        for lote in lotes:
-            if cantidad_a_descontar <= 0:
-                break
-                
-            if lote.cantidad_actual >= cantidad_a_descontar:
-                lote.cantidad_actual -= cantidad_a_descontar
-                lote.save()
-                cantidad_a_descontar = 0
-            else:
-                cantidad_a_descontar -= lote.cantidad_actual
-                lote.cantidad_actual = 0
-                lote.save()
-                
-        return detalle_salida
+        raise ConflictoOperacionInventarioError(
+            "El endpoint legacy de detalles-salida está bloqueado porque modificaba existencias sin trazabilidad en Kardex.",
+            codigo="SALIDA_LEGACY_BLOQUEADA",
+        )
 
 
 class InventariosSerializer(serializers.ModelSerializer):
@@ -124,40 +214,73 @@ class InventariosSerializer(serializers.ModelSerializer):
         model = Inventarios
         fields = '__all__'
 
-    def validate(self, attrs):
-        request = self.context.get('request')
-        if request and self.instance is not None and not _es_gestor(request.user):
-            # 1. Validar claves permitidas en self.initial_data
-            if hasattr(self, 'initial_data') and self.initial_data:
-                claves_recibidas = set(self.initial_data.keys())
-                claves_no_permitidas = claves_recibidas - {'cantidad_actual', 'estado'}
-                if claves_no_permitidas:
-                    raise serializers.ValidationError(
-                        f"Campos no permitidos para ajuste de stock: {sorted(list(claves_no_permitidas))}.",
-                        code='AJUSTE_STOCK_CAMPOS_NO_PERMITIDOS'
-                    )
+    def create(self, validated_data):
+        raise ConflictoOperacionInventarioError(
+            MENSAJE_CREACION_DIRECTA_LOTE_NO_PERMITIDA,
+            codigo="CREACION_DIRECTA_LOTE_NO_PERMITIDA",
+        )
 
-            # 2. Validar que cantidad_actual no sea negativa
-            if 'cantidad_actual' in attrs and attrs['cantidad_actual'] is not None and attrs['cantidad_actual'] < 0:
+    def validate(self, attrs):
+        if self.instance is not None:
+            raw = self.initial_data if isinstance(getattr(self, 'initial_data', None), dict) else None
+            if raw is None:
                 raise serializers.ValidationError(
-                    "La cantidad_actual no puede ser negativa.",
-                    code='AJUSTE_STOCK_NEGATIVO'
+                    "El cuerpo de actualización debe ser un objeto JSON válido.",
+                    code='PAYLOAD_LOTE_INVALIDO',
                 )
+
+            claves_recibidas = set(raw.keys())
+            claves_permitidas = {'estado', 'fecha_vencimiento'}
+            claves_no_permitidas = claves_recibidas - claves_permitidas
+            if claves_no_permitidas:
+                raise serializers.ValidationError(
+                    f"Campos no permitidos al editar lote de bodega: {sorted(list(claves_no_permitidas))}. "
+                    f"Solo se permite actualizar 'estado' o 'fecha_vencimiento'.",
+                    code='CAMPO_LOTE_NO_PERMITIDO',
+                )
+            if not claves_recibidas:
+                raise serializers.ValidationError(
+                    "Debe especificar al menos 'estado' o 'fecha_vencimiento'.",
+                    code='PATCH_LOTE_VACIO',
+                )
+
+            if 'estado' in attrs:
+                nuevo_estado = attrs.get('estado')
+                if nuevo_estado not in ESTADOS_LOTE_PERMITIDOS:
+                    raise serializers.ValidationError(
+                        f"Estado de lote inválido '{nuevo_estado}'. Valores permitidos: {list(ESTADOS_LOTE_PERMITIDOS)}.",
+                        code='ESTADO_LOTE_INVALIDO',
+                    )
 
         return super().validate(attrs)
 
     @transaction.atomic
     def update(self, instance, validated_data):
-        request = self.context.get('request')
-        if request and not _es_gestor(request.user) and 'cantidad_actual' in validated_data:
-            instancia_bloqueada = Inventarios.objects.select_for_update(no_key=True).get(pk=instance.pk)
-            nueva_cantidad = validated_data['cantidad_actual']
-            if nueva_cantidad is not None and nueva_cantidad > instancia_bloqueada.cantidad_actual:
-                raise serializers.ValidationError(
-                    "No esta permitido aumentar la cantidad_actual en ajuste de stock.",
-                    code='AJUSTE_STOCK_AUMENTO_NO_PERMITIDO'
-                )
-            return super().update(instancia_bloqueada, validated_data)
+        instancia_bloqueada = Inventarios.objects.select_for_update(no_key=True).get(pk=instance.pk)
 
-        return super().update(instance, validated_data)
+        if (
+            'fecha_vencimiento' in validated_data
+            and validated_data['fecha_vencimiento'] != instancia_bloqueada.fecha_vencimiento
+            and lote_tiene_historial_operativo(instancia_bloqueada)
+        ):
+            raise ConflictoOperacionInventarioError(
+                "No se puede modificar la fecha de vencimiento de un lote que ya tiene historial en kits, solicitudes o Kardex.",
+                codigo='LOTE_CON_HISTORIAL_VENCIMIENTO',
+            )
+
+        if 'estado' in validated_data:
+            nuevo_estado = validated_data['estado']
+            stock_actual = instancia_bloqueada.cantidad_actual or 0
+            if nuevo_estado == 'Disponible' and stock_actual <= 0:
+                raise ConflictoOperacionInventarioError(
+                    "No se puede establecer estado 'Disponible' en un lote sin existencias (cantidad_actual <= 0).",
+                    codigo='ESTADO_LOTE_INCONSISTENTE',
+                )
+            if nuevo_estado == 'Agotado' and stock_actual > 0:
+                raise ConflictoOperacionInventarioError(
+                    f"No se puede establecer estado 'Agotado' mientras el lote conserve existencias ({stock_actual}).",
+                    codigo='ESTADO_LOTE_INCONSISTENTE',
+                )
+
+        return super().update(instancia_bloqueada, validated_data)
 
