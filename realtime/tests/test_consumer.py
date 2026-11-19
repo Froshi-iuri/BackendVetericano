@@ -295,6 +295,63 @@ class NotificacionesConsumerTests(SimpleTestCase):
         self.assertTrue(captura.textos, 'se esperaban logs del consumer')
         self.assertFalse([t for t in captura.textos if tk[:40] in t])
 
+    # 11. Clientes nativos Android (ruta explícita sin Origin + JWT obligatorio)
+    @override_settings(WS_ALLOWED_NATIVE_CLIENTS=['android-petvetericano'])
+    async def test_cliente_nativo_permitido_autentica_y_recibe_evento(self):
+        headers = [(b'x-vetericano-client', b'android-petvetericano')]
+        comm = WebsocketCommunicator(APP, '/ws/notificaciones/', headers=headers)
+        conectado, _ = await comm.connect()
+        self.assertTrue(conectado)
+        await comm.send_to(text_data=json.dumps({'type': 'auth', 'token': token_access(12)}))
+        ok = json.loads(await comm.receive_from(timeout=2))
+        self.assertEqual(ok['type'], 'auth_ok')
+        self.assertEqual(ok['user_id'], 12)
+        self.assertEqual(ok['id_rol'], 3)
+
+        sobre = eventos.construir_sobre('peticion.asignada', 'NP', {'clave': 'pet-99'})
+        capa = get_channel_layer()
+        await capa.group_send(eventos.grupo_usuario(12), {'type': 'evento.enviar', 'evento': sobre})
+        recibido = json.loads(await comm.receive_from(timeout=2))
+        self.assertEqual(recibido['event_type'], 'peticion.asignada')
+        self.assertEqual(recibido['data']['clave'], 'pet-99')
+        await comm.disconnect()
+
+    @override_settings(WS_ALLOWED_NATIVE_CLIENTS=['android-petvetericano'])
+    async def test_cliente_nativo_no_autorizado_rechazado_4403(self):
+        headers = [(b'x-vetericano-client', b'cliente-desconocido')]
+        comm = WebsocketCommunicator(APP, '/ws/notificaciones/', headers=headers)
+        conectado, codigo = await comm.connect()
+        self.assertFalse(conectado)
+        self.assertEqual(codigo, 4403)
+
+    @override_settings(WS_ALLOWED_NATIVE_CLIENTS=[])
+    async def test_cliente_nativo_deshabilitado_rechazado_4403(self):
+        headers = [(b'x-vetericano-client', b'android-petvetericano')]
+        comm = WebsocketCommunicator(APP, '/ws/notificaciones/', headers=headers)
+        conectado, codigo = await comm.connect()
+        self.assertFalse(conectado)
+        self.assertEqual(codigo, 4403)
+
+    @override_settings(WS_ALLOWED_NATIVE_CLIENTS=['android-petvetericano'])
+    async def test_origin_malicioso_con_header_nativo_sigue_rechazado_4403(self):
+        headers = [
+            (b'origin', b'https://evil.example.com'),
+            (b'x-vetericano-client', b'android-petvetericano'),
+        ]
+        comm = WebsocketCommunicator(APP, '/ws/notificaciones/', headers=headers)
+        conectado, codigo = await comm.connect()
+        self.assertFalse(conectado)
+        self.assertEqual(codigo, 4403)
+
+    @override_settings(WS_ALLOWED_NATIVE_CLIENTS=['android-petvetericano'])
+    async def test_cliente_nativo_sin_jwt_valido_cierra_4001(self):
+        headers = [(b'x-vetericano-client', b'android-petvetericano')]
+        comm = WebsocketCommunicator(APP, '/ws/notificaciones/', headers=headers)
+        conectado, _ = await comm.connect()
+        self.assertTrue(conectado)
+        await comm.send_to(text_data=json.dumps({'type': 'auth', 'token': 'token-invalido'}))
+        self.assertEqual(await self._cierre(comm), 4001)
+
 
 class HttpMinimoTests(SimpleTestCase):
     databases = set()
