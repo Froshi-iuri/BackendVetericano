@@ -4,6 +4,7 @@ class Patologia(models.Model):
     id_patologia = models.AutoField(primary_key=True)
     nombre = models.CharField(max_length=150, unique=True)
     descripcion = models.TextField(blank=True, null=True)
+    tipo_de_enfermedad = models.CharField(max_length=100, blank=True, null=True)
     activo = models.BooleanField(default=True)
 
     class Meta:
