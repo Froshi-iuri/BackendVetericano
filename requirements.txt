@@ -52,3 +52,8 @@ pycparser==3.12
 # Las dependencias de IA (PyTorch/Transformers) viven en VetericanoIA/.
 # Para activar el respaldo local (DUPLICADOS_DINOV2_BACKEND=local), usar:
 #   pip install -r requirements-ia-local.txt
+
+# Módulo de Apoyo Diagnóstico IA Local (scikit-learn ligero)
+scikit-learn>=1.4.0
+joblib>=1.3.0
+

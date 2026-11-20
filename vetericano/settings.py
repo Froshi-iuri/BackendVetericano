@@ -71,6 +71,7 @@ INSTALLED_APPS = [
     'inventario',
     'dashboard',
     'realtime',
+    'diagnostico_ia',
 ]
 
 MIDDLEWARE = [
