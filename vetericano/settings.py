@@ -8,13 +8,11 @@ import dj_database_url
 from dotenv import load_dotenv
 from datetime import timedelta
 
-# carga las variables del archivo .env
-load_dotenv()
-
-
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# carga las variables del archivo .env desde la raíz del proyecto
+load_dotenv(BASE_DIR / '.env')
 
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
@@ -224,14 +222,33 @@ LOGGING = {
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
+def _parse_bool_env(nombre: str, default: bool) -> bool:
+    raw = os.environ.get(nombre)
+    if raw is None:
+        return default
+    val = str(raw).strip().lower()
+    if val in ('true', '1', 'yes', 'si', 'sí', 'on'):
+        return True
+    if val in ('false', '0', 'no', 'off'):
+        return False
+    return default
+
+
 # Configuración oficial de Correo en Django
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 465))
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'False') == 'True'
-EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'True') == 'True'
+_email_tls_req = _parse_bool_env('EMAIL_USE_TLS', EMAIL_PORT == 587)
+_email_ssl_req = _parse_bool_env('EMAIL_USE_SSL', EMAIL_PORT == 465 and not _email_tls_req)
+if _email_tls_req and _email_ssl_req:
+    if EMAIL_PORT == 587:
+        _email_ssl_req = False
+    else:
+        _email_tls_req = False
+EMAIL_USE_TLS = _email_tls_req
+EMAIL_USE_SSL = _email_ssl_req
 
 
 # Configuración base de Django REST Framework para exigir tokens por defecto
