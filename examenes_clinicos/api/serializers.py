@@ -30,13 +30,25 @@ class ExamenSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ('id_examen',)
 
+    @staticmethod
+    def _normalizar_estado(valor):
+        if valor is None:
+            return 'activo'
+        texto = str(valor).strip().lower()
+        if not texto or texto in ('true', '1', 'si', 'sí', 'activo'):
+            return 'activo'
+        if texto in ('false', '0', 'no', 'inactivo'):
+            return 'inactivo'
+        return texto
+
+    def validate_estado(self, value):
+        return self._normalizar_estado(value)
+
     def to_representation(self, instance):
-        # Forzamos la lectura directa del atributo estado desde la instancia o la base de datos
         representation = super().to_representation(instance)
         estado_valor = getattr(instance, 'estado', None)
-        
+
         if not estado_valor:
-            # Si por alguna razón el ORM no lo mapeó, intentamos leerlo directo del diccionario de la base de datos si existe
             try:
                 from django.db import connection
                 with connection.cursor() as cursor:
@@ -51,63 +63,13 @@ class ExamenSerializer(serializers.ModelSerializer):
         return representation
 
     def update(self, instance, validated_data):
-        estado = validated_data.get('estado')
-        if estado is None and self.initial_data and 'estado' in self.initial_data:
-            estado = self.initial_data.get('estado')
-
-        instance = super().update(instance, validated_data)
-
-        if estado:
-            estado_clean = str(estado).lower().strip()
-            instance.estado = estado_clean
-            try:
-                instance.save(update_fields=['estado'])
-            except Exception:
-                try:
-                    instance.save()
-                except Exception:
-                    pass
-
-            try:
-                from django.db import connection
-                with connection.cursor() as cursor:
-                    try:
-                        cursor.execute("ALTER TABLE examen ADD COLUMN estado VARCHAR(50) DEFAULT 'activo'")
-                    except Exception:
-                        pass
-                    cursor.execute("UPDATE examen SET estado = %s WHERE id_examen = %s", [estado_clean, instance.id_examen])
-            except Exception as e:
-                print("Error actualizando estado por SQL:", e)
-
-        return instance
+        if 'estado' in validated_data:
+            validated_data['estado'] = self._normalizar_estado(validated_data['estado'])
+        return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        estado = validated_data.get('estado')
-        if estado is None and self.initial_data and 'estado' in self.initial_data:
-            estado = self.initial_data.get('estado')
-
-        instance = super().create(validated_data)
-
-        if estado:
-            estado_clean = str(estado).lower().strip()
-            instance.estado = estado_clean
-            try:
-                instance.save()
-            except Exception:
-                pass
-
-            try:
-                from django.db import connection
-                with connection.cursor() as cursor:
-                    try:
-                        cursor.execute("ALTER TABLE examen ADD COLUMN estado VARCHAR(50) DEFAULT 'activo'")
-                    except Exception:
-                        pass
-                    cursor.execute("UPDATE examen SET estado = %s WHERE id_examen = %s", [estado_clean, instance.id_examen])
-            except Exception as e:
-                print("Error al asignar estado por SQL al crear:", e)
-
-        return instance
+        validated_data['estado'] = self._normalizar_estado(validated_data.get('estado'))
+        return super().create(validated_data)
 
 
 class ProcedimientoRealizadoSerializer(serializers.ModelSerializer):

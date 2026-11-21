@@ -72,4 +72,8 @@ urlpatterns = [
 
     # Endpoints de Inventario y Compras
     path('api/inventario/', include('inventario.api.urls')),
+
+    # Endpoints de Apoyo Diagnóstico IA Local (scikit-learn)
+    path('api/diagnostico-ia/', include('diagnostico_ia.urls')),
+    path('api/clinica/diagnostico-ia/', include('diagnostico_ia.urls')),
 ]
