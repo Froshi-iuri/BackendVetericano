@@ -630,7 +630,6 @@ class ActualizarEstadoPeticionView(APIView):
 
 
 
-
 # ============================================================================
 # MÓDULO JURÍDICO: DASHBOARD, NOTIFICACIONES Y REASIGNACIONES
 # ============================================================================

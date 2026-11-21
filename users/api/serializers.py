@@ -88,6 +88,9 @@ class UsuariosSerializer(serializers.ModelSerializer):
     telefono = serializers.CharField(
         required=False, allow_blank=True, allow_null=True
     )
+    matricula_profesional = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True
+    )
     foto_perfil = serializers.CharField(
         required=False, allow_blank=True, allow_null=True
     )
@@ -579,3 +582,4 @@ class AdministradorSuperAdminSerializer(UsuariosSerializer):
         if raw_password:
             validated_data['password'] = make_password(raw_password)
         return super(UsuariosSerializer, self).update(instance, validated_data)
+

@@ -1271,13 +1271,7 @@ class NotificacionJuridicoSerializer(serializers.ModelSerializer):
 # SERIALIZERS Y EXTENSIONES PARA EL MÓDULO DE JURÍDICO
 # ==============================================================================
 
-from peticiones.models import (
-    EstadoPeticiones,
-    HistorialPeticiones,
-    NotificacionPeticion,
-    HistorialAsignacionPeticion,
-    NotificacionJuridico,
-)
+from peticiones.models import EstadoPeticiones, HistorialPeticiones, NotificacionPeticion
 from peticiones.utils import calcular_tiempos_peticion
 
 
