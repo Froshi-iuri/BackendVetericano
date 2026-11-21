@@ -10,9 +10,19 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AddField(
-            model_name='patologia',
-            name='tipo_de_enfermedad',
-            field=models.CharField(blank=True, max_length=100, null=True),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql="ALTER TABLE patologia ADD COLUMN IF NOT EXISTS tipo_de_enfermedad VARCHAR(100);",
+                    reverse_sql=migrations.RunSQL.noop,
+                ),
+            ],
+            state_operations=[
+                migrations.AddField(
+                    model_name='patologia',
+                    name='tipo_de_enfermedad',
+                    field=models.CharField(blank=True, max_length=100, null=True),
+                ),
+            ],
         ),
     ]
