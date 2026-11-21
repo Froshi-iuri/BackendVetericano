@@ -3,9 +3,6 @@ from django.db import models
 
 # Modelo activo en los endpoints de DRF
 class Medicamento(models.Model):
-    # Llave primaria personalizada según Supabase
-    id_medicamento = models.AutoField(primary_key=True)
-    
     nombre = models.CharField(max_length=150)
     descripcion = models.TextField(blank=True, null=True)
     cantidad_ml = models.CharField(max_length=50)

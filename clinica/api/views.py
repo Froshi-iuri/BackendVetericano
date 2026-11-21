@@ -241,6 +241,12 @@ class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
             diagnostico_obj = consulta.diagnostico_set.last()
             lista_problemas = diagnostico_obj.lista_problemas.split('; ') if diagnostico_obj and diagnostico_obj.lista_problemas else []
             diagnostico_final = diagnostico_obj.descripcion if diagnostico_obj else ""
+            dp_obj = (
+                diagnostico_obj.diagnosticopatologia_set.select_related('id_patologia').last()
+                if diagnostico_obj
+                else None
+            )
+            id_patologia_val = dp_obj.id_patologia_id if dp_obj else None
 
             tratamientos_data = []
             for t in consulta.tratamientos_set.all():
@@ -267,6 +273,8 @@ class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
                 "examenes": consulta.examenes_complementarios or {},
                 "listaProblemas": lista_problemas,
                 "diagnosticoFinal": diagnostico_final,
+                "idPatologia": id_patologia_val,
+                "id_patologia": id_patologia_val,
                 "tratamientos": tratamientos_data
             }
 
@@ -599,7 +607,15 @@ class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
             if temp is not None: consulta.temperatura = temp
 
             diagnostico_diferencial = data.get('diagnostico_diferencial') or data.get('diagnosticoDiferencial') or ''
-            if diagnostico_diferencial:
+            hallazgos_recibidos = None
+            for clave_hallazgo in ('hallazgos_examen', 'descripcion_hallazgos', 'descripcionHallazgos'):
+                if clave_hallazgo in data:
+                    hallazgos_recibidos = data.get(clave_hallazgo) or ''
+                    break
+
+            if hallazgos_recibidos is not None:
+                consulta.hallazgos_examen = hallazgos_recibidos
+            elif diagnostico_diferencial and not consulta.hallazgos_examen:
                 consulta.hallazgos_examen = diagnostico_diferencial
 
             consulta.plan_procedimientos = plan_tratamiento
@@ -639,15 +655,20 @@ class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
 
             if pat_obj:
                 from clinica.models import DiagnosticoPatologia
+                hallazgos_dp = hallazgos_recibidos if hallazgos_recibidos is not None else diagnostico_diferencial
                 dp = DiagnosticoPatologia.objects.filter(id_diagnostico=diag_obj).first()
                 if dp:
                     dp.id_patologia = pat_obj
-                    dp.save(update_fields=['id_patologia'])
+                    update_dp = ['id_patologia']
+                    if hallazgos_dp:
+                        dp.hallazgos_pruebas = hallazgos_dp
+                        update_dp.append('hallazgos_pruebas')
+                    dp.save(update_fields=update_dp)
                 else:
                     DiagnosticoPatologia.objects.create(
                         id_diagnostico=diag_obj,
                         id_patologia=pat_obj,
-                        hallazgos_pruebas=diagnostico_diferencial
+                        hallazgos_pruebas=hallazgos_dp or ''
                     )
 
             alertas_farmacia = None

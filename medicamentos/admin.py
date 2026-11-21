@@ -9,7 +9,7 @@ from .models import (
 
 @admin.register(Medicamento)
 class MedicamentoAdmin(admin.ModelAdmin):
-    list_display = ('id_medicamento', 'nombre', 'tipo', 'cantidad_ml', 'estado')
+    list_display = ('id', 'nombre', 'tipo', 'cantidad_ml', 'estado')
     search_fields = ('nombre', 'tipo')
     list_filter = ('estado', 'tipo')
 
