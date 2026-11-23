@@ -10,6 +10,11 @@ from django.db import IntegrityError
 from users.models import Usuarios, Rol, Sede
 from users.constants import ROL_ADMINISTRADOR, ROL_SUPER_ADMINISTRADOR
 from users.api.permissions import es_super_administrador, NOMBRES_ROL_SUPER_ADMIN
+from users.services.google_oauth_service import (
+    es_formato_google_id_token_valido,
+    resolver_o_crear_usuario_google,
+    verificar_google_id_token,
+)
 from peticiones.utils import subir_o_asegurar_cloudinary
 
 
@@ -57,24 +62,79 @@ class LoginCustomSerializer(serializers.Serializer):
     """
     # Exigimos email y contraseña. Swagger usará estos campos para dibujar el formulario.
     email = serializers.EmailField()
-    password = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate(self, data):
         # 1. Buscamos al usuario por correo en nuestra tabla personalizada (insensible a mayúsculas/espacios).
         email_limpio = (data.get('email') or '').strip()
-        user = Usuarios.objects.filter(email__iexact=email_limpio).first()
+        password = data.get('password') or ''
+        candidatos = list(
+            Usuarios.objects.select_related('id_rol')
+            .filter(email__iexact=email_limpio)
+            .order_by('-activo', 'id_usuario')
+        )
 
         # 2. Validaciones encadenadas:
         # - ¿El usuario existe?
         # - check_password compara la contraseña plana de Swagger con el hash guardado en PostgreSQL.
         # - ¿El usuario tiene activo=True?
-        if user and check_password(data['password'], user.password):
-            if not user.activo:
-                 raise serializers.ValidationError("Esta cuenta ha sido desactivada.")
-            return user
-        
+        usuario_inactivo = False
+        for user in candidatos:
+            if check_password(password, user.password):
+                if user.activo:
+                    return user
+                usuario_inactivo = True
+
+        if usuario_inactivo:
+            raise serializers.ValidationError("Esta cuenta ha sido desactivada.")
+
         # Si algo de arriba falla, rechazamos el login.
         raise serializers.ValidationError("Credenciales incorrectas.")
+
+
+class GoogleLoginSerializer(serializers.Serializer):
+    """
+    Valida la solicitud de inicio de sesión con Google Sign-In usando un ID Token emitido por Google.
+    """
+    id_token = serializers.CharField(
+        write_only=True,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+        error_messages={
+            'required': "El campo 'id_token' es obligatorio.",
+            'blank': "El campo 'id_token' no puede estar vacío.",
+        },
+    )
+    email = serializers.EmailField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    nombre = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True, max_length=150)
+    apellido = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True, max_length=100)
+
+    def validate(self, data):
+        raw_token = (data.get('id_token') or '').strip()
+        if not es_formato_google_id_token_valido(raw_token):
+            raise serializers.ValidationError(
+                "Token de Google inválido. Debe enviar un ID Token auténtico emitido por Google."
+            )
+
+        identidad = verificar_google_id_token(raw_token)
+
+        email_enviado = (data.get('email') or '').strip().lower()
+        if email_enviado and email_enviado != identidad.email:
+            raise serializers.ValidationError(
+                "El correo enviado no coincide con la identidad verificada por Google."
+            )
+
+        user, es_nuevo_usuario = resolver_o_crear_usuario_google(
+            identidad,
+            nombre_fallback=data.get('nombre'),
+            apellido_fallback=data.get('apellido'),
+        )
+        return {
+            'user': user,
+            'es_nuevo_usuario': es_nuevo_usuario,
+        }
+
 
 class UsuariosSerializer(serializers.ModelSerializer):
 

@@ -2,6 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    GoogleLoginView,
     LoginView,
     RegisterView,
     UsuariosViewSet,
@@ -19,6 +20,7 @@ router.register(r'sedes', SedeViewSet, basename='usuarios-sedes')
 
 urlpatterns = [
     path('login/', LoginView.as_view(), name='login'),
+    path('google-login/', GoogleLoginView.as_view(), name='google-login'),
     path('register/', RegisterView.as_view(), name='register'), # El que usa Angular
 
     path('', include(router.urls)),

@@ -14,11 +14,18 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .serializers import (
     RegisterCustomSerializer,
     LoginCustomSerializer,
+    GoogleLoginSerializer,
     UsuariosSerializer,
     RolSerializer,
     SedeSerializer,
     SedeEstadoSerializer,
     AdministradorSuperAdminSerializer,
+)
+from users.services.google_oauth_service import (
+    GoogleAccountPolicyError,
+    GoogleAuthConfigError,
+    GoogleAuthUnavailableError,
+    GoogleTokenInvalidError,
 )
 from .permissions import (
     EsAdministradorOReadOnly,
@@ -48,6 +55,7 @@ class RegisterView(generics.GenericAPIView):
     # Esto es lo que le dice a Swagger:
     # "Usa este serializador para dibujar los campos".
     serializer_class = RegisterCustomSerializer
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
@@ -68,10 +76,42 @@ class RegisterView(generics.GenericAPIView):
         }, status=status.HTTP_201_CREATED)
 
 
+def _construir_respuesta_login(user, *, es_nuevo_usuario=None):
+    """Genera el par JWT con claims de rol/foto y construye la respuesta esperada por web y Android."""
+    refresh = RefreshToken.for_user(user)
+    foto_actual = getattr(user, 'foto_perfil', None)
+    refresh['id_rol'] = user.id_rol.id_rol
+    refresh['nombre_rol'] = user.id_rol.nombre_rol
+    refresh['foto_perfil'] = foto_actual or ''
+    refresh['foto'] = foto_actual or ''
+
+    nombre_completo = f"{(user.nombre or '').strip()} {(user.apellido or '').strip()}".strip()
+    payload = {
+        "mensaje": f"Bienvenido, {nombre_completo or user.email}",
+        "email": user.email,
+        "id_usuario": user.id_usuario,
+        "nombre": user.nombre,
+        "apellido": user.apellido,
+        "telefono": getattr(user, 'telefono', None),
+        "foto_perfil": foto_actual,
+        "foto": foto_actual,
+        "matricula_profesional": getattr(user, 'matricula_profesional', None),
+        "id_rol": user.id_rol.id_rol,
+        "tokens": {
+            "refresh": str(refresh),
+            "access": str(refresh.access_token),
+        },
+    }
+    if es_nuevo_usuario is not None:
+        payload["es_nuevo_usuario"] = es_nuevo_usuario
+    return payload
+
+
 class LoginView(generics.GenericAPIView):
 
     # Configura los campos 'email' y 'password' en Swagger.
     serializer_class = LoginCustomSerializer
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
@@ -79,34 +119,38 @@ class LoginView(generics.GenericAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data
-        
-        # Generamos el par de tokens (acceso y refresco) para este usuario
-        refresh = RefreshToken.for_user(user)
-        
-        # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
-        foto_actual = getattr(user, 'foto_perfil', None)
-        # Inyectamos datos extra al token para que el frontend no tenga que hacer peticiones extra
-        refresh['id_rol'] = user.id_rol.id_rol
-        refresh['nombre_rol'] = user.id_rol.nombre_rol
-        refresh['foto_perfil'] = foto_actual or ''
-        refresh['foto'] = foto_actual or ''
+        return Response(_construir_respuesta_login(user), status=status.HTTP_200_OK)
 
-        return Response({
-            "mensaje": f"Bienvenido, {user.nombre} {user.apellido}",
-            "email": user.email,
-            "id_usuario": user.id_usuario,
-            "nombre": user.nombre,
-            "apellido": user.apellido,
-            "telefono": getattr(user, 'telefono', None),
-            "foto_perfil": foto_actual,
-            "foto": foto_actual,
-            "matricula_profesional": getattr(user, 'matricula_profesional', None),
-            "id_rol": user.id_rol.id_rol,
-            "tokens": {
-                "refresh": str(refresh),
-                "access": str(refresh.access_token),
-            }
-        }, status=status.HTTP_200_OK)
+
+class GoogleLoginView(generics.GenericAPIView):
+    """
+    Autentica o registra ciudadanos (rol Peticionario) mediante un ID Token verificado de Google.
+    """
+    serializer_class = GoogleLoginSerializer
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except GoogleAuthConfigError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except GoogleAuthUnavailableError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except GoogleTokenInvalidError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_401_UNAUTHORIZED)
+        except GoogleAccountPolicyError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+
+        resultado = serializer.validated_data
+        return Response(
+            _construir_respuesta_login(
+                resultado['user'],
+                es_nuevo_usuario=resultado['es_nuevo_usuario'],
+            ),
+            status=status.HTTP_200_OK,
+        )
 
 
 class UsuariosViewSet(viewsets.ModelViewSet):
