@@ -548,3 +548,45 @@ FCM_PROJECT_ID = os.environ.get('FCM_PROJECT_ID', '').strip()
 FCM_CREDENTIALS_JSON = os.environ.get('FCM_CREDENTIALS_JSON', '').strip()
 FCM_CREDENTIALS_FILE = os.environ.get('FCM_CREDENTIALS_FILE', '').strip()
 
+
+# ─── Google OAuth (Inicio de sesión móvil/web con ID Token) ───────────────────────────────
+def _leer_env_lista_csv(nombre_var: str, fallback_var: str = '') -> tuple[str, ...]:
+    raw = os.environ.get(nombre_var, '').strip()
+    if not raw and fallback_var:
+        raw = os.environ.get(fallback_var, '').strip()
+    if not raw:
+        return ()
+    return tuple(item.strip() for item in raw.split(',') if item.strip())
+
+
+def _leer_env_roles_csv(nombre_var: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.environ.get(nombre_var)
+    if raw is None or not str(raw).strip():
+        return default
+    roles = []
+    for item in str(raw).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            roles.append(int(item))
+        except ValueError:
+            continue
+    return tuple(dict.fromkeys(roles))
+
+
+GOOGLE_OAUTH_CLIENT_IDS = _leer_env_lista_csv(
+    'GOOGLE_OAUTH_CLIENT_IDS',
+    fallback_var='GOOGLE_CLIENT_ID',
+)
+# Por defecto solo vincula automáticamente roles móviles (Veterinario=3, Peticionario=4);
+# Administrador (1), Jurídico (2) y Super Administrador (5) requieren login tradicional.
+GOOGLE_OAUTH_ALLOWED_LINK_ROLES = _leer_env_roles_csv(
+    'GOOGLE_OAUTH_ALLOWED_LINK_ROLES',
+    default=(3, 4),
+)
+GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS = tuple(
+    d.lower() for d in _leer_env_lista_csv('GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS')
+)
+
+

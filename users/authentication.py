@@ -13,7 +13,7 @@ class CustomJWTAuthentication(JWTAuthentication):
             raise AuthenticationFailed('El token no contiene el ID del usuario.')
 
         try:
-            user = Usuarios.objects.get(id_usuario=user_id)
+            user = Usuarios.objects.select_related('id_rol').get(id_usuario=user_id)
         except Usuarios.DoesNotExist:
             raise AuthenticationFailed('Usuario no encontrado.')
 
