@@ -20,12 +20,14 @@ from .serializers import (
     VoluntarioEventoSerializer,
 )
 from voluntariado import notificaciones_realtime as notif_vol
+from vetericano.paginacion import PaginacionOpcional
 
 
 class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
     queryset = EventoVoluntariado.objects.all().order_by('-fecha')
     serializer_class = EventoVoluntariadoSerializer
     permission_classes = [PermisoVoluntariado]
+    pagination_class = PaginacionOpcional
 
     @action(detail=True, methods=['get'], url_path='postulados', permission_classes=[PermisoVoluntariado])
     def postulados(self, request, pk=None):
@@ -90,6 +92,7 @@ class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
     queryset = PostulacionVoluntariado.objects.all().order_by('-fecha_postulacion')
     serializer_class = PostulacionVoluntariadoSerializer
     permission_classes = [PermisoVoluntariado]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset()

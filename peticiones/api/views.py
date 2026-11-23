@@ -33,6 +33,7 @@ from peticiones.services.alertas_duplicados_service import (
     es_peticion_duplicada,
 )
 from inventario.api.kit_views import KitErrorHandlingMixin
+from vetericano.paginacion import PaginacionOpcional
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class ListarPeticionesView(generics.ListAPIView):
     """
     serializer_class = ListarPeticionesSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         user = self.request.user
@@ -306,6 +308,7 @@ class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
     """
     serializer_class = ListarSeguimientoPeticionesVisitaSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         user = self.request.user

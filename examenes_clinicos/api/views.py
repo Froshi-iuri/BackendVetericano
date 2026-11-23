@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from examenes_clinicos.models import Examen, ProcedimientoRealizado
 from users.api.permissions import EsAdminOReadOnlyParaStaff, PermisoClinica
+from vetericano.paginacion import PaginacionOpcional
 from .serializers import ExamenSerializer, ProcedimientoRealizadoSerializer
 
 
@@ -36,6 +37,7 @@ class ExamenViewSet(viewsets.ModelViewSet):
     queryset = Examen.objects.all().order_by('-id_examen')
     serializer_class = ExamenSerializer
     permission_classes = [EsAdminOReadOnlyParaStaff]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         qs = super().get_queryset()

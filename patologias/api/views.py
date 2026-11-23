@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from patologias.models import Patologia
 from users.api.permissions import EsAdminOReadOnlyParaStaff
+from vetericano.paginacion import PaginacionOpcional
 from .serializers import PatologiaSerializer
 
 
@@ -64,6 +65,7 @@ class PatologiaViewSet(viewsets.ModelViewSet):
     queryset = Patologia.objects.all().order_by('nombre')
     serializer_class = PatologiaSerializer
     permission_classes = [EsAdminOReadOnlyParaStaff]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         qs = super().get_queryset()

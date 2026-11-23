@@ -47,6 +47,7 @@ from peticiones.models import (
     SeguimientoPeticionesVisita,
 )
 from peticiones.api.serializers import ListarPeticionesSerializer
+from vetericano.paginacion import PaginacionOpcional
 
 
 
@@ -157,6 +158,7 @@ class UsuariosViewSet(viewsets.ModelViewSet):
     queryset = Usuarios.objects.all()
     serializer_class = UsuariosSerializer
     permission_classes = [EsAdministradorOReadOnly]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -260,6 +262,7 @@ class SedeViewSet(
     queryset = Sede.objects.all()
     serializer_class = SedeSerializer
     permission_classes = [EsSuperAdministrador]
+    pagination_class = PaginacionOpcional
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
@@ -351,6 +354,7 @@ class SuperAdminListarAdministradoresView(generics.ListAPIView):
     """
     serializer_class = AdministradorSuperAdminSerializer
     permission_classes = [EsSuperAdministrador]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = _obtener_queryset_administradores()
@@ -717,6 +721,7 @@ class SuperAdminReportePeticionesView(generics.ListAPIView):
     """
     serializer_class = ListarPeticionesSerializer
     permission_classes = [EsSuperAdministrador]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = (
@@ -766,6 +771,7 @@ class SuperAdminReporteAtendidasView(generics.ListAPIView):
     """
     serializer_class = ListarPeticionesSerializer
     permission_classes = [EsSuperAdministrador]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = (

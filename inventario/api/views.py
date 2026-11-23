@@ -25,6 +25,7 @@ from .serializers import (
     DetalleSalidaSerializer,
     InventariosSerializer,
 )
+from vetericano.paginacion import PaginacionOpcional
 
 
 _MENSAJE_SALIDA_LEGACY_BLOQUEADA = (
@@ -38,12 +39,14 @@ class ProveedoresViewSet(viewsets.ModelViewSet):
     queryset = Proveedores.objects.all()
     serializer_class = ProveedoresSerializer
     permission_classes = [EsGestorOLecturaStaffLegacy]
+    pagination_class = PaginacionOpcional
 
 
 class CompraViewSet(KitErrorHandlingMixin, viewsets.ModelViewSet):
     queryset = Compra.objects.all()
     serializer_class = CompraSerializer
     permission_classes = [EsGestorOLecturaStaffLegacy]
+    pagination_class = PaginacionOpcional
 
     @action(detail=False, methods=['get'])
     def estadisticas(self, request):
@@ -124,6 +127,7 @@ class InventariosViewSet(KitErrorHandlingMixin, viewsets.ModelViewSet):
     queryset = Inventarios.objects.all()
     serializer_class = InventariosSerializer
     permission_classes = [PermisoInventariosLegacy]
+    pagination_class = PaginacionOpcional
 
     def create(self, request, *args, **kwargs):
         # Las permission_classes se evalúan antes en initial(): sin token 401, no gestor 403.

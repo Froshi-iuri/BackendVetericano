@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from users.api.permissions import PermisoClinica
+from vetericano.paginacion import PaginacionOpcional
 from clinica.models import (
     HistoriaClinica,
     Consulta,
@@ -53,6 +54,7 @@ class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSe
     queryset = HistoriaClinica.objects.all()
     serializer_class = HistoriaClinicaSerializer
     permission_classes = [PermisoClinica]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -66,6 +68,7 @@ class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
     permission_classes = [PermisoClinica]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset().order_by('-fecha_hora')

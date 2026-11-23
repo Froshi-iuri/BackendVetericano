@@ -20,6 +20,7 @@ from .serializers import (
     AdministracionMedicamentoSerializer,
     TratamientoMedicamentosSerializer,
 )
+from vetericano.paginacion import PaginacionOpcional
 
 
 class PermisoMedicamentosCatalogo(BasePermission):
@@ -65,6 +66,7 @@ class MedicamentoViewSet(viewsets.ModelViewSet):
     queryset = Medicamento.objects.all()
     serializer_class = MedicamentoSerializer
     permission_classes = [PermisoMedicamentosCatalogo]
+    pagination_class = PaginacionOpcional
 
 
 class MedicamentosViewSet(viewsets.ModelViewSet):

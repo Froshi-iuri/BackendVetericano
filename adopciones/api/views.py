@@ -3,6 +3,7 @@ from users.api.permissions import PermisoAdopciones
 from animales.models import Animal
 from .serializers import AdopcionAnimalSerializer
 from realtime import notificar
+from vetericano.paginacion import PaginacionOpcional
 
 # ADO-01: los cambios del catálogo de adopciones refrescan las vistas autorizadas (rol 1).
 ROLES_ADOPCIONES_AS = (1,)
@@ -12,6 +13,7 @@ class AdopcionAnimalViewSet(viewsets.ModelViewSet):
     queryset = Animal.objects.filter(activo=True)
     serializer_class = AdopcionAnimalSerializer
     permission_classes = [PermisoAdopciones]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         # Si es una petición para listar, podemos devolver solo los disponibles, 
