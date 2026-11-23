@@ -62,7 +62,7 @@ def _obtener_valor_normalizado(item_lower, *claves):
 
 
 class PatologiaViewSet(viewsets.ModelViewSet):
-    queryset = Patologia.objects.all().order_by('nombre')
+    queryset = Patologia.objects.all().order_by('nombre', 'id_patologia')
     serializer_class = PatologiaSerializer
     permission_classes = [EsAdminOReadOnlyParaStaff]
     pagination_class = PaginacionOpcional

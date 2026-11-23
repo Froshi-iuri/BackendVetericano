@@ -48,6 +48,7 @@ from peticiones.models import (
 )
 from peticiones.api.serializers import ListarPeticionesSerializer
 from vetericano.paginacion import PaginacionOpcional
+from vetericano.ordenamiento import ordenar_peticiones
 
 
 
@@ -155,7 +156,7 @@ class GoogleLoginView(generics.GenericAPIView):
 
 
 class UsuariosViewSet(viewsets.ModelViewSet):
-    queryset = Usuarios.objects.all()
+    queryset = Usuarios.objects.all().order_by('nombre', 'apellido', 'id_usuario')
     serializer_class = UsuariosSerializer
     permission_classes = [EsAdministradorOReadOnly]
     pagination_class = PaginacionOpcional
@@ -234,7 +235,7 @@ class UsuariosViewSet(viewsets.ModelViewSet):
 
 
 class RolViewSet(viewsets.ModelViewSet):
-    queryset = Rol.objects.all()
+    queryset = Rol.objects.all().order_by('nombre_rol', 'id_rol')
     serializer_class = RolSerializer
     permission_classes = [EsAdministradorOReadOnly]
 
@@ -268,7 +269,7 @@ class SedeViewSet(
     def get_queryset(self):
         queryset = Sede.objects.annotate(
             total_usuarios_count=Count('usuarios', distinct=True)
-        ).order_by('id_sede')
+        ).order_by('nombre', 'id_sede')
 
         query_params = getattr(self.request, 'query_params', {})
         activo_param = query_params.get('activo') if query_params else None
@@ -315,7 +316,7 @@ def _obtener_queryset_administradores():
             | Q(id_rol__nombre_rol__iexact='administrador')
             | Q(id_rol__nombre_rol__iexact='admin')
         )
-        .order_by('id_usuario')
+        .order_by('nombre', 'apellido', 'id_usuario')
     )
 
 
@@ -740,7 +741,7 @@ class SuperAdminReportePeticionesView(generics.ListAPIView):
             queryset,
             getattr(self.request, 'query_params', {}),
         )
-        return queryset.order_by('-fecha', '-id_peticion')
+        return ordenar_peticiones(queryset)
 
     @swagger_auto_schema(
         tags=['Super Administrador - Reportes'],

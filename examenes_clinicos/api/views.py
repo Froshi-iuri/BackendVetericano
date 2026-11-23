@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -34,7 +34,8 @@ def _normalizar_texto(valor):
 
 
 class ExamenViewSet(viewsets.ModelViewSet):
-    queryset = Examen.objects.all().order_by('-id_examen')
+    # Catálogo A-Z por defecto; los exámenes de una consulta van del más reciente al más antiguo.
+    queryset = Examen.objects.all().order_by('nombre_tipo_examen', 'id_examen')
     serializer_class = ExamenSerializer
     permission_classes = [EsAdminOReadOnlyParaStaff]
     pagination_class = PaginacionOpcional
@@ -67,12 +68,12 @@ class ExamenViewSet(viewsets.ModelViewSet):
         if solo_catalogo in ('true', '1', 'si', 'sí'):
             qs = qs.filter(id_consulta__isnull=True)
         elif solo_catalogo in ('false', '0', 'no'):
-            qs = qs.filter(id_consulta__isnull=False)
+            qs = qs.filter(id_consulta__isnull=False).order_by('-fecha_realizacion', '-id_examen')
 
         id_consulta = (params.get('id_consulta') or '').strip()
         if id_consulta:
             if id_consulta.isdigit():
-                qs = qs.filter(id_consulta_id=int(id_consulta))
+                qs = qs.filter(id_consulta_id=int(id_consulta)).order_by('-fecha_realizacion', '-id_examen')
             else:
                 return qs.none()
 
@@ -201,6 +202,9 @@ class ExamenViewSet(viewsets.ModelViewSet):
 
 
 class ProcedimientoRealizadoViewSet(viewsets.ModelViewSet):
-    queryset = ProcedimientoRealizado.objects.all()
+    queryset = ProcedimientoRealizado.objects.all().order_by(
+        F('fecha_procedimiento').desc(nulls_last=True), F('hora_procedimiento').desc(nulls_last=True),
+        '-id_procedimiento',
+    )
     serializer_class = ProcedimientoRealizadoSerializer
     permission_classes = [PermisoClinica]

@@ -371,4 +371,8 @@ def construir_queryset_conflictos(filtros: Dict[str, Any]) -> QuerySet:
     if filtros.get('id_medicamento') is not None:
         qs = qs.filter(id_medicamento=filtros['id_medicamento'])
 
-    return qs.order_by('-fecha_consumo', '-id_consumo')
+    # Conflictos sin resolver primero; luego del más reciente al más antiguo.
+    return qs.order_by(
+        Case(When(fecha_resolucion_conflicto__isnull=True, then=0), default=1, output_field=IntegerField()),
+        '-fecha_consumo', '-id_consumo',
+    )
