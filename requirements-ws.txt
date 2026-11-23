@@ -1,0 +1,41 @@
+# Dependencias exclusivas del servicio WebSocket (`vetericano-ws`, Dockerfile.ws).
+# Mantener las versiones sincronizadas con requirements.txt (validadas en Python 3.12.7).
+# Excluye intencionalmente stack ML (scikit-learn, scipy, numpy, joblib), WSGI (gunicorn,
+# whitenoise), FCM (google-auth, cryptography), HTTP cliente (requests), django-redis,
+# Pillow y watchfiles.
+
+# Django, PostgreSQL y configuración
+Django==6.1
+asgiref==3.12.1
+sqlparse==0.6.0
+tzdata==2026.3
+dj-database-url==3.1.2
+psycopg2-binary==2.9.12
+python-dotenv==1.2.3
+
+# Apps requeridas en INSTALLED_APPS por django.setup() y autenticación JWT del consumer
+djangorestframework==3.18.0
+djangorestframework_simplejwt==5.5.1
+PyJWT==2.13.0
+django-cors-headers==4.9.0
+drf-yasg==1.21.15
+inflection==0.5.1
+packaging==26.3
+PyYAML==6.0.3
+pytz==2026.3.post1
+uritemplate==4.2.0
+
+# ASGI, WebSockets, Channel Layer Redis y Uvicorn optimizado para Linux (sin watchfiles)
+channels==4.3.2
+channels-redis==4.3.0
+redis==8.1.0
+msgpack==1.2.4
+uvicorn==0.54.0
+uvloop==0.23.0 ; sys_platform != "win32"
+httptools==0.9.0
+websockets==17.4
+h11==0.16.0
+click==8.5.1
+anyio==4.16.0
+idna==3.19
+typing-extensions==4.16.0
