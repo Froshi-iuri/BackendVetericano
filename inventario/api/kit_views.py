@@ -16,6 +16,7 @@ Expone los endpoints del kit de dos niveles bajo /api/inventario/kit/:
 """
 
 from django.db.models import Q
+from vetericano.ordenamiento import orden_valor_primero
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -292,7 +293,9 @@ class SolicitudesKitListCreateView(KitErrorHandlingMixin, APIView):
                 'id_veterinario', 'id_gestor'
             ).prefetch_related(
                 'detalles__id_medicamento'
-            ).order_by('-fecha_solicitud')
+            ).order_by(
+                orden_valor_primero('estado', 'PENDIENTE'), '-fecha_solicitud', '-id_solicitud',
+            )
 
             id_vet_param = request.query_params.get('id_veterinario')
             if id_vet_param:
@@ -306,7 +309,9 @@ class SolicitudesKitListCreateView(KitErrorHandlingMixin, APIView):
                 'id_gestor'
             ).prefetch_related(
                 'detalles__id_medicamento'
-            ).order_by('-fecha_solicitud')
+            ).order_by(
+                orden_valor_primero('estado', 'PENDIENTE'), '-fecha_solicitud', '-id_solicitud',
+            )
 
         estado_param = request.query_params.get('estado')
         if estado_param:

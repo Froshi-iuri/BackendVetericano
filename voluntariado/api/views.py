@@ -20,12 +20,16 @@ from .serializers import (
     VoluntarioEventoSerializer,
 )
 from voluntariado import notificaciones_realtime as notif_vol
+from django.db.models import F
+from vetericano.paginacion import PaginacionOpcional
+from vetericano.ordenamiento import orden_valor_primero
 
 
 class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
-    queryset = EventoVoluntariado.objects.all().order_by('-fecha')
+    queryset = EventoVoluntariado.objects.all().order_by('-fecha', '-id')
     serializer_class = EventoVoluntariadoSerializer
     permission_classes = [PermisoVoluntariado]
+    pagination_class = PaginacionOpcional
 
     @action(detail=True, methods=['get'], url_path='postulados', permission_classes=[PermisoVoluntariado])
     def postulados(self, request, pk=None):
@@ -34,7 +38,9 @@ class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
         Formato optimizado para el modal de Angular admin.
         """
         evento = self.get_object()
-        postulaciones = evento.postulaciones.select_related('usuario').all().order_by('-fecha_postulacion')
+        postulaciones = evento.postulaciones.select_related('usuario').all().order_by(
+            orden_valor_primero('estado', 'PENDIENTE'), '-fecha_postulacion', '-id',
+        )
         serializer = PostuladoDetalleSerializer(postulaciones, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -87,9 +93,13 @@ class EventoVoluntariadoViewSet(viewsets.ModelViewSet):
 
 
 class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
-    queryset = PostulacionVoluntariado.objects.all().order_by('-fecha_postulacion')
+    # Pendientes primero; luego de la más reciente a la más antigua.
+    queryset = PostulacionVoluntariado.objects.all().order_by(
+        orden_valor_primero('estado', 'PENDIENTE'), '-fecha_postulacion', '-id',
+    )
     serializer_class = PostulacionVoluntariadoSerializer
     permission_classes = [PermisoVoluntariado]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -107,18 +117,18 @@ class PostulacionVoluntariadoViewSet(viewsets.ModelViewSet):
 
 
 class TiposEventosViewSet(viewsets.ModelViewSet):
-    queryset = TiposEventos.objects.all()
+    queryset = TiposEventos.objects.all().order_by('nombre', 'id_tipo_evento')
     serializer_class = TiposEventosSerializer
     permission_classes = [PermisoVoluntariado]
 
 
 class EventosViewSet(viewsets.ModelViewSet):
-    queryset = Eventos.objects.all()
+    queryset = Eventos.objects.all().order_by(F('fecha').desc(nulls_last=True), '-id_evento')
     serializer_class = EventosSerializer
     permission_classes = [PermisoVoluntariado]
 
 
 class VoluntarioEventoViewSet(viewsets.ModelViewSet):
-    queryset = VoluntarioEvento.objects.all()
+    queryset = VoluntarioEvento.objects.all().order_by('-fecha', '-id_voluntario_evento')
     serializer_class = VoluntarioEventoSerializer
     permission_classes = [PermisoVoluntariado]

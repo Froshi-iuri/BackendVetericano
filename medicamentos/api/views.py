@@ -20,6 +20,8 @@ from .serializers import (
     AdministracionMedicamentoSerializer,
     TratamientoMedicamentosSerializer,
 )
+from django.db.models import F
+from vetericano.paginacion import PaginacionOpcional
 
 
 class PermisoMedicamentosCatalogo(BasePermission):
@@ -62,9 +64,10 @@ class PermisoTratamientoMedicamento(BasePermission):
 
 
 class MedicamentoViewSet(viewsets.ModelViewSet):
-    queryset = Medicamento.objects.all()
+    queryset = Medicamento.objects.all().order_by('nombre', 'id')
     serializer_class = MedicamentoSerializer
     permission_classes = [PermisoMedicamentosCatalogo]
+    pagination_class = PaginacionOpcional
 
 
 class MedicamentosViewSet(viewsets.ModelViewSet):
@@ -77,7 +80,7 @@ class MedicamentosViewSet(viewsets.ModelViewSet):
       - ?tipo=valor        -> filtra por tipo (sin distinguir mayúsculas)
       - ?ordering=nombre   -> ordena (prefijo '-' para descendente)
     """
-    queryset = Medicamentos.objects.all()
+    queryset = Medicamentos.objects.all().order_by('nombre', 'id_medicamento')  # ?ordering= lo reemplaza
     serializer_class = MedicamentosSerializer
     permission_classes = [PermisoMedicamentosCatalogo]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -104,12 +107,15 @@ class MedicamentosViewSet(viewsets.ModelViewSet):
 
 
 class AdministracionMedicamentoViewSet(viewsets.ModelViewSet):
-    queryset = AdministracionMedicamento.objects.all()
+    queryset = AdministracionMedicamento.objects.all().order_by('-fecha_hora', '-id_administracion')
     serializer_class = AdministracionMedicamentoSerializer
     permission_classes = [PermisoTratamientoMedicamento]
 
 
 class TratamientoMedicamentosViewSet(viewsets.ModelViewSet):
-    queryset = TratamientoMedicamentos.objects.all()
+    queryset = TratamientoMedicamentos.objects.all().order_by(
+        F('fecha_aplicacion').desc(nulls_last=True), F('hora_administrada').desc(nulls_last=True),
+        '-id_tratamiento_medicamento',
+    )
     serializer_class = TratamientoMedicamentosSerializer
     permission_classes = [PermisoTratamientoMedicamento]

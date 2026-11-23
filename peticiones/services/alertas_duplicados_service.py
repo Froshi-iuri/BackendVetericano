@@ -22,6 +22,8 @@ from django.db import IntegrityError, connection, transaction
 from django.db.models import Count, Q, QuerySet
 from django.utils import timezone
 
+from vetericano.ordenamiento import orden_valor_primero
+
 from peticiones.models import (
     EstadoPeticiones,
     HistorialPeticiones,
@@ -1926,7 +1928,11 @@ def listar_alertas_duplicados(
         pid = _extraer_id_peticion(id_peticion, nombre_campo='id_peticion')
         qs = qs.filter(Q(peticion_menor_id=pid) | Q(peticion_mayor_id=pid))
 
-    return qs.order_by('-score_combinado', '-fecha_creacion', '-id_alerta')
+    # Pendientes de revisión primero; luego mayor similitud y lo más reciente.
+    return qs.order_by(
+        orden_valor_primero('estado_revision', PeticionPosibleDuplicado.ESTADO_PENDIENTE),
+        '-score_combinado', '-fecha_creacion', '-id_alerta',
+    )
 
 
 def obtener_resumen_alertas_duplicados(*, id_peticion: int | None = None) -> dict[str, int]:

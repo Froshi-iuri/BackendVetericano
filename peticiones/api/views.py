@@ -33,6 +33,8 @@ from peticiones.services.alertas_duplicados_service import (
     es_peticion_duplicada,
 )
 from inventario.api.kit_views import KitErrorHandlingMixin
+from vetericano.paginacion import PaginacionOpcional
+from vetericano.ordenamiento import ordenar_peticiones
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ def _normalizar_texto(texto):
 
 
 class ListarTiposPeticionView(generics.ListAPIView):
-    queryset = TipoPeticion.objects.filter(activo=True)
+    queryset = TipoPeticion.objects.filter(activo=True).order_by('nombre', 'id_tipo')
     serializer_class = TiposPeticionSerializer
     permission_classes = [IsAuthenticated]
 
@@ -58,6 +60,7 @@ class ListarPeticionesView(generics.ListAPIView):
     """
     serializer_class = ListarPeticionesSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         user = self.request.user
@@ -71,7 +74,7 @@ class ListarPeticionesView(generics.ListAPIView):
             # Peticionario: solo ve lo que creó
             queryset = queryset.filter(responsable=user)
             
-        return queryset.order_by('-fecha')
+        return ordenar_peticiones(queryset)
 
 class IniciarPeticionView(generics.CreateAPIView):
     serializer_class = IniciarPeticionSerializer
@@ -152,7 +155,7 @@ class FuncionariosVisitaView(APIView):
         funcionarios = Usuarios.objects.filter(
             id_rol__id_rol__in=ROLES_PERMITIDOS,
             activo=True
-        ).select_related('id_rol').order_by('id_rol__id_rol', 'nombre')
+        ).select_related('id_rol').order_by('id_rol__id_rol', 'nombre', 'apellido', 'id_usuario')
 
         data = [
             {
@@ -306,6 +309,7 @@ class ListarSeguimientoPeticionesVisitaView(generics.ListAPIView):
     """
     serializer_class = ListarSeguimientoPeticionesVisitaSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         user = self.request.user
@@ -856,7 +860,7 @@ class NotificacionesJuridicoView(APIView):
         queryset = NotificacionJuridico.objects.select_related('id_peticion').all()
         if not incluir_todas:
             queryset = queryset.filter(leida=False)
-        queryset = queryset.order_by('-fecha_creacion')
+        queryset = queryset.order_by('-fecha_creacion', '-id_notificacion')
         serializer = NotificacionJuridicoSerializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -917,7 +921,7 @@ class HistorialAsignacionesPorPeticionView(generics.ListAPIView):
         id_peticion = self.kwargs.get('id_peticion')
         return HistorialAsignacionPeticion.objects.filter(
             id_peticion_id=id_peticion
-        ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha')
+        ).select_related('veterinario_anterior', 'veterinario_nuevo', 'asignado_por').order_by('-fecha', '-id_historial')
 
 
 

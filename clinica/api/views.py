@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from users.api.permissions import PermisoClinica
+from vetericano.paginacion import PaginacionOpcional
 from clinica.models import (
     HistoriaClinica,
     Consulta,
@@ -50,9 +51,10 @@ class RestrictDeleteProtectionMixin:
 
 
 class HistoriaClinicaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
-    queryset = HistoriaClinica.objects.all()
+    queryset = HistoriaClinica.objects.all().order_by('-fecha_apertura', '-id_historia')
     serializer_class = HistoriaClinicaSerializer
     permission_classes = [PermisoClinica]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -66,9 +68,10 @@ class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
     queryset = Consulta.objects.all()
     serializer_class = ConsultaSerializer
     permission_classes = [PermisoClinica]
+    pagination_class = PaginacionOpcional
 
     def get_queryset(self):
-        queryset = super().get_queryset().order_by('-fecha_hora')
+        queryset = super().get_queryset().order_by('-fecha_hora', '-id_consulta')
         id_animal = self.request.query_params.get('id_animal')
         if id_animal:
             queryset = queryset.filter(id_historia__id_animal_id=id_animal)
@@ -99,37 +102,37 @@ class ConsultaViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
 
 
 class HospitalizacionSeresSintientesViewSet(viewsets.ModelViewSet):
-    queryset = HospitalizacionSeresSintientes.objects.all()
+    queryset = HospitalizacionSeresSintientes.objects.all().order_by('-fecha_ingreso', '-id_hospitalizacion')
     serializer_class = HospitalizacionSeresSintientesSerializer
     permission_classes = [PermisoClinica]
 
 
 class TratamientosViewSet(RestrictDeleteProtectionMixin, viewsets.ModelViewSet):
-    queryset = Tratamientos.objects.all()
+    queryset = Tratamientos.objects.all().order_by('-id_tratamiento')
     serializer_class = TratamientosSerializer
     permission_classes = [PermisoClinica]
 
 
 class DiagnosticoViewSet(viewsets.ModelViewSet):
-    queryset = Diagnostico.objects.all()
+    queryset = Diagnostico.objects.all().order_by('-id_diagnostico')
     serializer_class = DiagnosticoSerializer
     permission_classes = [PermisoClinica]
 
 
 class SeguimientosClinicosViewSet(viewsets.ModelViewSet):
-    queryset = SeguimientosClinicos.objects.all()
+    queryset = SeguimientosClinicos.objects.all().order_by('-fecha', '-id_seguimiento')
     serializer_class = SeguimientosClinicosSerializer
     permission_classes = [PermisoClinica]
 
 
 class DiagnosticoPatologiaViewSet(viewsets.ModelViewSet):
-    queryset = DiagnosticoPatologia.objects.all()
+    queryset = DiagnosticoPatologia.objects.all().order_by('-id_diagnostico_patologia')
     serializer_class = DiagnosticoPatologiaSerializer
     permission_classes = [PermisoClinica]
 
 
 class SeguimientoHospitalarioViewSet(viewsets.ModelViewSet):
-    queryset = SeguimientoHospitalario.objects.all()
+    queryset = SeguimientoHospitalario.objects.all().order_by('-fecha', '-id_seguimiento_hosp')
     serializer_class = SeguimientoHospitalarioSerializer
     permission_classes = [PermisoClinica]
 
@@ -378,7 +381,7 @@ class ExpedienteCompletoAPIView(KitErrorHandlingMixin, APIView):
                 }
 
             # Última Consulta registrada
-            consultas = list(hc.consulta_set.all().order_by('-fecha_hora'))
+            consultas = list(hc.consulta_set.all().order_by('-fecha_hora', '-id_consulta'))
             ultima_consulta_data = None
             if consultas:
                 ult = consultas[0]
