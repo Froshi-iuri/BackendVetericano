@@ -15,7 +15,12 @@ from peticiones.utils import (
     obtener_multimedia_acta,
     detectar_tipo_archivo,
 )
-from peticiones.services.foto_autorizada_service import registrar_fotos_autorizadas
+from peticiones.services.foto_autorizada_service import (
+    habilitar_fotos_por_politica_sistema,
+    registrar_fotos_autorizadas,
+)
+
+_CAMPO_NO_ENVIADO = object()
 from animales.models import Animal, Responsables
 from inventario.api.kit_serializers import CampoPassthroughJSONField
 
@@ -73,7 +78,7 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
         latitud = validated_data.pop('latitud', None)
         longitud = validated_data.pop('longitud', None)
         fotos_input = validated_data.pop('fotos', [])
-        fotos_autorizadas_input = validated_data.pop('fotos_autorizadas_duplicados', None)
+        fotos_autorizadas_input = validated_data.pop('fotos_autorizadas_duplicados', _CAMPO_NO_ENVIADO)
         foto_input = validated_data.get('foto', None)
 
         # 1. Si viene algún dato de mapa/dirección, creamos el registro en Ubicaciones
@@ -126,13 +131,22 @@ class IniciarPeticionSerializer(serializers.ModelSerializer):
                 descripcion=f"Evidencia #{idx} de la petición"
             )
 
-        # 5. Registrar autorización expresa de fotos para detector ciudadano (no bloqueante)
-        registrar_fotos_autorizadas(
-            peticion=peticion,
-            autorizado_por=peticion.responsable,
-            urls_autorizadas=fotos_autorizadas_input,
-            urls_procesadas=urls_procesadas,
-        )
+        # 5. Habilitación de fotos para detector ciudadano (no bloqueante)
+        # - Si el cliente envió `fotos_autorizadas_duplicados` (lista, [] o null), respeta el opt-in/opt-out explícito.
+        # - Si omitió el campo (app sin casilla), solo habilita si DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO=True.
+        if fotos_autorizadas_input is _CAMPO_NO_ENVIADO:
+            habilitar_fotos_por_politica_sistema(
+                peticion=peticion,
+                autorizado_por=peticion.responsable,
+                urls_procesadas=urls_procesadas,
+            )
+        else:
+            registrar_fotos_autorizadas(
+                peticion=peticion,
+                autorizado_por=peticion.responsable,
+                urls_autorizadas=fotos_autorizadas_input,
+                urls_procesadas=urls_procesadas,
+            )
 
         if tras_crear_en_transaccion is not None:
             tras_crear_en_transaccion(peticion)
@@ -2055,5 +2069,61 @@ class ResolverAlertaDuplicadoSerializer(serializers.Serializer):
             observacion_limpia = observacion.strip()
             attrs['observacion'] = observacion_limpia or None
         return attrs
+
+
+class ModerarFotoDuplicadoSerializer(serializers.Serializer):
+    """Valida solicitudes administrativas de ocultar o habilitar miniaturas de una petición."""
+
+    accion = serializers.ChoiceField(
+        choices=(('ocultar', 'Ocultar'), ('habilitar', 'Habilitar')),
+        required=True,
+    )
+    ruta_archivo = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+    motivo = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+
+    def to_internal_value(self, data):
+        if hasattr(data, 'copy'):
+            normalizado = data.copy()
+        elif isinstance(data, dict):
+            normalizado = dict(data)
+        else:
+            return super().to_internal_value(data)
+
+        accion = normalizado.get('accion')
+        if isinstance(accion, str):
+            normalizado['accion'] = accion.strip().lower()
+        return super().to_internal_value(normalizado)
+
+
+class RevocarFotoDuplicadoSerializer(serializers.Serializer):
+    """Valida la revocación ciudadana de una o todas las miniaturas de su propia petición."""
+
+    ruta_archivo = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+    motivo = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+
 
 

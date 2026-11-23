@@ -262,6 +262,9 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'duplicados_ciudadano_rafaga': '10/min',
         'duplicados_ciudadano_sostenido': '60/hour',
+        'duplicados_ciudadano_miniatura': '30/min',
+        'duplicados_ciudadano_miniatura_sostenido': '180/hour',
+        'duplicados_ciudadano_moderacion': '30/min',
     },
 }
 
@@ -413,6 +416,25 @@ DUPLICADOS_CIUDADANO_FOTO_ACTIVA = _leer_env_bool(
     'DUPLICADOS_CIUDADANO_FOTO_ACTIVA',
     default=True,
 )
+DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO = _leer_env_bool(
+    'DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO',
+    default=False,
+)
+try:
+    DUPLICADOS_CIUDADANO_MINIATURA_TTL_SEGUNDOS = max(
+        30,
+        min(int(os.environ.get('DUPLICADOS_CIUDADANO_MINIATURA_TTL_SEGUNDOS', '300')), 900),
+    )
+except (TypeError, ValueError):
+    DUPLICADOS_CIUDADANO_MINIATURA_TTL_SEGUNDOS = 300
+DUPLICADOS_CIUDADANO_PUBLIC_BASE_URL = os.environ.get(
+    'DUPLICADOS_CIUDADANO_PUBLIC_BASE_URL',
+    '',
+).strip().rstrip('/')
+DUPLICADOS_MINIATURA_TOKEN_SECRET = os.environ.get(
+    'DUPLICADOS_MINIATURA_TOKEN_SECRET',
+    '',
+).strip()
 
 
 def _leer_env_float_rango(

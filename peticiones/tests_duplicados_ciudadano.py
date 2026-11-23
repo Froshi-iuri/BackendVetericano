@@ -424,23 +424,32 @@ class DetectarDuplicadosCiudadanoFotoTestCase(SimpleTestCase):
                 self.assertIsNone(c['foto'])
                 self.assertFalse(c['tiene_fotografia'])
 
-        # Candidato con fallback válido autorizado en `fotos` -> miniatura derivada
+        # Candidato con fallback válido autorizado en `fotos` -> URL proxy cifrada sin exponer Cloudinary
         mock_detector.return_value = _respuesta_interna([candidato_con_fallback])
         request2 = self.factory.post(self.url, self.payload, format='json')
         force_authenticate(request2, user=self.peticionario)
         resp_valida = self.view(request2)
         self.assertEqual(resp_valida.status_code, status.HTTP_200_OK)
         ultimo = resp_valida.data['posibles_duplicados'][0]
-        esperada = (
-            'https://res.cloudinary.com/vet/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700/perro_valido.jpg'
-        )
-        self.assertEqual(ultimo['foto'], esperada)
+        self.assertTrue(ultimo['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertTrue(ultimo['tiene_fotografia'])
         serializado = json.dumps(resp_valida.data)
         self.assertNotIn(url_valida, serializado)
+        self.assertNotIn('res.cloudinary.com', serializado)
+        self.assertNotIn('perro_valido.jpg', serializado)
         self.assertNotIn('id_peticion', serializado)
-        self.assertNotIn('999', serializado)
+
+        from urllib.parse import parse_qs, urlparse
+        from peticiones.services.duplicados_ciudadano_service import (
+            _hash_url_miniatura,
+            decodificar_token_miniatura_ciudadano,
+        )
+        token = parse_qs(urlparse(ultimo['foto']).query)['t'][0]
+        self.assertNotIn('999', token)
+        datos_tok = decodificar_token_miniatura_ciudadano(token)
+        self.assertEqual(datos_tok['p'], 999)
+        self.assertEqual(datos_tok['h'], _hash_url_miniatura(url_valida))
+        self.assertEqual(datos_tok['u'], self.peticionario.id_usuario)
 
     @patch('peticiones.services.duplicados_ciudadano_service.obtener_urls_autorizadas', return_value={})
     @patch('peticiones.services.duplicados_ciudadano_service.detectar_duplicados_desde_solicitud')
@@ -567,7 +576,9 @@ class DetectarDuplicadosCiudadanoFotoTestCase(SimpleTestCase):
                 ('no_disponible', 'media', False),
             ],
         )
-        self.assertEqual(res[0]['foto'], esperada_3)
+        self.assertTrue(res[0]['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
+        self.assertNotIn('res.cloudinary.com', json.dumps(response.data))
+        self.assertNotIn(url_aut_3, json.dumps(response.data))
         self.assertIsNone(res[1]['foto'])
         self.assertIsNone(res[2]['foto'])
         self.assertIsNone(res[3]['foto'])
@@ -654,3 +665,183 @@ class DetectarDuplicadosCiudadanoThrottleSinEscriturasYCompatTestCase(SimpleTest
         self.assertEqual(url_interno, '/api/peticiones/detectar-duplicados/')
         self.assertEqual(resolve(url_ciudadano).func.view_class, DetectarDuplicadosCiudadanoView)
         self.assertEqual(resolve(url_interno).func.view_class, DetectarDuplicadosPeticionView)
+
+
+class MiniaturaProxySeguridadTestCase(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+        self.factory = APIRequestFactory()
+        from peticiones.api.duplicados_ciudadano import (
+            MiniaturaDuplicadoCiudadanoView,
+            ModerarFotoDuplicadoView,
+            RevocarFotoDuplicadoView,
+        )
+        self.miniatura_view = MiniaturaDuplicadoCiudadanoView.as_view()
+        self.moderar_view = ModerarFotoDuplicadoView.as_view()
+        self.revocar_view = RevocarFotoDuplicadoView.as_view()
+        self.url_miniatura = '/api/peticiones/duplicados/miniatura/'
+        self.url_orig = 'https://res.cloudinary.com/vet/image/upload/v1700000/mascota_privada.jpg'
+        self.url_blur_esperada = (
+            'https://res.cloudinary.com/vet/image/upload/'
+            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000/mascota_privada.jpg'
+        )
+
+    def tearDown(self):
+        cache.clear()
+
+    @staticmethod
+    def _crear_jpeg_con_exif(ancho=800, alto=600) -> bytes:
+        import io
+        from PIL import Image
+
+        img = Image.new('RGB', (ancho, alto), color=(180, 120, 60))
+        exif = Image.Exif()
+        exif[271] = 'CamaraPersonalXYZ'  # Make
+        exif[272] = 'TelefonoModelo99'   # Model
+        exif[305] = 'GPS-Tracker-App'    # Software
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', exif=exif.tobytes())
+        return buf.getvalue()
+
+    def test_token_ausente_manipulado_o_expirado_retorna_404_sin_fugas(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from peticiones.services.duplicados_ciudadano_service import generar_token_miniatura_ciudadano
+
+        tok_valido = generar_token_miniatura_ciudadano(
+            id_peticion=501,
+            url_imagen=self.url_orig,
+            id_usuario=42,
+        )
+        tok_adulterado = tok_valido[:-4] + ('ABCD' if tok_valido[-4:] != 'ABCD' else 'WXYZ')
+
+        for qs in ('', '?t=', '?t=invalido', f'?t={tok_adulterado}', '?t=' + ('A' * 600)):
+            with self.subTest(qs=qs[:32]):
+                cache.clear()
+                req = self.factory.get(f'{self.url_miniatura}{qs}')
+                resp = self.miniatura_view(req)
+                self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+                self.assertEqual(resp.content, b'')
+                self.assertEqual(resp['Cache-Control'], 'private, no-store, max-age=0')
+
+        # Expirado por TTL
+        with override_settings(DUPLICADOS_CIUDADANO_MINIATURA_TTL_SEGUNDOS=30):
+            ahora = timezone.now()
+            with patch('cryptography.fernet.time.time', return_value=ahora.timestamp()):
+                tok_expirado = generar_token_miniatura_ciudadano(
+                    id_peticion=501,
+                    url_imagen=self.url_orig,
+                    id_usuario=42,
+                )
+            with patch('cryptography.fernet.time.time', return_value=(ahora + timedelta(seconds=60)).timestamp()):
+                req_exp = self.factory.get(f'{self.url_miniatura}?t={tok_expirado}')
+                resp_exp = self.miniatura_view(req_exp)
+                self.assertEqual(resp_exp.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('peticiones.services.duplicados_ciudadano_service._descargar_bytes_url_validada')
+    @patch('peticiones.services.duplicados_ciudadano_service.url_foto_esta_habilitada_para_peticion', return_value=True)
+    @patch('peticiones.services.duplicados_ciudadano_service.obtener_urls_reales_peticion')
+    @patch('users.models.Usuarios.objects')
+    def test_proxy_elimina_exif_solo_descarga_blur_y_respeta_revocacion_en_vivo(
+        self,
+        mock_usuarios_mgr,
+        mock_urls_reales,
+        mock_habilitada,
+        mock_descarga,
+    ):
+        import io
+        from PIL import Image
+        from peticiones.services.duplicados_ciudadano_service import generar_token_miniatura_ciudadano
+
+        mock_usuarios_mgr.filter.return_value.exists.return_value = True
+        mock_urls_reales.return_value = [self.url_orig]
+        mock_descarga.return_value = self._crear_jpeg_con_exif(800, 600)
+
+        tok = generar_token_miniatura_ciudadano(
+            id_peticion=777,
+            url_imagen=self.url_orig,
+            id_usuario=42,
+        )
+
+        req_ok = self.factory.get(f'{self.url_miniatura}?t={tok}')
+        resp_ok = self.miniatura_view(req_ok)
+        self.assertEqual(resp_ok.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_ok['Content-Type'], 'image/jpeg')
+        self.assertEqual(resp_ok['Cache-Control'], 'private, no-store, max-age=0')
+        self.assertEqual(resp_ok['X-Content-Type-Options'], 'nosniff')
+        # Verifica que jamás se descargó la URL original sin e_blur_faces
+        mock_descarga.assert_called_once()
+        self.assertEqual(mock_descarga.call_args.args[0], self.url_blur_esperada)
+        self.assertNotIn(self.url_orig, str(dict(resp_ok.headers)))
+
+        # Verifica redimensión máxima 480x360 y 0 metadatos EXIF
+        with Image.open(io.BytesIO(resp_ok.content)) as img_res:
+            self.assertEqual(img_res.format, 'JPEG')
+            self.assertLessEqual(img_res.size[0], 480)
+            self.assertLessEqual(img_res.size[1], 360)
+            self.assertEqual(len(img_res.getexif()), 0)
+
+        # Si el titular revoca o se modera tras emitir el token -> el mismo token devuelve 404 inmediato
+        mock_habilitada.return_value = False
+        mock_descarga.reset_mock()
+        resp_rev = self.miniatura_view(self.factory.get(f'{self.url_miniatura}?t={tok}'))
+        self.assertEqual(resp_rev.status_code, status.HTTP_404_NOT_FOUND)
+        mock_descarga.assert_not_called()
+
+        # Si el usuario consultante fue desactivado tras obtener el token -> 404
+        mock_habilitada.return_value = True
+        mock_usuarios_mgr.filter.return_value.exists.return_value = False
+        resp_inactivo = self.miniatura_view(self.factory.get(f'{self.url_miniatura}?t={tok}'))
+        self.assertEqual(resp_inactivo.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('peticiones.services.duplicados_ciudadano_service._descargar_bytes_url_validada', return_value=None)
+    @patch('peticiones.services.duplicados_ciudadano_service.url_foto_esta_habilitada_para_peticion', return_value=True)
+    @patch('peticiones.services.duplicados_ciudadano_service.obtener_urls_reales_peticion')
+    @patch('users.models.Usuarios.objects')
+    def test_proxy_fallo_cloudinary_retorna_404_sin_caer_a_original(
+        self,
+        mock_usuarios_mgr,
+        mock_urls_reales,
+        _mock_hab,
+        mock_descarga,
+    ):
+        from peticiones.services.duplicados_ciudadano_service import generar_token_miniatura_ciudadano
+
+        mock_usuarios_mgr.filter.return_value.exists.return_value = True
+        mock_urls_reales.return_value = [self.url_orig]
+        tok = generar_token_miniatura_ciudadano(id_peticion=778, url_imagen=self.url_orig, id_usuario=42)
+
+        resp = self.miniatura_view(self.factory.get(f'{self.url_miniatura}?t={tok}'))
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        mock_descarga.assert_called_once()
+        self.assertEqual(mock_descarga.call_args.args[0], self.url_blur_esperada)
+
+    def test_proxy_throttling_y_permisos_endpoints_moderacion_revocacion(self):
+        from peticiones.api.duplicados_ciudadano import MiniaturaCiudadanoRafagaThrottle
+
+        with patch.dict(
+            MiniaturaCiudadanoRafagaThrottle.THROTTLE_RATES,
+            {'duplicados_ciudadano_miniatura': '2/min', 'duplicados_ciudadano_miniatura_sostenido': '180/hour'},
+        ):
+            for _ in range(2):
+                r = self.miniatura_view(self.factory.get(f'{self.url_miniatura}?t=bad'))
+                self.assertEqual(r.status_code, status.HTTP_404_NOT_FOUND)
+            r_429 = self.miniatura_view(self.factory.get(f'{self.url_miniatura}?t=bad'))
+            self.assertEqual(r_429.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Permisos de /moderar-foto/ y /revocar-foto/
+        req_anon_mod = self.factory.post('/api/peticiones/1/duplicados/moderar-foto/', {'accion': 'ocultar'}, format='json')
+        self.assertEqual(self.moderar_view(req_anon_mod, id_peticion=1).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        for rol_prohibido in (3, 4, 5):
+            req_mod = self.factory.post('/api/peticiones/1/duplicados/moderar-foto/', {'accion': 'ocultar'}, format='json')
+            force_authenticate(req_mod, user=_DummyUser(200 + rol_prohibido, rol_prohibido, True))
+            self.assertEqual(self.moderar_view(req_mod, id_peticion=1).status_code, status.HTTP_403_FORBIDDEN)
+
+        req_anon_rev = self.factory.post('/api/peticiones/1/duplicados/revocar-foto/', {}, format='json')
+        self.assertEqual(self.revocar_view(req_anon_rev, id_peticion=1).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        for rol_prohibido in (1, 2, 3, 5):
+            req_rev = self.factory.post('/api/peticiones/1/duplicados/revocar-foto/', {}, format='json')
+            force_authenticate(req_rev, user=_DummyUser(300 + rol_prohibido, rol_prohibido, True))
+            self.assertEqual(self.revocar_view(req_rev, id_peticion=1).status_code, status.HTTP_403_FORBIDDEN)

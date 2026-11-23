@@ -647,9 +647,23 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         self.assertEqual(resp_img.status_code, status.HTTP_200_OK)
         self.assertEqual(resp_img.data['total_candidatos'], 1)
         cand_img = resp_img.data['posibles_duplicados'][0]
-        self.assertEqual(cand_img['foto'], url_miniatura_esperada)
+        self.assertTrue(cand_img['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertTrue(cand_img['tiene_fotografia'])
-        self.assertNotIn(url_foto, resp_img.content.decode('utf-8'))
+        cuerpo_img = resp_img.content.decode('utf-8')
+        self.assertNotIn(url_foto, cuerpo_img)
+        self.assertNotIn('res.cloudinary.com', cuerpo_img)
+        self.assertNotIn('animal_test.jpg', cuerpo_img)
+
+        from urllib.parse import parse_qs, urlparse
+        from peticiones.services.duplicados_ciudadano_service import (
+            _hash_url_miniatura,
+            decodificar_token_miniatura_ciudadano,
+        )
+        token = parse_qs(urlparse(cand_img['foto']).query)['t'][0]
+        datos_tok = decodificar_token_miniatura_ciudadano(token)
+        self.assertEqual(datos_tok['p'], pet_img.id_peticion)
+        self.assertEqual(datos_tok['h'], _hash_url_miniatura(url_foto))
+        self.assertEqual(datos_tok['u'], self.ciudadano.id_usuario)
 
         self.assertEqual(resp_vid.status_code, status.HTTP_200_OK)
         self.assertEqual(resp_vid.data['total_candidatos'], 1)
@@ -732,14 +746,26 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         self.assertEqual(resp_b.status_code, status.HTTP_200_OK)
         self.assertEqual(resp_b.data['total_candidatos'], 1)
         cand = resp_b.data['posibles_duplicados'][0]
-        self.assertEqual(cand['foto'], url_miniatura_esperada)
+        self.assertTrue(cand['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertTrue(cand['tiene_fotografia'])
+
+        from urllib.parse import parse_qs, urlparse
+        from peticiones.services.duplicados_ciudadano_service import (
+            _hash_url_miniatura,
+            decodificar_token_miniatura_ciudadano,
+        )
+        token = parse_qs(urlparse(cand['foto']).query)['t'][0]
+        datos_tok = decodificar_token_miniatura_ciudadano(token)
+        self.assertEqual(datos_tok['p'], pet_id)
+        self.assertEqual(datos_tok['h'], _hash_url_miniatura(url_img_a))
+        self.assertEqual(datos_tok['u'], ciudadano_b.id_usuario)
 
         cuerpo_b = resp_b.content.decode('utf-8')
         self.assertNotIn(url_img_a, cuerpo_b)
+        self.assertNotIn('res.cloudinary.com', cuerpo_b)
+        self.assertNotIn('animal_a.jpg', cuerpo_b)
         self.assertNotIn(radicado_a, cuerpo_b)
         self.assertNotIn('id_peticion', cuerpo_b)
-        self.assertNotIn(str(pet_id), cuerpo_b)
 
         conteos_despues = {m.__name__: m.objects.count() for m in modelos_monitoreados}
         self.assertEqual(conteos_despues, conteos_antes)
@@ -807,7 +833,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
 
         primero, segundo = resp_orden.data['posibles_duplicados']
         self.assertTrue(primero['tiene_fotografia'])
-        self.assertEqual(primero['foto'], url_miniatura_orden)
+        self.assertTrue(primero['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertEqual(primero['cercania'], 'cerca')
 
         self.assertFalse(segundo['tiene_fotografia'])
@@ -817,6 +843,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         cuerpo_orden = resp_orden.content.decode('utf-8')
         self.assertNotIn(url_img_sin_aut, cuerpo_orden)
         self.assertNotIn(url_img_con_aut, cuerpo_orden)
+        self.assertNotIn('res.cloudinary.com', cuerpo_orden)
 
     def test_15_iniciar_sin_campo_y_con_null_regresion_claves_y_cero_autorizaciones(self):
         url_img_a = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/animal_a.jpg'
@@ -1032,13 +1059,24 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data['total_candidatos'], 1)
         cand = resp.data['posibles_duplicados'][0]
-        self.assertEqual(cand['foto'], miniatura_si)
+        self.assertTrue(cand['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertTrue(cand['tiene_fotografia'])
+
+        from urllib.parse import parse_qs, urlparse
+        from peticiones.services.duplicados_ciudadano_service import (
+            _hash_url_miniatura,
+            decodificar_token_miniatura_ciudadano,
+        )
+        token = parse_qs(urlparse(cand['foto']).query)['t'][0]
+        datos_tok = decodificar_token_miniatura_ciudadano(token)
+        self.assertEqual(datos_tok['p'], pet.id_peticion)
+        self.assertEqual(datos_tok['h'], _hash_url_miniatura(url_si_aut))
 
         cuerpo = resp.content.decode('utf-8')
         self.assertNotIn(url_no_aut, cuerpo)
         self.assertNotIn('no_autorizada.jpg', cuerpo)
         self.assertNotIn(url_si_aut, cuerpo)
+        self.assertNotIn('res.cloudinary.com', cuerpo)
 
     def test_20_fallo_al_guardar_autorizacion_no_aborta_peticion(self):
         url_img_a = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/animal_fail_safe.jpg'
@@ -1070,3 +1108,390 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
             PeticionFotoAutorizada.objects.filter(id_peticion_id=pet_id).count(),
             0,
         )
+
+    def test_21_proxy_miniatura_postgres_sin_exif_y_revocacion_invalida_token_previo(self):
+        import io
+        from PIL import Image
+        from urllib.parse import urlparse
+
+        url_img = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/pet_proxy_pg.jpg'
+        url_blur = (
+            'https://res.cloudinary.com/vet-test/image/upload/'
+            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000000/pet_proxy_pg.jpg'
+        )
+        ciudadano_b = self._crear_usuario(self.rol_ciudadano, 'Ciudadano B Proxy', 'ciud.b.proxy@local.test')
+
+        pet = self._crear_peticion(
+            radicado='RAD-PROXY-PG',
+            descripcion='Perro abandonado en el parque principal proxy postgres',
+            latitud=LAT_BASE,
+            longitud=LON_BASE,
+            foto=url_img,
+        )
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet,
+            ruta_archivo=url_img,
+            autorizado_por=self.ciudadano,
+            version_texto='v1',
+        )
+
+        # Ciudadano B obtiene URL temporal opaca desde detector ciudadano
+        client_b = self._cliente_jwt(ciudadano_b)
+        resp_det = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Perro abandonado en el parque principal proxy postgres',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        self.assertEqual(resp_det.status_code, status.HTTP_200_OK)
+        url_proxy = resp_det.data['posibles_duplicados'][0]['foto']
+        ruta_proxy = f"{urlparse(url_proxy).path}?{urlparse(url_proxy).query}"
+
+        # Construir imagen con EXIF sintético
+        img = Image.new('RGB', (700, 500), color=(90, 140, 200))
+        exif = Image.Exif()
+        exif[271] = 'DispositivoPrivado'
+        buf_exif = io.BytesIO()
+        img.save(buf_exif, format='JPEG', exif=exif.tobytes())
+        bytes_con_exif = buf_exif.getvalue()
+
+        # Glide descarga anónimamente (sin JWT) desde el proxy -> 200 JPEG limpio sin EXIF
+        anon_client = APIClient()
+        with patch(
+            'peticiones.services.duplicados_ciudadano_service._descargar_bytes_url_validada',
+            return_value=bytes_con_exif,
+        ) as mock_descarga:
+            resp_img = anon_client.get(ruta_proxy)
+
+        self.assertEqual(resp_img.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_img['Content-Type'], 'image/jpeg')
+        self.assertEqual(mock_descarga.call_args.args[0], url_blur)
+        with Image.open(io.BytesIO(resp_img.content)) as img_limpia:
+            self.assertEqual(img_limpia.format, 'JPEG')
+            self.assertLessEqual(img_limpia.size[0], 480)
+            self.assertLessEqual(img_limpia.size[1], 360)
+            self.assertEqual(len(img_limpia.getexif()), 0)
+
+        # Otro ciudadano NO puede revocar una petición ajena -> 403
+        resp_rev_ajeno = client_b.post(f'/api/peticiones/{pet.id_peticion}/duplicados/revocar-foto/', {}, format='json')
+        self.assertEqual(resp_rev_ajeno.status_code, status.HTTP_403_FORBIDDEN)
+
+        # El titular SÍ puede revocar -> el MISMO token previamente emitido pasa a responder 404
+        client_a = self._cliente_jwt(self.ciudadano)
+        resp_rev_ok = client_a.post(
+            f'/api/peticiones/{pet.id_peticion}/duplicados/revocar-foto/',
+            {'motivo': 'Retiro consentimiento'},
+            format='json',
+        )
+        self.assertEqual(resp_rev_ok.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_rev_ok.data['accion'], 'revocar')
+        self.assertTrue(
+            HistorialPeticiones.objects.filter(id_peticion=pet, tipo_cambio='REVOCACION_FOTO').exists()
+        )
+
+        resp_tras_revocar = anon_client.get(ruta_proxy)
+        self.assertEqual(resp_tras_revocar.status_code, status.HTTP_404_NOT_FOUND)
+
+        resp_nueva_consulta = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Perro abandonado en el parque principal proxy postgres',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        self.assertEqual(resp_nueva_consulta.status_code, status.HTTP_200_OK)
+        self.assertIsNone(resp_nueva_consulta.data['posibles_duplicados'][0]['foto'])
+        self.assertFalse(resp_nueva_consulta.data['posibles_duplicados'][0]['tiene_fotografia'])
+
+        # Jurídico NO puede re-habilitar una fotografía revocada expresamente por su titular -> 409
+        juridico = self._crear_usuario(self.rol_juridico, 'Juridico Rev', 'jur.rev@local.test')
+        resp_rehab = self._cliente_jwt(juridico).post(
+            f'/api/peticiones/{pet.id_peticion}/duplicados/moderar-foto/',
+            {'accion': 'habilitar'},
+            format='json',
+        )
+        self.assertEqual(resp_rehab.status_code, status.HTTP_409_CONFLICT)
+
+    def test_22_moderacion_juridico_y_exclusion_por_estado_o_duplicado_confirmado(self):
+        from urllib.parse import urlparse
+
+        url_img = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/pet_mod_pg.jpg'
+        ciudadano_b = self._crear_usuario(self.rol_ciudadano, 'Ciudadano B Mod', 'ciud.b.mod@local.test')
+        juridico = self._crear_usuario(self.rol_juridico, 'Juridico Mod', 'jur.mod@local.test')
+        client_a = self._cliente_jwt(self.ciudadano)
+        client_b = self._cliente_jwt(ciudadano_b)
+        client_j = self._cliente_jwt(juridico)
+
+        # Nueva petición sin campo de consentimiento bajo default fail-closed (False) -> foto privada al inicio
+        resp_init = client_a.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Canino sin casilla esperando moderacion para miniatura',
+                'latitud': LAT_BASE,
+                'longitud': LON_BASE,
+                'foto': url_img,
+                'fotos': [url_img],
+            },
+            format='json',
+        )
+        self.assertEqual(resp_init.status_code, status.HTTP_201_CREATED)
+        pet_id = resp_init.data['id_peticion']
+        self.assertEqual(PeticionFotoAutorizada.objects.filter(id_peticion_id=pet_id).count(), 0)
+
+        resp_antes_mod = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Canino sin casilla esperando moderacion para miniatura',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        self.assertEqual(resp_antes_mod.status_code, status.HTTP_200_OK)
+        self.assertIsNone(resp_antes_mod.data['posibles_duplicados'][0]['foto'])
+
+        # Jurídico habilita tras revisión -> ahora sí entrega URL proxy cifrada
+        resp_hab = client_j.post(
+            f'/api/peticiones/{pet_id}/duplicados/moderar-foto/',
+            {'accion': 'habilitar', 'motivo': 'Solo animal visible'},
+            format='json',
+        )
+        self.assertEqual(resp_hab.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_hab.data['total_fotos_habilitadas'], 1)
+        self.assertTrue(
+            HistorialPeticiones.objects.filter(id_peticion_id=pet_id, tipo_cambio='MODERACION_FOTO').exists()
+        )
+
+        resp_con_mod = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Canino sin casilla esperando moderacion para miniatura',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        url_proxy = resp_con_mod.data['posibles_duplicados'][0]['foto']
+        self.assertTrue(url_proxy.startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
+        ruta_proxy = f"{urlparse(url_proxy).path}?{urlparse(url_proxy).query}"
+
+        # Jurídico oculta la fotografía por moderación -> tanto el token previo como nuevas consultas ocultan foto
+        resp_ocu = client_j.post(
+            f'/api/peticiones/{pet_id}/duplicados/moderar-foto/',
+            {'accion': 'ocultar', 'motivo': 'Contiene dato sensible'},
+            format='json',
+        )
+        self.assertEqual(resp_ocu.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_ocu.data['total_fotos_habilitadas'], 0)
+        self.assertEqual(APIClient().get(ruta_proxy).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Re-habilitada de nuevo y luego marcada con estado Rechazada -> queda bloqueada por estado
+        self.assertEqual(
+            client_j.post(
+                f'/api/peticiones/{pet_id}/duplicados/moderar-foto/',
+                {'accion': 'habilitar'},
+                format='json',
+            ).status_code,
+            status.HTTP_200_OK,
+        )
+        estado_rechazada, _ = EstadoPeticiones.objects.get_or_create(
+            nombre='Rechazada',
+            defaults={'activo': True},
+        )
+        Peticiones.objects.filter(pk=pet_id).update(id_estado=estado_rechazada)
+        resp_rech = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Canino sin casilla esperando moderacion para miniatura',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        self.assertIsNone(resp_rech.data['posibles_duplicados'][0]['foto'])
+        self.assertFalse(resp_rech.data['posibles_duplicados'][0]['tiene_fotografia'])
+
+        # Petición en estado activo pero de responsable desactivado -> permanece privada
+        pet_inact = self._crear_peticion(
+            radicado='RAD-RESP-INACT',
+            descripcion='Felino herido en jardin comunal caso responsable desactivado',
+            latitud=LAT_LEJOS_5KM,
+            longitud=LON_LEJOS_5KM,
+            foto=url_img,
+        )
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet_inact,
+            ruta_archivo=url_img,
+            autorizado_por=self.ciudadano,
+            version_texto='v1',
+        )
+        Usuarios.objects.filter(pk=self.ciudadano.id_usuario).update(activo=False)
+        try:
+            resp_inact = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'descripcion': 'Felino herido en jardin comunal caso responsable desactivado',
+                    'latitud': LAT_LEJOS_5KM,
+                    'longitud': LON_LEJOS_5KM,
+                },
+                format='json',
+            )
+            self.assertIsNone(resp_inact.data['posibles_duplicados'][0]['foto'])
+            self.assertFalse(resp_inact.data['posibles_duplicados'][0]['tiene_fotografia'])
+        finally:
+            Usuarios.objects.filter(pk=self.ciudadano.id_usuario).update(activo=True)
+
+    @override_settings(DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO=True)
+    def test_23_politica_sistema_habilita_nuevas_peticiones_sin_casilla_pero_respeta_opt_out_y_roles(self):
+        url_img = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/politica_sis_auto.jpg'
+        url_video = 'https://res.cloudinary.com/vet-test/video/upload/v1700000000/clip_sis.mp4'
+        ciudadano_b = self._crear_usuario(self.rol_ciudadano, 'Ciudadano B Sis', 'ciud.b.sis@local.test')
+        juridico = self._crear_usuario(self.rol_juridico, 'Juridico Sis', 'jur.sis@local.test')
+
+        client_a = self._cliente_jwt(self.ciudadano)
+        client_b = self._cliente_jwt(ciudadano_b)
+
+        # 1) Peticionario nuevo sin campo `fotos_autorizadas_duplicados` -> habilita imagen bajo `politica_sis`, ignora video
+        resp_auto = client_a.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Felino herido reportado desde Android sin casilla autorizada',
+                'latitud': LAT_BASE,
+                'longitud': LON_BASE,
+                'foto': url_img,
+                'fotos': [url_img, url_video],
+            },
+            format='json',
+        )
+        self.assertEqual(resp_auto.status_code, status.HTTP_201_CREATED)
+        auts = list(PeticionFotoAutorizada.objects.filter(id_peticion_id=resp_auto.data['id_peticion']))
+        self.assertEqual(len(auts), 1)
+        self.assertEqual(auts[0].ruta_archivo, url_img)
+        self.assertEqual(auts[0].version_texto, 'politica_sis')
+
+        resp_det = client_b.post(
+            URL_CIUDADANO,
+            {
+                'descripcion': 'Felino herido reportado desde Android sin casilla autorizada',
+                'latitud': LAT_CERCA_30M,
+                'longitud': LON_CERCA_30M,
+            },
+            format='json',
+        )
+        self.assertEqual(resp_det.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_det.data['posibles_duplicados'][0]['tiene_fotografia'])
+        self.assertTrue(
+            resp_det.data['posibles_duplicados'][0]['foto'].startswith(
+                'http://testserver/api/peticiones/duplicados/miniatura/?t='
+            )
+        )
+
+        # 2) Cliente con opt-out explícito ([] / null) -> 0 filas
+        resp_opt_out = client_a.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Canino reportado con rechazo explicito en cliente previo',
+                'latitud': LAT_LEJOS_5KM,
+                'longitud': LON_LEJOS_5KM,
+                'foto': url_img,
+                'fotos_autorizadas_duplicados': [],
+            },
+            format='json',
+        )
+        self.assertEqual(resp_opt_out.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            PeticionFotoAutorizada.objects.filter(id_peticion_id=resp_opt_out.data['id_peticion']).count(),
+            0,
+        )
+
+        # 3) Petición creada por Jurídico sin casilla -> NO auto-habilita (permanece privada)
+        resp_jur = self._cliente_jwt(juridico).post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Reporte interno creado por personal juridico sin casilla',
+                'latitud': LAT_LEJOS_5KM,
+                'longitud': LON_LEJOS_5KM,
+                'foto': url_img,
+            },
+            format='json',
+        )
+        self.assertEqual(resp_jur.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            PeticionFotoAutorizada.objects.filter(id_peticion_id=resp_jur.data['id_peticion']).count(),
+            0,
+        )
+
+    @override_settings(
+        DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO=True,
+        DUPLICADOS_CIUDADANO_FOTO_ACTIVA=False,
+    )
+    def test_24_politica_sistema_no_habilita_si_foto_desactivada_o_estado_no_elegible_o_ajeno(self):
+        from peticiones.services.foto_autorizada_service import habilitar_fotos_por_politica_sistema
+
+        url_img = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/guard_priv.jpg'
+        client_a = self._cliente_jwt(self.ciudadano)
+
+        # Con DUPLICADOS_CIUDADANO_FOTO_ACTIVA=False no debe auto-registrar filas
+        resp = client_a.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Reporte con interruptor maestro de fotos apagado',
+                'latitud': LAT_BASE,
+                'longitud': LON_BASE,
+                'foto': url_img,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            PeticionFotoAutorizada.objects.filter(id_peticion_id=resp.data['id_peticion']).count(),
+            0,
+        )
+
+        # Con foto activa pero estado Borrador u otro ciudadano ajeno -> tampoco habilita
+        with override_settings(DUPLICADOS_CIUDADANO_FOTO_ACTIVA=True):
+            estado_borrador, _ = EstadoPeticiones.objects.get_or_create(
+                nombre='Borrador',
+                defaults={'activo': True},
+            )
+            pet_borrador = self._crear_peticion(
+                radicado='RAD-BORR-01',
+                descripcion='Peticion borrador no elegible para politica',
+                foto=url_img,
+            )
+            pet_borrador.id_estado = estado_borrador
+            pet_borrador.save(update_fields=['id_estado'])
+            self.assertEqual(
+                habilitar_fotos_por_politica_sistema(
+                    peticion=pet_borrador,
+                    autorizado_por=self.ciudadano,
+                    urls_procesadas=[url_img],
+                ),
+                [],
+            )
+
+            otro_ciudadano = self._crear_usuario(self.rol_ciudadano, 'Otro Ciud', 'otro.guard@local.test')
+            pet_ok = self._crear_peticion(
+                radicado='RAD-OK-AJENO',
+                descripcion='Peticion activa sin permiso de otro usuario',
+                foto=url_img,
+            )
+            self.assertEqual(
+                habilitar_fotos_por_politica_sistema(
+                    peticion=pet_ok,
+                    autorizado_por=otro_ciudadano,
+                    urls_procesadas=[url_img],
+                ),
+                [],
+            )
+            self.assertEqual(PeticionFotoAutorizada.objects.filter(id_peticion=pet_ok).count(), 0)

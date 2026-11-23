@@ -69,7 +69,7 @@ class EvidenciaSeguimientoVisitaAdmin(admin.ModelAdmin):
 
 
 
-from .models import HistorialAsignacionPeticion, NotificacionJuridico
+from .models import HistorialAsignacionPeticion, NotificacionJuridico, PeticionFotoAutorizada
 
 
 @admin.register(HistorialAsignacionPeticion)
@@ -84,3 +84,10 @@ class NotificacionJuridicoAdmin(admin.ModelAdmin):
     list_display = ('id_notificacion', 'id_peticion', 'tipo', 'leida', 'fecha_creacion')
     list_filter = ('tipo', 'leida', 'fecha_creacion')
     search_fields = ('mensaje',)
+
+
+@admin.register(PeticionFotoAutorizada)
+class PeticionFotoAutorizadaAdmin(admin.ModelAdmin):
+    list_display = ('id_autorizacion', 'id_peticion', 'version_texto', 'autorizado_por', 'fecha_autorizacion', 'revocada_en')
+    list_filter = ('version_texto', 'revocada_en')
+    search_fields = ('id_peticion__numero_radicado', 'ruta_archivo')

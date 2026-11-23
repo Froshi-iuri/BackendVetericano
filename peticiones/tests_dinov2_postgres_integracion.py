@@ -333,12 +333,26 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
             self.assertGreaterEqual(cand['porcentaje_similitud_visual'], 45.0)
             self.assertIn(cand['similitud_visual'], ('media', 'alta'))
             self.assertFalse(cand['es_certeza_identidad'])
-            self.assertEqual(cand['foto'], MINIATURA_MISMO_1)
+            self.assertTrue(cand['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
             self.assertTrue(cand['tiene_fotografia'])
+
+            from urllib.parse import parse_qs, urlparse
+            from peticiones.services.duplicados_ciudadano_service import (
+                _hash_url_miniatura,
+                decodificar_token_miniatura_ciudadano,
+            )
+            token = parse_qs(urlparse(cand['foto']).query)['t'][0]
+            datos_tok = decodificar_token_miniatura_ciudadano(token)
+            self.assertEqual(datos_tok['p'], pet_a.id_peticion)
+            self.assertEqual(datos_tok['h'], _hash_url_miniatura(URL_MISMO_1))
+            self.assertEqual(datos_tok['u'], self.peticionario_b.id_usuario)
 
             cuerpo = resp.content.decode('utf-8')
             self.assertNotIn(URL_MISMO_1, cuerpo)
+            self.assertNotIn('res.cloudinary.com', cuerpo)
+            self.assertNotIn('mismo_animal_1.png', cuerpo)
             self.assertNotIn(pet_a.numero_radicado, cuerpo)
+            self.assertNotIn('id_peticion', cuerpo)
             self.assertNotIn(str(pet_a.id_peticion), cuerpo)
 
             # Con DUPLICADOS_DINOV2_CACHE_BD_ACTIVA=False (default), no debe escribir en tabla 0007
@@ -804,6 +818,7 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
         self.assertEqual(c0['cercania'], 'muy_cerca')
         self.assertTrue(c0['tiene_fotografia'])
         self.assertIsNotNone(c0['foto'])
+        self.assertTrue(c0['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
         self.assertEqual(c1['cercania'], 'cerca')
         self.assertFalse(c1['tiene_fotografia'])
         self.assertIsNone(c1['foto'])
@@ -923,4 +938,276 @@ class PostgresDinov2IntegracionTests(VetericanoTransactionTestCase):
         resp_dash = client_j.get('/api/peticiones/dashboard-juridico/')
         self.assertEqual(resp_dash.status_code, status.HTTP_200_OK)
         self.assertLessEqual(resp_dash.data['peticiones']['pendientes'], total_antes - 1)
+
+        # Al confirmarse pet_30m como copia duplicada, incluso con foto autorizada previa no se expone al ciudadano
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet_30m,
+            ruta_archivo=URL_MISMO_2,
+            autorizado_por=self.peticionario_b,
+            version_texto='v1',
+        )
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ):
+            resp_post_conf = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'latitud': LAT_CERCA_30M,
+                    'longitud': LON_CERCA_30M,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
+        self.assertEqual(resp_post_conf.status_code, status.HTTP_200_OK)
+        # pet_0m sí expone miniatura; pet_30m (duplicada confirmada) permanece privada
+        con_foto = [c for c in resp_post_conf.data['posibles_duplicados'] if c['tiene_fotografia']]
+        sin_foto = [c for c in resp_post_conf.data['posibles_duplicados'] if not c['tiene_fotografia']]
+        self.assertEqual(len(con_foto), 1)
+        self.assertGreaterEqual(len(sin_foto), 1)
+
+    @override_settings(
+        DUPLICADOS_IA_DINOV2_ACTIVA=True,
+        DUPLICADOS_UMBRAL_DINOV2=0.45,
+        DUPLICADOS_RADIO_GPS_METROS=200.0,
+        DUPLICADOS_CIUDADANO_FOTO_ACTIVA=True,
+        DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO=True,
+    )
+    def test_08_dinov2_real_sin_casilla_proxy_sin_exif_y_revocacion_inmediata(self):
+        import io
+        from urllib.parse import urlparse
+        from PIL import Image
+
+        client_a = self._cliente_jwt(self.peticionario_a)
+        client_b = self._cliente_jwt(self.peticionario_b)
+
+        # 1) Ciudadano A radica sin casilla `fotos_autorizadas_duplicados` (política activa habilita imagen)
+        resp_iniciar = client_a.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Avistamiento canino sin casilla para flujo DINOv2 real',
+                'latitud': LAT_BASE,
+                'longitud': LON_BASE,
+                'foto': URL_MISMO_1,
+                'fotos': [URL_MISMO_1],
+            },
+            format='json',
+        )
+        self.assertEqual(resp_iniciar.status_code, status.HTTP_201_CREATED)
+        pet_id = resp_iniciar.data['id_peticion']
+
+        # 2) Ciudadano B reporta foto diferente del mismo animal cerca -> DINOv2 detecta >= 45% + entrega proxy
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ):
+            resp_det = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'latitud': LAT_CERCA_30M,
+                    'longitud': LON_CERCA_30M,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
+
+        self.assertEqual(resp_det.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_det.data['posible_duplicado'])
+        cand = resp_det.data['posibles_duplicados'][0]
+        self.assertTrue(cand['coincidencia_imagen'])
+        self.assertEqual(cand['metodo_imagen'], 'dinov2_small')
+        self.assertGreaterEqual(cand['porcentaje_similitud_visual'], 45.0)
+        self.assertTrue(cand['tiene_fotografia'])
+        url_proxy = cand['foto']
+        self.assertTrue(url_proxy.startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
+        self.assertNotIn('res.cloudinary.com', resp_det.content.decode('utf-8'))
+
+        # 3) Proxy entrega miniatura JPEG sin EXIF a partir de la foto real
+        ruta_proxy = f"{urlparse(url_proxy).path}?{urlparse(url_proxy).query}"
+        with Image.open(FOTO_MISMO_1) as img_orig:
+            exif = Image.Exif()
+            exif[271] = 'TelefonoTestEXIF'
+            buf = io.BytesIO()
+            img_orig.convert('RGB').save(buf, format='JPEG', exif=exif.tobytes())
+            bytes_blur = buf.getvalue()
+
+        with patch(
+            'peticiones.services.duplicados_ciudadano_service._descargar_bytes_url_validada',
+            return_value=bytes_blur,
+        ):
+            resp_proxy = APIClient().get(ruta_proxy)
+
+        self.assertEqual(resp_proxy.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_proxy['Content-Type'], 'image/jpeg')
+        with Image.open(io.BytesIO(resp_proxy.content)) as img_res:
+            self.assertEqual(img_res.format, 'JPEG')
+            self.assertLessEqual(img_res.size[0], 480)
+            self.assertLessEqual(img_res.size[1], 360)
+            self.assertEqual(len(img_res.getexif()), 0)
+
+        # 4) Ciudadano A revoca -> el token previo falla (404) pero DINOv2 sigue detectando texto/GPS/imagen
+        resp_rev = client_a.post(f'/api/peticiones/{pet_id}/duplicados/revocar-foto/', {}, format='json')
+        self.assertEqual(resp_rev.status_code, status.HTTP_200_OK)
+        self.assertEqual(APIClient().get(ruta_proxy).status_code, status.HTTP_404_NOT_FOUND)
+
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_simular_descarga_cloudinary_real,
+        ):
+            resp_det_post_rev = client_b.post(
+                URL_CIUDADANO,
+                {
+                    'latitud': LAT_CERCA_30M,
+                    'longitud': LON_CERCA_30M,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
+        self.assertEqual(resp_det_post_rev.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_det_post_rev.data['posible_duplicado'])
+        cand_rev = resp_det_post_rev.data['posibles_duplicados'][0]
+        self.assertTrue(cand_rev['coincidencia_imagen'])
+        self.assertGreaterEqual(cand_rev['porcentaje_similitud_visual'], 45.0)
+        self.assertIsNone(cand_rev['foto'])
+        self.assertFalse(cand_rev['tiene_fotografia'])
+
+    @override_settings(
+        DUPLICADOS_IA_DINOV2_ACTIVA=True,
+        DUPLICADOS_UMBRAL_DINOV2=0.45,
+        DUPLICADOS_RADIO_GPS_METROS=200.0,
+        DUPLICADOS_CIUDADANO_FOTO_ACTIVA=True,
+        DUPLICADOS_AUTO_HABILITAR_FOTOS_PETICIONARIO=True,
+    )
+    def test_09_e2e_dos_ciudadanos_dinov2_politica_automatica_y_peticiones_antiguas(self):
+        import io
+        from urllib.parse import urlparse
+        from PIL import Image
+
+        # A) Peticiones antiguas en la misma zona:
+        # 1) Antigua sin fila en PeticionFotoAutorizada -> debe seguir PRIVADA (ausencia != permiso)
+        self._crear_peticion(
+            radicado='RAD-OLD-NOAUT',
+            descripcion='Reporte antiguo sin registro de autorizacion',
+            latitud=LAT_BASE,
+            longitud=LON_BASE,
+            foto=URL_NO_AUTORIZADA,
+            responsable=self.peticionario_a,
+        )
+        # 2) Antigua con autorización revocada -> debe seguir PRIVADA
+        pet_old_rev = self._crear_peticion(
+            radicado='RAD-OLD-REV',
+            descripcion='Reporte antiguo con revocacion expresa',
+            latitud=LAT_BASE,
+            longitud=LON_BASE,
+            foto=URL_REVOCADA,
+            responsable=self.peticionario_a,
+        )
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet_old_rev,
+            ruta_archivo=URL_REVOCADA,
+            autorizado_por=self.peticionario_a,
+            version_texto='v1',
+            revocada_en=timezone.now(),
+        )
+        # 3) Antigua con autorización v1 vigente -> sigue visible vía proxy seguro
+        pet_old_v1 = self._crear_peticion(
+            radicado='RAD-OLD-V1',
+            descripcion='Reporte antiguo con autorizacion expresa vigente',
+            latitud=LAT_BASE,
+            longitud=LON_BASE,
+            foto=URL_MISMO_1,
+            responsable=self.peticionario_a,
+        )
+        PeticionFotoAutorizada.objects.create(
+            id_peticion=pet_old_v1,
+            ruta_archivo=URL_MISMO_1,
+            autorizado_por=self.peticionario_a,
+            version_texto='v1',
+        )
+
+        # B) Ciudadano 1 radica nueva petición con foto sin enviar casilla `fotos_autorizadas_duplicados`
+        client_1 = self._cliente_jwt(self.peticionario_a)
+        client_2 = self._cliente_jwt(self.peticionario_b)
+        url_nueva_1 = 'https://res.cloudinary.com/vet-test/image/upload/v1700000199/e2e_nueva_c1.png'
+
+        def _descarga_e2e(url: str, **kwargs):
+            if url == url_nueva_1:
+                return FOTO_MISMO_1.read_bytes()
+            return _simular_descarga_cloudinary_real(url, **kwargs)
+
+        resp_c1 = client_1.post(
+            URL_INICIAR,
+            {
+                'id_tipo': self.tipo.id_tipo,
+                'descripcion': 'Canino reportado por ciudadano uno sin casilla',
+                'latitud': LAT_BASE,
+                'longitud': LON_BASE,
+                'foto': url_nueva_1,
+                'fotos': [url_nueva_1],
+            },
+            format='json',
+        )
+        self.assertEqual(resp_c1.status_code, status.HTTP_201_CREATED)
+        pet_nueva_id = resp_c1.data['id_peticion']
+        reg_aut = PeticionFotoAutorizada.objects.filter(id_peticion_id=pet_nueva_id).first()
+        self.assertIsNotNone(reg_aut)
+        self.assertEqual(reg_aut.version_texto, 'politica_sis')
+
+        # C) Ciudadano 2 reporta un animal similar cerca -> DINOv2 real detecta coincidencia y devuelve miniatura
+        with patch(
+            'peticiones.services.imagen_hash_service.descargar_imagen_segura',
+            side_effect=_descarga_e2e,
+        ):
+            resp_c2 = client_2.post(
+                URL_CIUDADANO,
+                {
+                    'descripcion': 'Perro parecido visto en el mismo sector',
+                    'latitud': LAT_CERCA_30M,
+                    'longitud': LON_CERCA_30M,
+                    'foto': URL_MISMO_2,
+                },
+                format='json',
+            )
+
+        self.assertEqual(resp_c2.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp_c2.data['posible_duplicado'])
+        cuerpo = resp_c2.content.decode('utf-8')
+        self.assertNotIn('res.cloudinary.com', cuerpo)
+        self.assertNotIn(URL_NO_AUTORIZADA, cuerpo)
+        self.assertNotIn(URL_REVOCADA, cuerpo)
+        self.assertNotIn(url_nueva_1, cuerpo)
+
+        candidatos = resp_c2.data['posibles_duplicados']
+        con_foto = [c for c in candidatos if c['tiene_fotografia']]
+        sin_foto = [c for c in candidatos if not c['tiene_fotografia']]
+        # Exactamente las 2 habilitadas (nueva bajo `politica_sis` y antigua `v1`) muestran proxy URL;
+        # las 2 antiguas privadas/revocadas mantienen `foto=None` y `tiene_fotografia=False`
+        self.assertEqual(len(con_foto), 2)
+        self.assertEqual(len(sin_foto), 2)
+        for c in con_foto:
+            self.assertTrue(c['coincidencia_imagen'])
+            self.assertTrue(c['coincidencia_gps'])
+            self.assertGreaterEqual(c['porcentaje_similitud_visual'], 45.0)
+            self.assertTrue(c['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
+
+        # D) Descarga desde proxy para la nueva petición entrega JPEG limpio sin EXIF
+        with Image.open(FOTO_MISMO_1) as img_src:
+            buf = io.BytesIO()
+            img_src.convert('RGB').save(buf, format='JPEG')
+            blur_bytes = buf.getvalue()
+
+        for c in con_foto:
+            ruta_proxy = f"{urlparse(c['foto']).path}?{urlparse(c['foto']).query}"
+            with patch(
+                'peticiones.services.duplicados_ciudadano_service._descargar_bytes_url_validada',
+                return_value=blur_bytes,
+            ):
+                r_img = APIClient().get(ruta_proxy)
+            self.assertEqual(r_img.status_code, status.HTTP_200_OK)
+            self.assertEqual(r_img['Content-Type'], 'image/jpeg')
+            with Image.open(io.BytesIO(r_img.content)) as im:
+                self.assertEqual(len(im.getexif()), 0)
+                self.assertLessEqual(im.size[0], 480)
+                self.assertLessEqual(im.size[1], 360)
 

@@ -616,8 +616,21 @@ class Dinov2EndpointCiudadanoYJuridicoTests(SimpleTestCase):
         self.assertEqual(c0['porcentaje_similitud_visual'], 91.0)
         self.assertEqual(c0['similitud_visual'], 'alta')
         self.assertFalse(c0['es_certeza_identidad'])
-        self.assertIn('e_blur_faces/', c0['foto'])
+        self.assertTrue(c0['foto'].startswith('http://testserver/api/peticiones/duplicados/miniatura/?t='))
+        self.assertNotIn('res.cloudinary.com', c0['foto'])
+        self.assertNotIn('autorizada.jpg', c0['foto'])
         self.assertTrue(c0['tiene_fotografia'])
+
+        from urllib.parse import parse_qs, urlparse
+        from peticiones.services.duplicados_ciudadano_service import (
+            _hash_url_miniatura,
+            decodificar_token_miniatura_ciudadano,
+        )
+        token = parse_qs(urlparse(c0['foto']).query)['t'][0]
+        datos_tok = decodificar_token_miniatura_ciudadano(token)
+        self.assertEqual(datos_tok['p'], 10)
+        self.assertEqual(datos_tok['h'], _hash_url_miniatura(url_aut))
+        self.assertEqual(datos_tok['u'], self.ciudadano.id_usuario)
 
         self.assertEqual(c1['cercania'], 'cerca')
         self.assertEqual(c1['porcentaje_similitud_visual'], 50.65)

@@ -23,7 +23,12 @@ from .views import (
     CompararVisualAlertaDuplicadoView,
     PeticionAlertasDuplicadosView,
 )
-from .duplicados_ciudadano import DetectarDuplicadosCiudadanoView
+from .duplicados_ciudadano import (
+    DetectarDuplicadosCiudadanoView,
+    MiniaturaDuplicadoCiudadanoView,
+    ModerarFotoDuplicadoView,
+    RevocarFotoDuplicadoView,
+)
 
 urlpatterns = [
     # Rutas existentes
@@ -35,6 +40,11 @@ urlpatterns = [
         'detectar-duplicados-ciudadano/',
         DetectarDuplicadosCiudadanoView.as_view(),
         name='detectar-duplicados-ciudadano-peticion',
+    ),
+    path(
+        'duplicados/miniatura/',
+        MiniaturaDuplicadoCiudadanoView.as_view(),
+        name='miniatura-duplicado-ciudadano',
     ),
     path('duplicados/alertas/', AlertasDuplicadosListView.as_view(), name='alertas-duplicados-listar'),
     path('duplicados/alertas/<int:id_alerta>/', AlertaDuplicadoDetailView.as_view(), name='alerta-duplicado-detalle'),
@@ -67,6 +77,8 @@ urlpatterns = [
     path('<int:id_peticion>/historial-asignaciones/', HistorialAsignacionesPorPeticionView.as_view(), name='historial-asignaciones-peticion'),
     path('<int:id_peticion>/seguimientos/', ListarSeguimientosPorPeticionView.as_view(), name='seguimientos-por-peticion'),
     path('<int:id_peticion>/duplicados/', PeticionAlertasDuplicadosView.as_view(), name='peticion-alertas-duplicados'),
+    path('<int:id_peticion>/duplicados/moderar-foto/', ModerarFotoDuplicadoView.as_view(), name='peticion-moderar-foto-duplicado'),
+    path('<int:id_peticion>/duplicados/revocar-foto/', RevocarFotoDuplicadoView.as_view(), name='peticion-revocar-foto-duplicado'),
     path('<int:id_peticion>/', DetallePeticionView.as_view(), name='detalle-peticion'),
 ]
 
