@@ -20,7 +20,12 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m')
+# Clave SOLO para desarrollo local y pruebas: es pública (está en el repositorio), así que nunca
+# se acepta en Railway (ver validación más abajo, después de detectar el entorno).
+_SECRET_KEY_DESARROLLO = 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m'
+_SECRET_KEY_ENTORNO = os.environ.get('SECRET_KEY', '')
+# El valor se usa tal cual (sin strip): recortarlo cambiaría la clave efectiva e invalidaría los JWT.
+SECRET_KEY = _SECRET_KEY_ENTORNO if _SECRET_KEY_ENTORNO.strip() else _SECRET_KEY_DESARROLLO
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Seguro por defecto: sin la variable DEBUG -> False.
@@ -32,6 +37,31 @@ _EN_RAILWAY = bool(os.environ.get('RAILWAY_PROJECT_ID') or os.environ.get('RAILW
 DEBUG = _DEBUG_SOLICITADO and not _EN_RAILWAY
 if _DEBUG_SOLICITADO and _EN_RAILWAY:
     sys.stderr.write('[settings] DEBUG=True ignorado: en Railway DEBUG siempre es False.\n')
+
+
+def _secret_key_insegura(clave: str) -> bool:
+    """Mismos criterios que el check security.W009 de Django + rechazo explícito de la clave pública."""
+    return (
+        not clave
+        or clave == _SECRET_KEY_DESARROLLO
+        or clave.startswith('django-insecure-')
+        or len(clave) < 50
+        or len(set(clave)) < 5
+    )
+
+
+# Arranque seguro (fail-closed): en Railway (servicio web y servicio WebSocket, que cargan este mismo
+# archivo) el proceso NO arranca con una SECRET_KEY ausente, pública o débil, porque con ella cualquiera
+# podría firmar JWT válidos de cualquier usuario. EXIGIR_SECRET_KEY_SEGURA=True aplica la misma regla
+# fuera de Railway (p. ej. un staging propio). En desarrollo local y pruebas se usa la clave de desarrollo.
+if (_EN_RAILWAY or os.environ.get('EXIGIR_SECRET_KEY_SEGURA', '').strip().lower() in ('true', '1', 'yes', 'si', 'sí', 'on')) \
+        and _secret_key_insegura(SECRET_KEY):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        'SECRET_KEY ausente, pública o débil: el servicio no arranca. Define en Railway una SECRET_KEY '
+        'aleatoria de al menos 50 caracteres (la misma en el servicio web y en vetericano-ws) que no '
+        'empiece por "django-insecure-".'
+    )
 
 
 # ALLOWED_HOSTS = [
