@@ -1,5 +1,5 @@
 from rest_framework import viewsets
-from users.api.permissions import PermisoAdopciones
+from users.api.permissions import PermisoAdopciones, es_administrador
 from animales.models import Animal
 from .serializers import AdopcionAnimalSerializer
 from realtime import notificar
@@ -20,10 +20,13 @@ class AdopcionAnimalViewSet(viewsets.ModelViewSet):
     pagination_class = PaginacionOpcional
 
     def get_queryset(self):
-        # Si es una petición para listar, podemos devolver solo los disponibles, 
-        # o todos si el frontend admin quiere verlos todos.
-        # Por ahora dejamos activo=True. El frontend parece pedir todos.
-        return super().get_queryset()
+        # El Administrador gestiona el catálogo completo (incluye los "No Disponible").
+        # Para el público, ciudadanos y demás roles solo existen los animales disponibles
+        # para adopción: los pacientes clínicos no aparecen en la lista y su detalle da 404.
+        queryset = super().get_queryset()
+        if es_administrador(getattr(self.request, 'user', None)):
+            return queryset
+        return queryset.filter(disponible_adopcion=True)
 
     def _avisar_catalogo(self, accion, instancia):
         notificar.actualizacion_silenciosa(

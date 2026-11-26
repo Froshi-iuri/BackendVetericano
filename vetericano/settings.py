@@ -20,7 +20,12 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m')
+# Clave SOLO para desarrollo local y pruebas: es pública (está en el repositorio), así que nunca
+# se acepta en Railway (ver validación más abajo, después de detectar el entorno).
+_SECRET_KEY_DESARROLLO = 'django-insecure-k8kuso8-gb$syavcny^-$li&jsmfbvd89_8#8f_oq4kbhju*9m'
+_SECRET_KEY_ENTORNO = os.environ.get('SECRET_KEY', '')
+# El valor se usa tal cual (sin strip): recortarlo cambiaría la clave efectiva e invalidaría los JWT.
+SECRET_KEY = _SECRET_KEY_ENTORNO if _SECRET_KEY_ENTORNO.strip() else _SECRET_KEY_DESARROLLO
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Seguro por defecto: sin la variable DEBUG -> False.
@@ -32,6 +37,31 @@ _EN_RAILWAY = bool(os.environ.get('RAILWAY_PROJECT_ID') or os.environ.get('RAILW
 DEBUG = _DEBUG_SOLICITADO and not _EN_RAILWAY
 if _DEBUG_SOLICITADO and _EN_RAILWAY:
     sys.stderr.write('[settings] DEBUG=True ignorado: en Railway DEBUG siempre es False.\n')
+
+
+def _secret_key_insegura(clave: str) -> bool:
+    """Mismos criterios que el check security.W009 de Django + rechazo explícito de la clave pública."""
+    return (
+        not clave
+        or clave == _SECRET_KEY_DESARROLLO
+        or clave.startswith('django-insecure-')
+        or len(clave) < 50
+        or len(set(clave)) < 5
+    )
+
+
+# Arranque seguro (fail-closed): en Railway (servicio web y servicio WebSocket, que cargan este mismo
+# archivo) el proceso NO arranca con una SECRET_KEY ausente, pública o débil, porque con ella cualquiera
+# podría firmar JWT válidos de cualquier usuario. EXIGIR_SECRET_KEY_SEGURA=True aplica la misma regla
+# fuera de Railway (p. ej. un staging propio). En desarrollo local y pruebas se usa la clave de desarrollo.
+if (_EN_RAILWAY or os.environ.get('EXIGIR_SECRET_KEY_SEGURA', '').strip().lower() in ('true', '1', 'yes', 'si', 'sí', 'on')) \
+        and _secret_key_insegura(SECRET_KEY):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        'SECRET_KEY ausente, pública o débil: el servicio no arranca. Define en Railway una SECRET_KEY '
+        'aleatoria de al menos 50 caracteres (la misma en el servicio web y en vetericano-ws) que no '
+        'empiece por "django-insecure-".'
+    )
 
 
 # ALLOWED_HOSTS = [
@@ -318,6 +348,50 @@ else:
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         }
     }
+
+
+# ─── Recuperación de contraseña: almacenamiento compartido entre workers ───────────────
+# Los códigos de recuperación, sus intentos y sus límites NO pueden vivir en memoria por
+# proceso: gunicorn corre 2 workers y la confirmación puede caer en otro worker distinto al
+# que generó el código. Se usa un alias de caché propio ('recuperacion') sobre el Redis que
+# ya existe: REDIS_URL si se define; si no, CHANNEL_REDIS_URL (el Redis del servicio
+# WebSocket), en una base lógica aparte para no mezclarse con las claves 'asgi*' de Channels.
+# El caché 'default' (throttles de duplicados) no cambia. Se usa el backend Redis integrado
+# en Django (librería `redis`, ya presente en requirements.txt y requirements-ws.txt).
+def _url_redis_con_db(url: str, db: int) -> str:
+    """Devuelve la URL de Redis apuntando a la base lógica `db` (sustituye la ruta /N)."""
+    from urllib.parse import urlsplit, urlunsplit
+    partes = urlsplit(url)
+    return urlunsplit((partes.scheme, partes.netloc, f'/{db}', partes.query, partes.fragment))
+
+
+_RECUPERACION_REDIS_URL_BASE = (
+    os.environ.get('REDIS_URL', '').strip() or os.environ.get('CHANNEL_REDIS_URL', '').strip()
+)
+try:
+    _RECUPERACION_REDIS_DB = max(0, int(os.environ.get('RECUPERACION_REDIS_DB', '1')))
+except (TypeError, ValueError):
+    _RECUPERACION_REDIS_DB = 1
+
+if _RECUPERACION_REDIS_URL_BASE:
+    CACHES['recuperacion'] = {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': _url_redis_con_db(_RECUPERACION_REDIS_URL_BASE, _RECUPERACION_REDIS_DB),
+        'KEY_PREFIX': 'vetericano-recuperacion',
+        'TIMEOUT': 900,
+        # Si Redis no responde, la petición falla rápido (el servicio responde 503).
+        'OPTIONS': {'socket_connect_timeout': 2, 'socket_timeout': 2},
+    }
+else:
+    # Desarrollo local y pruebas (un solo proceso).
+    CACHES['recuperacion'] = {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'vetericano-recuperacion',
+    }
+RECUPERACION_CACHE_COMPARTIDA = bool(_RECUPERACION_REDIS_URL_BASE)
+# En Railway se exige almacenamiento compartido: sin Redis la recuperación responde 503 en lugar
+# de fallar de forma intermitente entre workers. Configurable para escenarios locales multiproceso.
+RECUPERACION_EXIGIR_CACHE_COMPARTIDA = _parse_bool_env('RECUPERACION_EXIGIR_CACHE_COMPARTIDA', _EN_RAILWAY)
 
 # Configuración para que Swagger pida el Token JWT en lugar de usuario/contraseña
 SWAGGER_SETTINGS = {
