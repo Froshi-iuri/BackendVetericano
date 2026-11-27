@@ -286,6 +286,31 @@ class SeguimientoPeticionesVisitaDetailView(generics.RetrieveUpdateAPIView):
         rol_id = getattr(user, 'id_rol_id', None)
         if rol_id not in (1, 3):
             return Response({"error": "No cuenta con permisos para modificar un acta de visita."}, status=status.HTTP_403_FORBIDDEN)
+
+        # A-03: las actas confirmadas y los registros automáticos de cambio de estado no se reescriben.
+        # Va después del control de rol y de propietario (get_object) para conservar sus 403.
+        from .serializers import CAMPOS_ACTA_INMUTABLES, motivo_bloqueo_edicion_acta
+        acta = self.get_object()
+        bloqueo = motivo_bloqueo_edicion_acta(acta)
+        if bloqueo:
+            codigo, permitidos = bloqueo
+            # Los campos de identidad los valida el serializer (mismo valor: se ignora; otro: 400).
+            claves = request.data.keys() if hasattr(request.data, 'keys') else []
+            no_permitidos = sorted(
+                campo for campo in claves
+                if campo not in permitidos and campo not in CAMPOS_ACTA_INMUTABLES
+            )
+            if no_permitidos:
+                mensaje = (
+                    "El acta ya está confirmada (tiene radicado o firmas): solo se pueden añadir evidencias."
+                    if codigo == 'ACTA_CONFIRMADA'
+                    else "Este registro es historial automático de un cambio de estado y no se puede modificar."
+                )
+                return Response(
+                    {"error": mensaje, "codigo": codigo, "campos_no_permitidos": no_permitidos},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
         kwargs['partial'] = True  # Siempre parcial (PATCH)
         return super().update(request, *args, **kwargs)
 
@@ -826,6 +851,12 @@ class DashboardJuridicoView(APIView):
                 "estado": estado_diag,
             })
 
+        distribucion_cba = {
+            "En Observación": en_observacion,
+            "En Tratamiento": en_tratamiento,
+            "Apto para Adopción": aptos_adopcion,
+        }
+
         cba_data = {
             "total_ingresados_cba": total_cba,
             "totalIngresadosCBA": total_cba,
@@ -835,6 +866,8 @@ class DashboardJuridicoView(APIView):
             "enTratamiento": en_tratamiento,
             "aptos_adopcion": aptos_adopcion,
             "aptosAdopcion": aptos_adopcion,
+            "distribucion_estados": distribucion_cba,
+            "distribucionEstados": distribucion_cba,
             "ultimos_ingresos": ultimos_ingresos,
             "ultimosIngresos": ultimos_ingresos,
         }

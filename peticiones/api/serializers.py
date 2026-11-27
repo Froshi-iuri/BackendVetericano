@@ -520,6 +520,31 @@ def _guardar_evidencias_seguimiento(seguimiento, fotos_input=None, foto_input=No
                 )
 
 
+# A-03: campos que identifican el acta y no pueden cambiar al editarla.
+CAMPOS_ACTA_INMUTABLES = ('id_peticion', 'id_veterinario', 'numero_radicado', 'id_animal', 'id_ubicacion_visita')
+# Lo único que admite un acta confirmada: AÑADIR evidencias (_guardar_evidencias_seguimiento solo agrega).
+CAMPOS_EVIDENCIA_ACTA = frozenset({'foto', 'fotos', 'video', 'videos', 'multimedia'})
+PREFIJO_REGISTRO_CAMBIO_ESTADO = "Cambio de estado a '"
+
+
+def motivo_bloqueo_edicion_acta(acta):
+    """
+    Devuelve (codigo, campos_permitidos) si el acta no admite edición libre, o None si es editable.
+    - ACTA_CONFIRMADA: tiene radicado o alguna firma (criterio de servidor; Android siempre envía
+      radicado RAD-VIS-… y la firma del veterinario). Solo se pueden añadir evidencias.
+    - REGISTRO_CAMBIO_ESTADO: fila automática del historial creada al cambiar el estado de la
+      petición (ActualizarEstadoPeticionView). Es historial: no se modifica.
+    """
+    def _texto(valor):
+        return valor.strip() if isinstance(valor, str) else ''
+
+    if _texto(acta.numero_radicado) or _texto(acta.firma_notificador) or _texto(acta.firma_notificado):
+        return 'ACTA_CONFIRMADA', CAMPOS_EVIDENCIA_ACTA
+    if _texto(acta.observacion).startswith(PREFIJO_REGISTRO_CAMBIO_ESTADO):
+        return 'REGISTRO_CAMBIO_ESTADO', frozenset()
+    return None
+
+
 class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
     """
     Serializer principal del acta de visita de campo.
@@ -677,6 +702,31 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
             if not es_vacio:
                 raise serializers.ValidationError({
                     "medicamentos_usados": "No se admite consumo del kit al editar un acta."
+                })
+            # A-03: la identidad del acta no cambia tras registrarla (petición, veterinario responsable,
+            # radicado, animal y ubicación). El kardex y el antiduplicados offline dependen de ellos.
+            # Mismo valor: se ignora (compatibilidad); valor distinto: 400. No depende de Android.
+            errores_inmutables = {}
+            for campo in CAMPOS_ACTA_INMUTABLES:
+                if campo not in attrs:
+                    continue
+                nuevo = attrs[campo]
+                if campo == 'numero_radicado':
+                    actual = (self.instance.numero_radicado or '').strip()
+                    igual = (nuevo or '').strip() == actual
+                else:
+                    igual = getattr(nuevo, 'pk', nuevo) == getattr(self.instance, f'{campo}_id', None)
+                if igual:
+                    attrs.pop(campo)
+                else:
+                    errores_inmutables[campo] = 'No se puede modificar después de registrar el acta.'
+            if errores_inmutables:
+                raise serializers.ValidationError(errores_inmutables)
+            # El prefijo de los registros automáticos de cambio de estado lo pone solo el servidor.
+            observacion = attrs.get('observacion')
+            if isinstance(observacion, str) and observacion.strip().startswith(PREFIJO_REGISTRO_CAMBIO_ESTADO):
+                raise serializers.ValidationError({
+                    'observacion': 'Ese formato está reservado para el historial automático de cambios de estado.'
                 })
             return attrs
 
@@ -964,10 +1014,18 @@ class SeguimientoPeticionesVisitaSerializer(serializers.ModelSerializer):
 
         # Actualizar o crear ubicación de la visita
         if lugar_atencion_data:
-            if instance.id_ubicacion_visita:
+            ubicacion_actual = instance.id_ubicacion_visita
+            # A-03: solo se edita en sitio si la ubicación es exclusiva de esta acta. Si la comparte
+            # una petición u otra acta, se crea una nueva para no alterar registros ajenos.
+            compartida = ubicacion_actual is not None and (
+                Peticiones.objects.filter(id_ubicacion=ubicacion_actual).exists()
+                or SeguimientoPeticionesVisita.objects.filter(id_ubicacion_visita=ubicacion_actual)
+                .exclude(pk=instance.pk).exists()
+            )
+            if ubicacion_actual and not compartida:
                 for attr, value in lugar_atencion_data.items():
-                    setattr(instance.id_ubicacion_visita, attr, value)
-                instance.id_ubicacion_visita.save()
+                    setattr(ubicacion_actual, attr, value)
+                ubicacion_actual.save()
             else:
                 ubicacion_visita = Ubicaciones.objects.create(**lugar_atencion_data)
                 instance.id_ubicacion_visita = ubicacion_visita

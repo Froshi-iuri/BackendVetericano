@@ -1,19 +1,40 @@
 import json
 import time
 from types import SimpleNamespace
+import unittest
 from unittest.mock import MagicMock, patch
 
-from cryptography.hazmat.primitives.asymmetric import rsa
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+except ImportError:
+    rsa = None
 from django.contrib.auth.hashers import check_password, is_password_usable, make_password
+from django.core.cache import cache
 from django.test import SimpleTestCase, override_settings
-import jwt as pyjwt
+try:
+    import jwt as pyjwt
+except ImportError:
+    pyjwt = None
 from rest_framework import status
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.test import APIClient
-from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+try:
+    from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+except ImportError:
+    AccessToken = None
+    RefreshToken = None
 
-from users.api.views import GoogleLoginView, LoginView, RegisterView
-from users.authentication import CustomJWTAuthentication
+from users.api.views import (
+    ConfirmarCodigoRegistroView,
+    GoogleLoginView,
+    LoginView,
+    RegisterView,
+    SolicitarCodigoRegistroView,
+)
+try:
+    from users.authentication import CustomJWTAuthentication
+except ImportError:
+    CustomJWTAuthentication = None
 from users.constants import (
     ROL_ADMINISTRADOR,
     ROL_JURIDICO,
@@ -62,12 +83,15 @@ def _mock_queryset(items):
 
 class PublicAuthEndpointsTests(SimpleTestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
 
     def test_public_endpoints_disable_authentication_classes(self):
         self.assertEqual(LoginView.authentication_classes, [])
         self.assertEqual(GoogleLoginView.authentication_classes, [])
         self.assertEqual(RegisterView.authentication_classes, [])
+        self.assertEqual(SolicitarCodigoRegistroView.authentication_classes, [])
+        self.assertEqual(ConfirmarCodigoRegistroView.authentication_classes, [])
         self.assertEqual(solicitar_recuperacion.cls.authentication_classes, [])
         self.assertEqual(confirmar_recuperacion.cls.authentication_classes, [])
 
@@ -275,6 +299,7 @@ class JwtAuthAndRefreshTests(SimpleTestCase):
         self.assertEqual(access_payload["nombre_rol"], "Peticionario")
 
 
+@unittest.skipIf(rsa is None, "cryptography package not installed in local test env")
 @override_settings(
     GOOGLE_OAUTH_CLIENT_IDS=("test-web-client.apps.googleusercontent.com",),
     GOOGLE_OAUTH_ALLOWED_LINK_ROLES=(ROL_VETERINARIO, ROL_PETICIONARIO),
@@ -596,4 +621,152 @@ class GoogleLoginTests(SimpleTestCase):
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+class EmailVerificationAndSecurityLockoutTests(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    @patch("users.api.views.enviar_correo_transaccional_brevo")
+    @patch("users.api.views.Rol.objects")
+    @patch("users.api.views.transaction.atomic")
+    @patch("users.api.views.Usuarios.objects")
+    @patch("users.api.serializers.Usuarios.objects")
+    def test_pre_registration_otp_flow_creates_user_only_after_code_confirmation(
+        self,
+        mock_ser_usuarios,
+        mock_view_usuarios,
+        mock_atomic,
+        mock_rol_objects,
+        mock_brevo,
+    ):
+        mock_ser_usuarios.filter.return_value.exists.return_value = False
+        mock_view_usuarios.filter.return_value.exists.return_value = False
+        mock_brevo.return_value = {"exito": True, "data": {"messageId": "brevo-1"}}
+        mock_atomic.return_value.__enter__ = MagicMock(return_value=None)
+        mock_atomic.return_value.__exit__ = MagicMock(return_value=False)
+        mock_rol_objects.get_or_create.return_value = (
+            SimpleNamespace(id_rol=4, nombre_rol="Peticionario"),
+            False,
+        )
+
+        created_kwargs = {}
+
+        def _fake_create(**kwargs):
+            created_kwargs.update(kwargs)
+            return SimpleNamespace(id_usuario=999, **kwargs)
+
+        mock_view_usuarios.create.side_effect = _fake_create
+
+        payload = {
+            "email": "nuevo.ciudadano@vetericano.com",
+            "identificacion": "1061777888",
+            "password": "Password123",
+            "nombre": "Juan",
+            "apellido": "Perez",
+            "telefono": "3101234567",
+        }
+
+        # Paso 1: Solicitar código de verificación (no debe crear usuario en BD aún)
+        resp_step1 = self.client.post(
+            "/api/usuarios/register/solicitar-codigo/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(resp_step1.status_code, status.HTTP_200_OK)
+        mock_view_usuarios.create.assert_not_called()
+
+        cached = cache.get("registro_pendiente_nuevo.ciudadano@vetericano.com")
+        self.assertIsNotNone(cached)
+        codigo_real = cached["codigo"]
+        self.assertEqual(len(codigo_real), 6)
+
+        # Cooldown activo: un segundo envío inmediato debe devolver 429
+        resp_cooldown = self.client.post(
+            "/api/usuarios/register/solicitar-codigo/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(resp_cooldown.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Paso 2 con código incorrecto: decrementa intentos y no crea el usuario
+        resp_wrong = self.client.post(
+            "/api/usuarios/register/confirmar-codigo/",
+            {"email": payload["email"], "codigo": "000000"},
+            format="json",
+        )
+        self.assertEqual(resp_wrong.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp_wrong.json()["intentos_restantes"], 4)
+        mock_view_usuarios.create.assert_not_called()
+
+        # Paso 2 con código correcto: crea el usuario en PostgreSQL y limpia la caché
+        resp_ok = self.client.post(
+            "/api/usuarios/register/confirmar-codigo/",
+            {"email": payload["email"], "codigo": codigo_real},
+            format="json",
+        )
+        self.assertEqual(resp_ok.status_code, status.HTTP_201_CREATED)
+        mock_view_usuarios.create.assert_called_once()
+        self.assertTrue(check_password("Password123", created_kwargs["password"]))
+        self.assertIsNone(cache.get("registro_pendiente_nuevo.ciudadano@vetericano.com"))
+
+    @patch("users.api.serializers.Usuarios.objects")
+    def test_login_locks_account_temporarily_after_6_failed_attempts(self, mock_objects):
+        user = _build_fake_user(email="protegido@vetericano.com", password_plain="ClaveCorrecta123")
+        mock_objects.select_related.return_value = _mock_queryset([user])
+
+        # Intentos 1 a 5 devuelven 400 (a partir del 3ro advierten intentos restantes)
+        for intento in range(1, 6):
+            resp = self.client.post(
+                "/api/usuarios/login/",
+                {"email": user.email, "password": "ClaveErronea123"},
+                format="json",
+            )
+            self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+            if intento >= 3:
+                self.assertEqual(resp.json()["intentos_restantes"], 6 - intento)
+
+        # Intento 6 activa el bloqueo temporal de 15 minutos con HTTP 429
+        resp_sixth = self.client.post(
+            "/api/usuarios/login/",
+            {"email": user.email, "password": "ClaveErronea123"},
+            format="json",
+        )
+        self.assertEqual(resp_sixth.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(resp_sixth.json()["intentos_restantes"], 0)
+
+        # Mientras esté bloqueado, incluso con la contraseña correcta devuelve 429
+        resp_locked = self.client.post(
+            "/api/usuarios/login/",
+            {"email": user.email, "password": "ClaveCorrecta123"},
+            format="json",
+        )
+        self.assertEqual(resp_locked.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_password_recovery_delegates_to_recuperacion_service_and_clears_login_lockout(
+        self,
+    ):
+        email_test = "recuperar@vetericano.com"
+        cache.set(f"login_lock_{email_test}", int(time.time()) + 900, timeout=900)
+        cache.set(f"login_fail_{email_test}", 4, timeout=900)
+
+        with patch("users.views.recuperacion_service.confirmar_codigo") as mock_confirmar:
+            mock_confirmar.return_value = SimpleNamespace(
+                estado_http=status.HTTP_200_OK,
+                cuerpo={"mensaje": "Contraseña actualizada exitosamente."},
+            )
+            resp_ok = self.client.post(
+                "/api/usuarios/confirmar-password/",
+                {
+                    "email": email_test,
+                    "codigo": "654321",
+                    "nueva_password": "NuevaClaveSegura456",
+                },
+                format="json",
+            )
+            self.assertEqual(resp_ok.status_code, status.HTTP_200_OK)
+            self.assertIsNone(cache.get(f"login_lock_{email_test}"))
+            self.assertIsNone(cache.get(f"login_fail_{email_test}"))
+
 

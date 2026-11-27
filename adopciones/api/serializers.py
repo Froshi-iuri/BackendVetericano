@@ -23,11 +23,16 @@ class AdopcionAnimalSerializer(serializers.ModelSerializer):
             # Formato similar a "Oct 6, 2026" o YYYY-MM-DD
             fecha_str = instance.fecha_ingreso.strftime("%Y-%m-%d")
 
+        # La descripción es la del catálogo de adopción, que create/update guardan en
+        # 'caracteristicas'. Nunca se devuelven 'observaciones' (notas veterinarias): si el
+        # Administrador las recibiera, al reenviar el formulario en un PUT quedarían publicadas.
+        descripcion = instance.caracteristicas or ""
+
         return {
             'id': instance.id_animal,
             'nombre': instance.nombre,
             'raza': instance.id_raza.nombre if instance.id_raza else "Desconocida",
-            'descripcion': instance.observaciones or instance.caracteristicas or "",
+            'descripcion': descripcion,
             'imagen': instance.foto_url or "",
             'estado': "Disponible" if instance.disponible_adopcion else "No Disponible",
             'fecha': fecha_str

@@ -11,13 +11,17 @@ from drf_yasg import openapi
 
 from users.api.permissions import PermisoClinica
 from diagnostico_ia.serializers import DiagnosticoIAPrediccionInputSerializer
-from diagnostico_ia.ml.engine import obtener_motor_diagnostico
 from diagnostico_ia.ml.knowledge_base import (
     NOMBRES_HUMANOS_TESTS,
     NOMBRES_HUMANOS_EXAMENES,
     SIGNOS_CLINICOS_CANONICOS,
     PATOLOGIAS_KNOWLEDGE,
 )
+
+
+def obtener_motor_diagnostico():
+    from diagnostico_ia.ml.engine import obtener_motor_diagnostico as _obtener
+    return _obtener()
 
 
 class DiagnosticoIAPredictView(APIView):
