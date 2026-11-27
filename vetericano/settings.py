@@ -695,5 +695,32 @@ TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS = _leer_env_float_rango(
     max_val=3600.0,
 )
 TRIAJE_N8N_ASYNC_THREAD = _leer_env_bool('TRIAJE_N8N_ASYNC_THREAD', default=True)
+TRIAJE_LEASE_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_LEASE_TIMEOUT_SEGUNDOS',
+    default=60.0,
+    min_val=10.0,
+    max_val=600.0,
+)
+TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS',
+    default=300.0,
+    min_val=30.0,
+    max_val=3600.0,
+)
+TRIAJE_RECOVERY_INTERVAL_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_RECOVERY_INTERVAL_SEGUNDOS',
+    default=30.0,
+    min_val=5.0,
+    max_val=600.0,
+)
+TRIAJE_RECOVERY_IN_PROCESS = _leer_env_bool('TRIAJE_RECOVERY_IN_PROCESS', default=True)
+TRIAJE_AISLAR_POR_SEDE = _leer_env_bool('TRIAJE_AISLAR_POR_SEDE', default=False)
+try:
+    TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO = max(
+        0,
+        int(os.environ.get('TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO', '0')),
+    )
+except (TypeError, ValueError):
+    TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO = 0
 
 

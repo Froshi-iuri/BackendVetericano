@@ -1,3 +1,4 @@
+from django.conf import settings
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -9,16 +10,21 @@ from triaje_ia.authentication import TriajeServiceTokenAuthentication
 from triaje_ia.models import TriajePeticion
 from triaje_ia.permissions import EsJuridicoOAdminTriaje, EsServicioTriaje
 from triaje_ia.serializers import (
+    TriajeDecisionInputSerializer,
     TriajeDuplicadosInputSerializer,
     TriajePeticionSerializer,
     TriajeResultadoInputSerializer,
 )
 from triaje_ia.services import (
+    StaleTriajeCallbackError,
+    TriajeDecisionInvalidaError,
+    TriajeNoEncontradoError,
     calcular_carga_veterinarios,
     construir_payload_peticion_triaje,
     ejecutar_deteccion_duplicados_triaje,
     encolar_y_despachar_triaje_peticion,
-    procesar_reintentos_pendientes,
+    recuperar_trabajos_interrumpidos,
+    registrar_decision_humana_triaje,
     registrar_resultado_triaje,
 )
 
@@ -26,6 +32,13 @@ from triaje_ia.services import (
 class _VistaInternaTriajeBase(APIView):
     authentication_classes = [TriajeServiceTokenAuthentication]
     permission_classes = [IsAuthenticated, EsServicioTriaje]
+
+
+def _parse_int_opcional(valor):
+    if valor is None or not str(valor).strip().isdigit():
+        return None
+    num = int(str(valor).strip())
+    return num if num > 0 else None
 
 
 class TriajeInternoContextoPeticionView(_VistaInternaTriajeBase):
@@ -37,7 +50,7 @@ class TriajeInternoContextoPeticionView(_VistaInternaTriajeBase):
 
     def get(self, request, id_peticion):
         peticion = (
-            Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion')
+            Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable')
             .prefetch_related('evidenciapeticiones_set')
             .filter(pk=id_peticion)
             .first()
@@ -76,13 +89,27 @@ class TriajeInternoDuplicadosView(_VistaInternaTriajeBase):
 
 class TriajeInternoCargaVeterinariosView(_VistaInternaTriajeBase):
     """
-    GET /api/triaje-ia/interno/veterinarios/carga/
-    Consulta la carga laboral actual de veterinarios activos y sugiere el candidato
-    con menor carga activa.
+    GET /api/triaje-ia/interno/veterinarios/carga/?id_peticion=<id>&id_sede=<id>&solo_sede=true|false
+    Consulta la carga laboral actual de veterinarios activos (con sede activa) y sugiere
+    el candidato elegible con menor carga activa respetando reglas de asignación.
     """
 
     def get(self, request):
-        return Response(calcular_carga_veterinarios(), status=status.HTTP_200_OK)
+        id_peticion = _parse_int_opcional(request.query_params.get('id_peticion'))
+        id_sede = _parse_int_opcional(request.query_params.get('id_sede'))
+        solo_sede = str(request.query_params.get('solo_sede', '')).strip().lower() in ('true', '1', 'si')
+        try:
+            data = calcular_carga_veterinarios(
+                id_peticion=id_peticion,
+                id_sede=id_sede,
+                solo_sede=solo_sede,
+            )
+        except PeticionNoEncontradaError:
+            return Response(
+                {'error': f'La petición #{id_peticion} no fue encontrada.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class TriajeInternoGuardarResultadoView(_VistaInternaTriajeBase):
@@ -102,13 +129,18 @@ class TriajeInternoGuardarResultadoView(_VistaInternaTriajeBase):
                 {'error': f'La petición #{id_peticion} no fue encontrada.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        except StaleTriajeCallbackError as exc:
+            return Response(
+                {'error': str(exc), 'callback_obsoleto': True},
+                status=status.HTTP_409_CONFLICT,
+            )
         return Response(TriajePeticionSerializer(triaje).data, status=status.HTTP_200_OK)
 
 
 class TriajeInternoReintentarPendientesView(_VistaInternaTriajeBase):
     """
     POST /api/triaje-ia/interno/reintentar-pendientes/
-    Procesa los envíos pendientes o con fallo temporal vencido hacia n8n.
+    Recupera trabajos interrumpidos (lease/análisis expirado) y procesa envíos pendientes.
     """
 
     def post(self, request):
@@ -117,7 +149,10 @@ class TriajeInternoReintentarPendientesView(_VistaInternaTriajeBase):
             limite_int = int(limite)
         except (TypeError, ValueError):
             limite_int = 20
-        return Response(procesar_reintentos_pendientes(limite=limite_int), status=status.HTTP_200_OK)
+        return Response(
+            recuperar_trabajos_interrumpidos(limite=limite_int, usar_advisory_lock=True),
+            status=status.HTTP_200_OK,
+        )
 
 
 class TriajeDetallePeticionView(APIView):
@@ -129,14 +164,44 @@ class TriajeDetallePeticionView(APIView):
     permission_classes = [IsAuthenticated, EsJuridicoOAdminTriaje]
 
     def get(self, request, id_peticion):
+        automatizacion_activa = bool(getattr(settings, 'TRIAJE_N8N_ACTIVO', False))
+        peticion = Peticiones.objects.select_related('responsable').filter(pk=id_peticion).first()
+        if not peticion:
+            return Response(
+                {
+                    'error': f'La petición #{id_peticion} no fue encontrada.',
+                    'existe_peticion': False,
+                    'existe_triaje': False,
+                    'automatizacion_activa': automatizacion_activa,
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        self.check_object_permissions(request, peticion)
+
         triaje = (
-            TriajePeticion.objects.select_related('peticion', 'veterinario_recomendado')
+            TriajePeticion.objects.select_related(
+                'peticion',
+                'peticion__id_estado',
+                'peticion__responsable',
+                'peticion__asignado_a',
+                'veterinario_recomendado',
+                'veterinario_recomendado__id_sede',
+                'decision_prioridad_por',
+                'decision_veterinario_por',
+            )
+            .prefetch_related('peticion__evidenciapeticiones_set')
             .filter(peticion_id=id_peticion)
             .first()
         )
         if not triaje:
             return Response(
-                {'error': f'No existe registro de triaje para la petición #{id_peticion}.'},
+                {
+                    'error': f'No existe registro de triaje para la petición #{id_peticion}.',
+                    'id_peticion': peticion.id_peticion,
+                    'existe_peticion': True,
+                    'existe_triaje': False,
+                    'automatizacion_activa': automatizacion_activa,
+                },
                 status=status.HTTP_404_NOT_FOUND,
             )
         return Response(TriajePeticionSerializer(triaje).data, status=status.HTTP_200_OK)
@@ -151,14 +216,76 @@ class TriajeReintentarPeticionView(APIView):
     permission_classes = [IsAuthenticated, EsJuridicoOAdminTriaje]
 
     def post(self, request, id_peticion):
-        if not Peticiones.objects.filter(pk=id_peticion).exists():
+        peticion = Peticiones.objects.select_related('responsable').filter(pk=id_peticion).first()
+        if not peticion:
             return Response(
                 {'error': f'La petición #{id_peticion} no fue encontrada.'},
                 status=status.HTTP_404_NOT_FOUND,
+            )
+        self.check_object_permissions(request, peticion)
+        automatizacion_activa = bool(getattr(settings, 'TRIAJE_N8N_ACTIVO', False))
+        if not automatizacion_activa:
+            return Response(
+                {
+                    'ejecutado': False,
+                    'motivo': 'DESACTIVADO',
+                    'automatizacion_activa': False,
+                },
+                status=status.HTTP_200_OK,
             )
         forzar = bool(request.data.get('forzar', False)) if isinstance(request.data, dict) else False
         resultado = encolar_y_despachar_triaje_peticion(
             id_peticion,
             forzar_reenvio=forzar,
         )
+        resultado['automatizacion_activa'] = automatizacion_activa
         return Response(resultado, status=status.HTTP_200_OK)
+
+
+class TriajeDecisionPeticionView(APIView):
+    """
+    POST /api/triaje-ia/peticiones/<id_peticion>/decision/
+    Permite a Administrador o Jurídico aceptar o rechazar recomendaciones del triaje
+    mediante los flujos autorizados existentes y manteniendo auditoría humana.
+    """
+
+    permission_classes = [IsAuthenticated, EsJuridicoOAdminTriaje]
+
+    def post(self, request, id_peticion):
+        peticion = Peticiones.objects.select_related('responsable').filter(pk=id_peticion).first()
+        if not peticion:
+            return Response(
+                {'error': f'La petición #{id_peticion} no fue encontrada.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        self.check_object_permissions(request, peticion)
+
+        serializer = TriajeDecisionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            triaje, cambiada = registrar_decision_humana_triaje(
+                id_peticion,
+                request.user,
+                serializer.validated_data,
+            )
+        except TriajeNoEncontradoError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except TriajeDecisionInvalidaError as exc:
+            return Response(
+                {'error': str(exc), 'codigo': exc.codigo},
+                status=exc.status_code,
+            )
+
+        return Response(
+            {
+                'mensaje': (
+                    'Decisión humana registrada correctamente.'
+                    if cambiada
+                    else 'La decisión humana ya se encontraba registrada previamente.'
+                ),
+                'cambiada': cambiada,
+                'triaje': TriajePeticionSerializer(triaje).data,
+            },
+            status=status.HTTP_200_OK,
+        )

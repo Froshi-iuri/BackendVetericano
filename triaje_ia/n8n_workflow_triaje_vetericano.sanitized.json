@@ -1,0 +1,531 @@
+{
+  "name": "Vetericano - Triaje Inteligente de Denuncias",
+  "active": false,
+  "description": "Triaje inteligente de denuncias ciudadanas en Vetericano usando Gemini texto/visión, detección de duplicados DINOv2 y carga laboral veterinaria.",
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none"
+  },
+  "nodes": [
+    {
+      "id": "b47909f0-02bf-4f16-b7e7-bbc4c0062e37",
+      "name": "Complaint Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vetericano-triaje-peticion",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "REPLACE_WITH_NEW_WEBHOOK_ID",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_WEBHOOK_SECRET_CREDENTIAL_ID",
+          "name": "Vetericano Triaje Webhook Secret"
+        }
+      }
+    },
+    {
+      "id": "12538034-db54-4ac6-ab6d-5582b86f48ba",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-peticion",
+              "name": "id_peticion",
+              "type": "number",
+              "value": "={{ Number($json.body?.id_peticion ?? $json.id_peticion) }}"
+            },
+            {
+              "id": "numero-radicado",
+              "name": "numero_radicado",
+              "type": "string",
+              "value": "={{ $json.body?.numero_radicado ?? $json.numero_radicado ?? \"\" }}"
+            },
+            {
+              "id": "clave-idempotencia",
+              "name": "clave_idempotencia",
+              "type": "string",
+              "value": "={{ $json.body?.clave_idempotencia ?? $json.clave_idempotencia ?? (\"triaje-pet-\" + ($json.body?.id_peticion ?? $json.id_peticion ?? \"\")) }}"
+            },
+            {
+              "id": "despacho-token",
+              "name": "despacho_token",
+              "type": "string",
+              "value": "={{ $json.body?.despacho_token ?? $json.despacho_token ?? \"\" }}"
+            },
+            {
+              "id": "id-sede",
+              "name": "id_sede",
+              "type": "string",
+              "value": "={{ ($json.body?.id_sede ?? $json.id_sede) ? String($json.body?.id_sede ?? $json.id_sede) : \"\" }}"
+            },
+            {
+              "id": "tipo-nombre",
+              "name": "tipo_nombre",
+              "type": "string",
+              "value": "={{ $json.body?.tipo_nombre ?? $json.tipo_nombre ?? \"Denuncia ciudadana\" }}"
+            },
+            {
+              "id": "prioridad-actual",
+              "name": "prioridad_actual",
+              "type": "string",
+              "value": "={{ $json.body?.prioridad_actual ?? $json.prioridad_actual ?? \"\" }}"
+            },
+            {
+              "id": "descripcion",
+              "name": "descripcion",
+              "type": "string",
+              "value": "={{ $json.body?.descripcion ?? $json.descripcion ?? \"\" }}"
+            },
+            {
+              "id": "fotos",
+              "name": "fotos",
+              "type": "array",
+              "value": "={{ Array.isArray($json.body?.fotos) ? $json.body.fotos : (Array.isArray($json.fotos) ? $json.fotos : []) }}"
+            },
+            {
+              "id": "total-fotos",
+              "name": "total_fotos",
+              "type": "number",
+              "value": "={{ Number($json.body?.total_fotos ?? $json.total_fotos ?? (Array.isArray($json.body?.fotos) ? $json.body.fotos.length : (Array.isArray($json.fotos) ? $json.fotos.length : 0))) }}"
+            },
+            {
+              "id": "backend-base-url",
+              "name": "backendBaseUrl",
+              "type": "string",
+              "value": "https://REPLACE_WITH_BACKEND_BASE_URL"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "mode": "manual"
+      }
+    },
+    {
+      "id": "660f236f-1f3e-4fda-b6f6-8643271314e8",
+      "name": "Has Photos",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.total_fotos }}",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "rightValue": 0
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "bbeaeeda-1c53-4f59-a3f3-6cc09ae7ef1b",
+      "name": "Analyze Photos Vision",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        180
+      ],
+      "parameters": {
+        "binaryPropertyName": "data",
+        "inputType": "binary",
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-3.5-flash-lite"
+        },
+        "operation": "analyze",
+        "options": {
+          "maxOutputTokens": 300
+        },
+        "resource": "image",
+        "simplify": true,
+        "text": "Analiza OBJETIVAMENTE unicamente lo que sea visible en esta fotografia de una denuncia ciudadana sobre un animal.\n1) Indica la especie y el estado fisico aparente (por ejemplo: animal aparentemente sano/alerta, decaido, herido o imagen poco clara).\n2) Lista SOLO hallazgos clinicos visibles reales (por ejemplo: heridas abiertas, sangrado, desnutricion severa, cojera evidente, miasis). Si no se observan lesiones, indica explicitamente: \"No se observan lesiones visibles ni signos clinicos de maltrato o urgencia en la fotografia\".\n3) Describe si el entorno visible muestra peligro inminente.\nREGLA ESTRICTA: Nunca inventes ni supongas lesiones no visibles ni te dejes influenciar por el relato del ciudadano. Si el animal luce sano, dilo explicitamente."
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_WITH_GOOGLE_GEMINI_CREDENTIAL_ID",
+          "name": "Google Gemini API"
+        }
+      }
+    },
+    {
+      "id": "ad20a522-3c89-4a3b-9d57-a0fbfe4b9f58",
+      "name": "Prepare Vision Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const base = $('Normalize Payload').first().json;\nconst incoming = $input.first()?.json || {};\n\nconst sanitizarPII = (texto) => {\n  let t = String(texto || '');\n  t = t.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/g, '[CORREO]');\n  t = t.replace(/(?:\\+?57[\\s-]?)?3\\d{2}[\\s-]?\\d{3}[\\s-]?\\d{4}/g, '[TELEFONO]');\n  t = t.replace(/\\b(?:cc|c\\.c\\.|ti|nit|tel|cel|celular|telefono|teléfono|whatsapp)\\s*[:#.-]?\\s*\\d{6,12}\\b/gi, '[DATO_CONTACTO]');\n  t = t.replace(/\\b\\d{6,12}\\b/g, '[NUMERO]');\n  t = t.replace(/\\b(?:calle|cll|carrera|cra|kr|avenida|av|diagonal|diag|transversal|transv|tv|manzana|mz|casa|apto|apartamento|torre)\\s*#?\\s*\\d+[a-zA-Z]?(?:\\s*(?:#|no\\.?|n°|-)\\s*\\d+[a-zA-Z]?(?:\\s*-\\s*\\d+)?)?/gi, '[DIRECCION]');\n  return t.replace(/\\s+/g, ' ').trim().slice(0, 1500);\n};\n\nlet visionText = '';\nlet visionModel = '';\nlet visionError = false;\n\nif (incoming.error) {\n  visionError = true;\n  visionText = 'No fue posible analizar las fotografias con IA visual.';\n} else if (typeof incoming.visionSummary === 'string' && incoming.visionSummary.trim()) {\n  visionText = sanitizarPII(incoming.visionSummary);\n} else if (typeof incoming.content === 'string' && incoming.content.trim()) {\n  visionText = sanitizarPII(incoming.content);\n  visionModel = 'models/gemini-3.5-flash-lite';\n} else if (typeof incoming.text === 'string' && incoming.text.trim()) {\n  visionText = sanitizarPII(incoming.text);\n  visionModel = 'models/gemini-3.5-flash-lite';\n} else if (Array.isArray(incoming.content?.parts)) {\n  visionText = sanitizarPII(incoming.content.parts.map((p) => p?.text || '').filter(Boolean).join(' '));\n  visionModel = 'models/gemini-3.5-flash-lite';\n} else {\n  visionText = base.total_fotos > 0 ? 'Analisis visual sin observaciones textuales.' : 'Sin fotografias adjuntas en la denuncia.';\n}\n\nreturn [{\n  json: {\n    ...base,\n    descripcion_ia: sanitizarPII(base.descripcion),\n    visionSummary: visionText,\n    visionModel,\n    visionError\n  }\n}];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "0e6d2140-432a-4079-ab84-47a67a750923",
+      "name": "No Photos Fallback",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        980,
+        420
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "vision-summary",
+              "name": "visionSummary",
+              "value": "Sin fotografias adjuntas en la denuncia.",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "20f28f36-fdd6-4b4c-ab2a-8a640b1bd8f8",
+      "name": "Analyze Text Triage",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "jsonOutput": true,
+        "messages": {
+          "values": [
+            {
+              "content": "={{ \"Tipo: \" + $json.tipo_nombre + \"\\nPrioridad reportada: \" + ($json.prioridad_actual || \"No indicada\") + \"\\nDescripcion clinica/hechos (sin PII): \" + $json.descripcion_ia + \"\\nAnalisis visual de fotos: \" + $json.visionSummary }}",
+              "role": "user"
+            }
+          ]
+        },
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-3.5-flash-lite"
+        },
+        "operation": "message",
+        "options": {
+          "maxOutputTokens": 850,
+          "systemMessage": "Eres un asistente de triaje veterinario y bienestar animal para Vetericano (Colombia). Evalua hechos clinicos y riesgo del animal y clasifica en UNA sola prioridad exacta: URGENTE, ALTA, MEDIA o BAJA. Compara estrictamente la descripcion ciudadana contra el \"Analisis visual de fotos\" SIN inventar lesiones visuales.\nResponde UNICAMENTE un objeto JSON valido sin texto extra ni datos personales con las claves exactas:\n- prioridad_sugerida: \"URGENTE\"|\"ALTA\"|\"MEDIA\"|\"BAJA\"\n- nivel_confianza: numero entre 0 y 1\n- signos_reportados: array de hasta 15 strings cortos con signos/hechos UNICAMENTE mencionados en la descripcion ciudadana\n- signos_fotografia: array de hasta 15 strings cortos con hallazgos UNICAMENTE visibles en el \"Analisis visual de fotos\" (OBLIGATORIAMENTE [] si no hay fotografias, si fallo el analisis visual o si la foto muestra un animal aparentemente sano sin lesiones; NUNCA copies signos de la descripcion aqui si no se ven en la foto)\n- signos_detectados: array combinado de hasta 15 strings cortos relevantes\n- contradiccion_foto_descripcion: boolean (true SOLO cuando la fotografia contradice claramente la descripcion ciudadana, por ejemplo la descripcion reporta sangrado/fracturas/desnutricion grave/abandono critico o cierta especie, pero la foto muestra un animal aparentemente sano, sin lesiones o una escena/especie distinta; false si no hay fotos o son coherentes)\n- advertencias_contradiccion: array de strings claros en espanol explicando cada contradiccion entre foto y descripcion ([] si contradiccion_foto_descripcion es false)\n- resumen_texto: string breve resumiendo lo reportado por el ciudadano\n- resumen_vision: string breve resumiendo lo observado objetivamente en la fotografia\n- justificacion: string con la justificacion clinica y advertencias relevantes",
+          "temperature": 0.1
+        },
+        "resource": "text",
+        "simplify": true
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_WITH_GOOGLE_GEMINI_CREDENTIAL_ID",
+          "name": "Google Gemini API"
+        }
+      }
+    },
+    {
+      "id": "a338c18f-516f-4120-b2c6-a97e4fe7212a",
+      "name": "Detect Duplicates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1760,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Normalize Payload').item.json.backendBaseUrl + '/api/triaje-ia/interno/peticiones/' + $('Normalize Payload').item.json.id_peticion + '/duplicados/' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"usar_dinov2\": true, \"registrar_alertas\": true } }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_TRIAJE_SERVICE_TOKEN_CREDENTIAL_ID",
+          "name": "Vetericano Triaje Service Token"
+        }
+      }
+    },
+    {
+      "id": "f02c2470-a538-40d2-b16f-2dc52d46f41e",
+      "name": "Fetch Vet Workload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2020,
+        300
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "GET",
+        "options": {
+          "timeout": 10000
+        },
+        "url": "={{ $('Normalize Payload').item.json.backendBaseUrl + '/api/triaje-ia/interno/veterinarios/carga/?id_peticion=' + $('Normalize Payload').item.json.id_peticion + ($('Normalize Payload').item.json.id_sede ? '&id_sede=' + $('Normalize Payload').item.json.id_sede : '') }}"
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_TRIAJE_SERVICE_TOKEN_CREDENTIAL_ID",
+          "name": "Vetericano Triaje Service Token"
+        }
+      }
+    },
+    {
+      "id": "7df94b99-f71b-4cbe-95ae-2023926c9568",
+      "name": "Assemble Triage Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Payload').first().json;\nconst visionCtx = $('Prepare Vision Context').first().json;\n\nlet iaRaw = {};\nlet iaError = false;\ntry {\n  iaRaw = $('Analyze Text Triage').first().json || {};\n  if (iaRaw.error) iaError = true;\n} catch (e) {\n  iaError = true;\n}\n\nlet dupRaw = {};\ntry {\n  dupRaw = $('Detect Duplicates').first().json || {};\n} catch (e) {\n  dupRaw = {};\n}\n\nlet cargaRaw = {};\ntry {\n  cargaRaw = $('Fetch Vet Workload').first().json || {};\n} catch (e) {\n  cargaRaw = {};\n}\n\nlet parsedIa = {};\nconst candidateText =\n  typeof iaRaw.content === 'string'\n    ? iaRaw.content\n    : (typeof iaRaw.text === 'string'\n        ? iaRaw.text\n        : (Array.isArray(iaRaw.content?.parts)\n            ? iaRaw.content.parts.map((p) => p?.text || '').join('')\n            : (typeof iaRaw === 'object' && iaRaw.prioridad_sugerida ? JSON.stringify(iaRaw) : '')));\n\nif (!iaError && candidateText) {\n  try {\n    const cleaned = candidateText.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n    const obj = JSON.parse(cleaned);\n    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {\n      iaError = true;\n    } else {\n      parsedIa = obj;\n    }\n  } catch (e) {\n    iaError = true;\n  }\n} else {\n  iaError = true;\n}\n\nconst PRIORIDADES_PERMITIDAS = new Set(['URGENTE', 'ALTA', 'MEDIA', 'BAJA']);\nconst rawPrio = String(parsedIa.prioridad_sugerida || '')\n  .normalize('NFD')\n  .replace(/[\\u0300-\\u036f]/g, '')\n  .trim()\n  .toUpperCase();\nconst mapPrioridad = (val) => {\n  if (PRIORIDADES_PERMITIDAS.has(val)) return val;\n  if (val === 'CRITICA' || val === 'EMERGENCIA') return 'URGENTE';\n  if (val === 'NORMAL') return 'MEDIA';\n  return null;\n};\n\nconst limpiarListaStrings = (arr, maxItems = 15, maxLen = 100) => {\n  if (!Array.isArray(arr)) return [];\n  const vistos = new Set();\n  const res = [];\n  for (const item of arr) {\n    if (typeof item !== 'string') continue;\n    const limpio = item.replace(/\\s+/g, ' ').trim().slice(0, maxLen);\n    if (!limpio) continue;\n    const key = limpio.toLowerCase();\n    if (vistos.has(key)) continue;\n    vistos.add(key);\n    res.push(limpio);\n    if (res.length >= maxItems) break;\n  }\n  return res;\n};\n\nconst prioridadSugerida = !iaError ? mapPrioridad(rawPrio) : null;\nlet confianzaValida = null;\nif (!iaError && typeof parsedIa.nivel_confianza === 'number' && Number.isFinite(parsedIa.nivel_confianza)) {\n  confianzaValida = Math.max(0, Math.min(1, Math.round(parsedIa.nivel_confianza * 10000) / 10000));\n}\n\nconst tieneFotosReales = Number(norm.total_fotos || 0) > 0 && !visionCtx.visionError;\nconst signosReportados = !iaError ? limpiarListaStrings(parsedIa.signos_reportados, 15, 100) : [];\nconst signosFotografia = (!iaError && tieneFotosReales)\n  ? limpiarListaStrings(parsedIa.signos_fotografia, 15, 100)\n  : [];\n\nlet signosValidados = !iaError ? limpiarListaStrings(parsedIa.signos_detectados, 15, 100) : [];\nif (signosValidados.length === 0) {\n  signosValidados = limpiarListaStrings([...signosReportados, ...signosFotografia], 15, 100);\n}\n\nlet advertenciasContradiccion = (!iaError && tieneFotosReales)\n  ? limpiarListaStrings(parsedIa.advertencias_contradiccion, 5, 400)\n  : [];\nconst contradiccionFotoDescripcion = Boolean(\n  !iaError &&\n  tieneFotosReales &&\n  (parsedIa.contradiccion_foto_descripcion === true || advertenciasContradiccion.length > 0)\n);\nif (contradiccionFotoDescripcion && advertenciasContradiccion.length === 0) {\n  advertenciasContradiccion = [\n    'La evidencia fotografica presenta diferencias relevantes frente a la descripcion reportada por el ciudadano; revise ambas antes de decidir.'\n  ];\n}\nif (!contradiccionFotoDescripcion) {\n  advertenciasContradiccion = [];\n}\n\nconst schemaInvalido = !iaError && (!prioridadSugerida || typeof parsedIa.justificacion !== 'string' || !parsedIa.justificacion.trim());\nconst posiblesDuplicados = Array.isArray(dupRaw.posibles_duplicados) ? dupRaw.posibles_duplicados : [];\nconst vetRec = cargaRaw.veterinario_recomendado || null;\nconst cargaLista = Array.isArray(cargaRaw.veterinarios) ? cargaRaw.veterinarios : [];\n\nconst estadoAnalisis = (iaError || schemaInvalido || visionCtx.visionError || !prioridadSugerida)\n  ? ((dupRaw && !dupRaw.error) || (cargaRaw && !cargaRaw.error) ? 'PARCIAL' : 'FALLIDO')\n  : 'COMPLETADO';\n\nreturn [{\n  json: {\n    id_peticion: norm.id_peticion,\n    backendBaseUrl: norm.backendBaseUrl,\n    clave_idempotencia: norm.clave_idempotencia,\n    despacho_token: norm.despacho_token || '',\n    estado_analisis: estadoAnalisis,\n    prioridad_sugerida: prioridadSugerida,\n    nivel_confianza: confianzaValida,\n    justificacion: (typeof parsedIa.justificacion === 'string' && parsedIa.justificacion.trim())\n      ? parsedIa.justificacion.trim().slice(0, 3000)\n      : (iaError || schemaInvalido ? 'Analisis de IA no disponible o respuesta invalida; se recopilaron duplicados y carga laboral.' : ''),\n    resumen_texto: typeof parsedIa.resumen_texto === 'string' ? parsedIa.resumen_texto.trim().slice(0, 2000) : '',\n    resumen_vision: typeof parsedIa.resumen_vision === 'string' && parsedIa.resumen_vision.trim()\n      ? parsedIa.resumen_vision.trim().slice(0, 2000)\n      : (visionCtx.visionSummary || '').slice(0, 2000),\n    signos_detectados: signosValidados,\n    signos_reportados: signosReportados,\n    signos_fotografia: signosFotografia,\n    contradiccion_foto_descripcion: contradiccionFotoDescripcion,\n    advertencias_contradiccion: advertenciasContradiccion,\n    posibles_duplicados: posiblesDuplicados,\n    veterinario_recomendado_id: vetRec ? vetRec.id_veterinario : null,\n    justificacion_recomendacion: cargaRaw.justificacion_recomendacion || '',\n    carga_veterinarios_snapshot: cargaLista,\n    modelo_texto_usado: (iaError || schemaInvalido) ? '' : 'models/gemini-3.5-flash-lite',\n    modelo_vision_usado: visionCtx.visionModel || '',\n    n8n_execution_id: String($execution.id || ''),\n    resultado_raw: {\n      ia: parsedIa,\n      schema_invalido: schemaInvalido,\n      duplicados_meta: dupRaw.parametros || {}\n    }\n  }\n}];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "f97f661f-d8ad-478d-b40c-829e2ca1c01f",
+      "name": "Save Triage Result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2540,
+        300
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "contentType": "json",
+        "genericAuthType": "httpHeaderAuth",
+        "jsonBody": "={{ { clave_idempotencia: $json.clave_idempotencia, despacho_token: $json.despacho_token, estado_analisis: $json.estado_analisis, prioridad_sugerida: $json.prioridad_sugerida, nivel_confianza: $json.nivel_confianza, justificacion: $json.justificacion, resumen_texto: $json.resumen_texto, resumen_vision: $json.resumen_vision, signos_detectados: $json.signos_detectados, signos_reportados: $json.signos_reportados, signos_fotografia: $json.signos_fotografia, contradiccion_foto_descripcion: $json.contradiccion_foto_descripcion, advertencias_contradiccion: $json.advertencias_contradiccion, posibles_duplicados: $json.posibles_duplicados, veterinario_recomendado_id: $json.veterinario_recomendado_id, justificacion_recomendacion: $json.justificacion_recomendacion, carga_veterinarios_snapshot: $json.carga_veterinarios_snapshot, modelo_texto_usado: $json.modelo_texto_usado, modelo_vision_usado: $json.modelo_vision_usado, n8n_execution_id: $json.n8n_execution_id, resultado_raw: $json.resultado_raw } }}",
+        "method": "POST",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "={{ $json.backendBaseUrl + '/api/triaje-ia/interno/peticiones/' + $json.id_peticion + '/resultado/' }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_TRIAJE_SERVICE_TOKEN_CREDENTIAL_ID",
+          "name": "Vetericano Triaje Service Token"
+        }
+      }
+    },
+    {
+      "id": "6d9cbb02-9528-460f-b33b-a3169c870603",
+      "name": "Download Primary Photo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        850,
+        180
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "response": {
+            "response": {
+              "outputPropertyName": "data",
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 10000
+        },
+        "url": "={{ $json.fotos[0] }}"
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Complaint Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "Has Photos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Photos": {
+      "main": [
+        [
+          {
+            "node": "Download Primary Photo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Photos Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Photos Vision": {
+      "main": [
+        [
+          {
+            "node": "Prepare Vision Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Vision Context": {
+      "main": [
+        [
+          {
+            "node": "Analyze Text Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Photos Fallback": {
+      "main": [
+        [
+          {
+            "node": "Prepare Vision Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Text Triage": {
+      "main": [
+        [
+          {
+            "node": "Detect Duplicates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Duplicates": {
+      "main": [
+        [
+          {
+            "node": "Fetch Vet Workload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Vet Workload": {
+      "main": [
+        [
+          {
+            "node": "Assemble Triage Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Triage Result": {
+      "main": [
+        [
+          {
+            "node": "Save Triage Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Primary Photo": {
+      "main": [
+        [
+          {
+            "node": "Analyze Photos Vision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "meta": {
+    "sanitizedForCentralizedDeployment": true,
+    "n8nVersionTested": "2.49.7",
+    "placeholdersRequired": [
+      "REPLACE_WITH_WEBHOOK_SECRET_CREDENTIAL_ID",
+      "REPLACE_WITH_GOOGLE_GEMINI_CREDENTIAL_ID",
+      "REPLACE_WITH_TRIAJE_SERVICE_TOKEN_CREDENTIAL_ID",
+      "http://backendvetericano.railway.internal:8080 (or https://YOUR_BACKEND_HOST)"
+    ]
+  }
+}

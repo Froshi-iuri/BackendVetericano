@@ -9,6 +9,7 @@ class TriajePeticion(models.Model):
     """
 
     ENVIO_PENDIENTE = 'PENDIENTE'
+    ENVIO_ENVIANDO = 'ENVIANDO'
     ENVIO_ENVIADO = 'ENVIADO'
     ENVIO_FALLO_TEMPORAL = 'FALLO_TEMPORAL'
     ENVIO_FALLO_DEFINITIVO = 'FALLO_DEFINITIVO'
@@ -16,6 +17,7 @@ class TriajePeticion(models.Model):
 
     ESTADOS_ENVIO_CHOICES = [
         (ENVIO_PENDIENTE, 'Pendiente de envío'),
+        (ENVIO_ENVIANDO, 'Enviando a n8n (en curso)'),
         (ENVIO_ENVIADO, 'Enviado a n8n'),
         (ENVIO_FALLO_TEMPORAL, 'Fallo temporal (reintento pendiente)'),
         (ENVIO_FALLO_DEFINITIVO, 'Fallo definitivo (reintentos agotados)'),
@@ -48,6 +50,18 @@ class TriajePeticion(models.Model):
         (PRIORIDAD_BAJA, 'Baja'),
     ]
 
+    DECISION_PENDIENTE = 'PENDIENTE'
+    DECISION_ACEPTADA = 'ACEPTADA'
+    DECISION_RECHAZADA = 'RECHAZADA'
+    DECISION_NO_APLICA = 'NO_APLICA'
+
+    DECISIONES_HUMANAS_CHOICES = [
+        (DECISION_PENDIENTE, 'Pendiente de revisión'),
+        (DECISION_ACEPTADA, 'Aceptada'),
+        (DECISION_RECHAZADA, 'Rechazada'),
+        (DECISION_NO_APLICA, 'No aplica'),
+    ]
+
     id_triaje = models.BigAutoField(primary_key=True)
     peticion = models.OneToOneField(
         'peticiones.Peticiones',
@@ -56,6 +70,7 @@ class TriajePeticion(models.Model):
         related_name='triaje_ia',
     )
     clave_idempotencia = models.CharField(max_length=120, unique=True)
+    despacho_token = models.CharField(max_length=64, blank=True, default='')
 
     estado_envio = models.CharField(
         max_length=25,
@@ -70,12 +85,15 @@ class TriajePeticion(models.Model):
 
     intentos_envio = models.PositiveSmallIntegerField(default=0)
     max_intentos = models.PositiveSmallIntegerField(default=3)
+    lease_expira_en = models.DateTimeField(null=True, blank=True)
+    ultimo_intento_en = models.DateTimeField(null=True, blank=True)
     proximo_reintento_en = models.DateTimeField(null=True, blank=True)
     ultimo_codigo_http = models.PositiveSmallIntegerField(null=True, blank=True)
     ultimo_error_envio = models.TextField(blank=True, default='')
     enviado_en = models.DateTimeField(null=True, blank=True)
     completado_en = models.DateTimeField(null=True, blank=True)
     n8n_execution_id = models.CharField(max_length=120, blank=True, default='')
+    version_resultado = models.PositiveIntegerField(default=0)
 
     prioridad_original = models.CharField(max_length=20, null=True, blank=True)
     prioridad_sugerida = models.CharField(
@@ -89,6 +107,10 @@ class TriajePeticion(models.Model):
     resumen_texto = models.TextField(blank=True, default='')
     resumen_vision = models.TextField(blank=True, default='')
     signos_detectados = models.JSONField(default=list, blank=True)
+    signos_reportados = models.JSONField(default=list, blank=True)
+    signos_fotografia = models.JSONField(default=list, blank=True)
+    contradiccion_foto_descripcion = models.BooleanField(default=False)
+    advertencias_contradiccion = models.JSONField(default=list, blank=True)
 
     posibles_duplicados = models.JSONField(default=list, blank=True)
     total_duplicados_detectados = models.PositiveIntegerField(default=0)
@@ -103,6 +125,42 @@ class TriajePeticion(models.Model):
     )
     justificacion_recomendacion = models.TextField(blank=True, default='')
     carga_veterinarios_snapshot = models.JSONField(default=list, blank=True)
+
+    decision_prioridad = models.CharField(
+        max_length=20,
+        choices=DECISIONES_HUMANAS_CHOICES,
+        default=DECISION_PENDIENTE,
+    )
+    decision_prioridad_por = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='id_decision_prioridad_por',
+        related_name='triajes_decision_prioridad',
+    )
+    decision_prioridad_en = models.DateTimeField(null=True, blank=True)
+    decision_prioridad_observacion = models.TextField(blank=True, default='')
+    prioridad_aplicada = models.CharField(max_length=20, null=True, blank=True)
+
+    decision_veterinario = models.CharField(
+        max_length=20,
+        choices=DECISIONES_HUMANAS_CHOICES,
+        default=DECISION_PENDIENTE,
+    )
+    decision_veterinario_por = models.ForeignKey(
+        'users.Usuarios',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='id_decision_veterinario_por',
+        related_name='triajes_decision_veterinario',
+    )
+    decision_veterinario_en = models.DateTimeField(null=True, blank=True)
+    decision_veterinario_observacion = models.TextField(blank=True, default='')
+    veterinario_asignado_decision_id = models.IntegerField(null=True, blank=True)
+
+    historial_decisiones = models.JSONField(default=list, blank=True)
 
     modelo_texto_usado = models.CharField(max_length=100, blank=True, default='')
     modelo_vision_usado = models.CharField(max_length=100, blank=True, default='')
@@ -121,8 +179,16 @@ class TriajePeticion(models.Model):
                 name='idx_triaje_envio_reint',
             ),
             models.Index(
+                fields=['estado_envio', 'lease_expira_en'],
+                name='idx_triaje_envio_lease',
+            ),
+            models.Index(
                 fields=['estado_analisis', '-fecha_creacion'],
                 name='idx_triaje_analisis_fecha',
+            ),
+            models.Index(
+                fields=['estado_analisis', 'enviado_en'],
+                name='idx_triaje_analisis_env',
             ),
         ]
 

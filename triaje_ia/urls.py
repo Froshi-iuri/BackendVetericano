@@ -1,6 +1,7 @@
 from django.urls import path
 
 from triaje_ia.views import (
+    TriajeDecisionPeticionView,
     TriajeDetallePeticionView,
     TriajeInternoCargaVeterinariosView,
     TriajeInternoContextoPeticionView,
@@ -47,5 +48,10 @@ urlpatterns = [
         'peticiones/<int:id_peticion>/reintentar/',
         TriajeReintentarPeticionView.as_view(),
         name='triaje-reintentar-peticion',
+    ),
+    path(
+        'peticiones/<int:id_peticion>/decision/',
+        TriajeDecisionPeticionView.as_view(),
+        name='triaje-decision-peticion',
     ),
 ]
