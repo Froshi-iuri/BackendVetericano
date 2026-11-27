@@ -1224,6 +1224,18 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
             triaje.completado_en = ahora
         triaje.save()
 
+        rt_notificar.actualizacion_silenciosa(
+            'peticion.estado_actualizado',
+            roles=(1, 2),
+            accion='triaje_actualizado',
+            referencia={
+                'id_peticion': peticion.id_peticion,
+                'numero_radicado': peticion.numero_radicado,
+                'estado_analisis': triaje.estado_analisis,
+                'prioridad_sugerida': triaje.prioridad_sugerida,
+            },
+        )
+
     return triaje
 
 
@@ -1464,6 +1476,13 @@ def registrar_decision_humana_triaje(
 
                 triaje.veterinario_asignado_decision_id = triaje.veterinario_recomendado_id
                 valor_resultante = f'{vet_rec_nombre} (#{triaje.veterinario_recomendado_id})'
+                # Actualizar snapshot de carga laboral para reflejar inmediatamente la nueva asignación
+                try:
+                    carga_actualizada = calcular_carga_veterinarios()
+                    if isinstance(carga_actualizada.get('veterinarios'), list):
+                        triaje.carga_veterinarios_snapshot = carga_actualizada['veterinarios'][:50]
+                except Exception:
+                    pass
             else:
                 valor_resultante = (
                     f'{_nombre_usuario_auditoria(vet_ant)} (#{vet_ant.id_usuario})'
@@ -1498,6 +1517,7 @@ def registrar_decision_humana_triaje(
                     'decision_veterinario_en',
                     'decision_veterinario_observacion',
                     'veterinario_asignado_decision_id',
+                    'carga_veterinarios_snapshot',
                     'historial_decisiones',
                     'fecha_actualizacion',
                 ]

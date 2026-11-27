@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.db import connection, connections
 from rest_framework import serializers
 
 from peticiones.models import PeticionPosibleDuplicado
@@ -6,6 +7,118 @@ from peticiones.services.duplicados_service import extraer_fotografias_peticion
 from peticiones.utils import detectar_tipo_archivo
 from triaje_ia.models import TriajePeticion
 from triaje_ia.services import normalizar_prioridad_sugerida
+
+
+def tabla_triaje_disponible() -> bool:
+    """
+    Verifica de forma segura si la tabla `triaje_peticion` existe en la conexión actual
+    (p. ej. entornos o plantillas de prueba previos a aplicar migraciones de `triaje_ia`).
+    """
+    try:
+        conn_real = connections[connection.alias]
+    except Exception:
+        conn_real = connection
+    if getattr(conn_real, '_triaje_tabla_disponible', False):
+        return True
+    try:
+        existe = TriajePeticion._meta.db_table in conn_real.introspection.table_names()
+    except Exception:
+        return False
+    if existe:
+        setattr(conn_real, '_triaje_tabla_disponible', True)
+    return existe
+
+
+def _nombre_usuario_triaje(user_obj):
+    if not user_obj:
+        return None
+    return f'{user_obj.nombre or ""} {user_obj.apellido or ""}'.strip() or user_obj.email
+
+
+def calcular_puede_reintentar_triaje(obj) -> bool:
+    if obj.estado_analisis in (
+        TriajePeticion.ANALISIS_FALLIDO,
+        TriajePeticion.ANALISIS_PARCIAL,
+        TriajePeticion.ANALISIS_PENDIENTE,
+        TriajePeticion.ANALISIS_EN_PROCESO,
+    ):
+        return True
+    return obj.estado_envio in (
+        TriajePeticion.ENVIO_FALLO_TEMPORAL,
+        TriajePeticion.ENVIO_FALLO_DEFINITIVO,
+        TriajePeticion.ENVIO_OMITIDO,
+    )
+
+
+def _buscar_carga_en_snapshot_triaje(obj):
+    vet_id = getattr(obj, 'veterinario_recomendado_id', None)
+    if not vet_id:
+        return None
+    snap = getattr(obj, 'carga_veterinarios_snapshot', None) or []
+    if not isinstance(snap, list):
+        return None
+    for item in snap:
+        if isinstance(item, dict) and item.get('id_veterinario') == vet_id:
+            return item
+    return None
+
+
+def extraer_veterinario_recomendado_sede(obj):
+    vet = getattr(obj, 'veterinario_recomendado', None)
+    if vet and getattr(vet, 'id_sede', None):
+        return getattr(vet.id_sede, 'nombre', None)
+    snap = _buscar_carga_en_snapshot_triaje(obj)
+    return snap.get('sede_nombre') if snap else None
+
+
+def extraer_veterinario_recomendado_carga(obj):
+    snap = _buscar_carga_en_snapshot_triaje(obj)
+    if not snap:
+        return None
+    return {
+        'id_veterinario': snap.get('id_veterinario'),
+        'id_sede': snap.get('id_sede'),
+        'sede_nombre': snap.get('sede_nombre'),
+        'total_asignados': snap.get('total_asignados', 0),
+        'pendientes': snap.get('pendientes', 0),
+        'en_proceso': snap.get('en_proceso', 0),
+        'finalizadas': snap.get('finalizadas', 0),
+        'carga_activa': snap.get('carga_activa', 0),
+        'urgentes_activos': snap.get('urgentes_activos', 0),
+        'saturado': bool(snap.get('saturado', False)),
+        'porcentaje_completado': snap.get('porcentaje_completado', 0),
+    }
+
+
+def construir_resumen_triaje_tarjeta(obj):
+    """
+    Construye el resumen ligero de triaje IA para las tarjetas del listado
+    sin consultas adicionales ni exposición de datos internos completos.
+    """
+    if obj is None:
+        return None
+    return {
+        'id_triaje': obj.id_triaje,
+        'automatizacion_activa': bool(getattr(settings, 'TRIAJE_N8N_ACTIVO', False)),
+        'puede_reintentar': calcular_puede_reintentar_triaje(obj),
+        'estado_envio': obj.estado_envio,
+        'estado_analisis': obj.estado_analisis,
+        'prioridad_sugerida': obj.prioridad_sugerida,
+        'prioridad_aplicada': obj.prioridad_aplicada,
+        'decision_prioridad': obj.decision_prioridad,
+        'veterinario_recomendado_id': obj.veterinario_recomendado_id,
+        'veterinario_recomendado_nombre': _nombre_usuario_triaje(
+            getattr(obj, 'veterinario_recomendado', None)
+        ),
+        'veterinario_recomendado_sede': extraer_veterinario_recomendado_sede(obj),
+        'veterinario_recomendado_carga': extraer_veterinario_recomendado_carga(obj),
+        'decision_veterinario': obj.decision_veterinario,
+        'veterinario_asignado_decision_id': obj.veterinario_asignado_decision_id,
+        'contradiccion_foto_descripcion': bool(obj.contradiccion_foto_descripcion),
+        'total_duplicados_detectados': int(obj.total_duplicados_detectados or 0),
+        'completado_en': obj.completado_en.isoformat() if obj.completado_en else None,
+        'fecha_actualizacion': obj.fecha_actualizacion.isoformat() if obj.fecha_actualizacion else None,
+    }
 
 
 class TriajeResultadoInputSerializer(serializers.Serializer):
@@ -192,9 +305,7 @@ class TriajePeticionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def _nombre_usuario(self, user_obj):
-        if not user_obj:
-            return None
-        return f'{user_obj.nombre or ""} {user_obj.apellido or ""}'.strip() or user_obj.email
+        return _nombre_usuario_triaje(user_obj)
 
     def get_automatizacion_activa(self, obj):
         return bool(getattr(settings, 'TRIAJE_N8N_ACTIVO', False))
@@ -207,58 +318,16 @@ class TriajePeticionSerializer(serializers.ModelSerializer):
         return any(detectar_tipo_archivo(u) == 'imagen' for u in todas)
 
     def get_puede_reintentar(self, obj):
-        if obj.estado_analisis in (
-            TriajePeticion.ANALISIS_FALLIDO,
-            TriajePeticion.ANALISIS_PARCIAL,
-            TriajePeticion.ANALISIS_PENDIENTE,
-            TriajePeticion.ANALISIS_EN_PROCESO,
-        ):
-            return True
-        return obj.estado_envio in (
-            TriajePeticion.ENVIO_FALLO_TEMPORAL,
-            TriajePeticion.ENVIO_FALLO_DEFINITIVO,
-            TriajePeticion.ENVIO_OMITIDO,
-        )
+        return calcular_puede_reintentar_triaje(obj)
 
     def get_veterinario_recomendado_nombre(self, obj):
         return self._nombre_usuario(getattr(obj, 'veterinario_recomendado', None))
 
-    def _buscar_carga_en_snapshot(self, obj):
-        vet_id = getattr(obj, 'veterinario_recomendado_id', None)
-        if not vet_id:
-            return None
-        snap = getattr(obj, 'carga_veterinarios_snapshot', None) or []
-        if not isinstance(snap, list):
-            return None
-        for item in snap:
-            if isinstance(item, dict) and item.get('id_veterinario') == vet_id:
-                return item
-        return None
-
     def get_veterinario_recomendado_sede(self, obj):
-        vet = getattr(obj, 'veterinario_recomendado', None)
-        if vet and getattr(vet, 'id_sede', None):
-            return getattr(vet.id_sede, 'nombre', None)
-        snap = self._buscar_carga_en_snapshot(obj)
-        return snap.get('sede_nombre') if snap else None
+        return extraer_veterinario_recomendado_sede(obj)
 
     def get_veterinario_recomendado_carga(self, obj):
-        snap = self._buscar_carga_en_snapshot(obj)
-        if not snap:
-            return None
-        return {
-            'id_veterinario': snap.get('id_veterinario'),
-            'id_sede': snap.get('id_sede'),
-            'sede_nombre': snap.get('sede_nombre'),
-            'total_asignados': snap.get('total_asignados', 0),
-            'pendientes': snap.get('pendientes', 0),
-            'en_proceso': snap.get('en_proceso', 0),
-            'finalizadas': snap.get('finalizadas', 0),
-            'carga_activa': snap.get('carga_activa', 0),
-            'urgentes_activos': snap.get('urgentes_activos', 0),
-            'saturado': bool(snap.get('saturado', False)),
-            'porcentaje_completado': snap.get('porcentaje_completado', 0),
-        }
+        return extraer_veterinario_recomendado_carga(obj)
 
     def get_posibles_duplicados_detalle(self, obj):
         candidatos = getattr(obj, 'posibles_duplicados', None) or []

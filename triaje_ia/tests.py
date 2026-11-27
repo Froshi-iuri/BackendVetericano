@@ -1030,6 +1030,7 @@ class TriajeIntegracionJuridicaYDecisionesTests(_BaseTriajeSqliteTestCase):
         self.assertEqual(self.peticion.asignado_a_id, self.vet_1.id_usuario)
         self.assertEqual(self.peticion.id_estado.nombre, 'Asignada')
         self.assertEqual(resp_vet.data['triaje']['decision_veterinario'], 'ACEPTADA')
+        self.assertGreaterEqual(resp_vet.data['triaje']['veterinario_recomendado_carga']['carga_activa'], 1)
         self.assertEqual(len(resp_vet.data['triaje']['historial_decisiones']), 2)
         self.assertTrue(
             HistorialPeticiones.objects.filter(
@@ -1249,3 +1250,103 @@ class TriajeIntegracionJuridicaYDecisionesTests(_BaseTriajeSqliteTestCase):
         self.assertTrue(r_dec.data['cambiada'])
         self.assertEqual(NotificacionPeticion.objects.filter(id_peticion=self.peticion).count(), notif_tras_patch)
         self.assertEqual(HistP.objects.filter(id_peticion=self.peticion, tipo_cambio='ASIGNACION').count(), hist_asig_tras_patch)
+
+    def test_listar_peticiones_expone_triaje_resumen_sin_n_plus_1_y_protege_roles(self):
+        from django.test.utils import CaptureQueriesContext
+
+        registrar_resultado_triaje(
+            self.peticion.id_peticion,
+            {
+                'estado_analisis': 'COMPLETADO',
+                'prioridad_sugerida': 'URGENTE',
+                'justificacion': 'Atropellamiento con hemorragia.',
+                'veterinario_recomendado_id': self.vet_1.id_usuario,
+                'carga_veterinarios_snapshot': [
+                    {
+                        'id_veterinario': self.vet_1.id_usuario,
+                        'nombre_completo': 'Laura Vet',
+                        'id_sede': self.sede.id_sede,
+                        'sede_nombre': self.sede.nombre,
+                        'total_asignados': 3,
+                        'pendientes': 1,
+                        'en_proceso': 1,
+                        'finalizadas': 1,
+                        'carga_activa': 2,
+                        'urgentes_activos': 1,
+                        'saturado': False,
+                        'porcentaje_completado': 33,
+                    }
+                ],
+            },
+        )
+
+        self.client.force_authenticate(user=self.juridico)
+        # Primer llamado calienta caché de existencia de tabla
+        resp_warmup = self.client.get('/api/peticiones/listar/')
+        self.assertEqual(resp_warmup.status_code, status.HTTP_200_OK)
+
+        with CaptureQueriesContext(self._sqlite_conn) as ctx_uno:
+            resp_uno = self.client.get('/api/peticiones/listar/')
+        self.assertEqual(resp_uno.status_code, status.HTTP_200_OK)
+
+        # Agregar más peticiones con y sin triaje (incluida una asignada al veterinario)
+        for i in range(4):
+            pet_extra = self._crear_peticion(
+                descripcion=f'Denuncia adicional #{i}',
+                prioridad='Baja',
+                asignado_a=self.vet_1 if i == 0 else None,
+                estado=self.estado_asig if i == 0 else self.estado_rev,
+            )
+            if i < 3:
+                registrar_resultado_triaje(
+                    pet_extra.id_peticion,
+                    {
+                        'estado_analisis': 'COMPLETADO',
+                        'prioridad_sugerida': 'ALTA',
+                        'veterinario_recomendado_id': self.vet_2.id_usuario,
+                        'carga_veterinarios_snapshot': [
+                            {
+                                'id_veterinario': self.vet_2.id_usuario,
+                                'nombre_completo': 'Carlos Vet',
+                                'id_sede': self.sede.id_sede,
+                                'sede_nombre': self.sede.nombre,
+                                'total_asignados': 1,
+                                'pendientes': 1,
+                                'en_proceso': 0,
+                                'finalizadas': 0,
+                                'carga_activa': 1,
+                                'urgentes_activos': 0,
+                                'saturado': False,
+                                'porcentaje_completado': 0,
+                            }
+                        ],
+                    },
+                )
+
+        with CaptureQueriesContext(self._sqlite_conn) as ctx_cinco:
+            resp_cinco = self.client.get('/api/peticiones/listar/')
+        self.assertEqual(resp_cinco.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp_cinco.data), 5)
+        self.assertEqual(len(ctx_cinco), len(ctx_uno))
+
+        por_id = {item['id_peticion']: item for item in resp_cinco.data}
+        item_principal = por_id[self.peticion.id_peticion]
+        self.assertEqual(item_principal['prioridad'], 'Media')
+        self.assertIsNone(item_principal['asignado_a'])
+        self.assertEqual(item_principal['triaje_resumen']['prioridad_sugerida'], 'URGENTE')
+        self.assertEqual(item_principal['triaje_resumen']['decision_prioridad'], 'PENDIENTE')
+        self.assertEqual(item_principal['triaje_resumen']['veterinario_recomendado_nombre'], 'Laura Vet')
+        self.assertEqual(item_principal['triaje_resumen']['veterinario_recomendado_carga']['carga_activa'], 2)
+        self.assertEqual(item_principal['triaje_resumen']['decision_veterinario'], 'PENDIENTE')
+
+        sin_triaje = [item for item in resp_cinco.data if item['triaje_resumen'] is None]
+        self.assertEqual(len(sin_triaje), 1)
+
+        # Roles no autorizados (Veterinario y Peticionario) nunca reciben triaje_resumen
+        for usuario_no_auth in (self.vet_1, self.ciudadano):
+            self.client.force_authenticate(user=usuario_no_auth)
+            resp_rol = self.client.get('/api/peticiones/listar/')
+            self.assertEqual(resp_rol.status_code, status.HTTP_200_OK)
+            self.assertGreater(len(resp_rol.data), 0)
+            for item in resp_rol.data:
+                self.assertNotIn('triaje_resumen', item)

@@ -1163,6 +1163,15 @@ def _juridico_listar_peticiones_get_queryset(self):
     qs = _orig_listar_peticiones_get_qs(self).select_related('asignado_por').prefetch_related('historial_cambios')
     params = self.request.query_params
     rol_id = getattr(self.request.user, 'id_rol_id', None)
+    if rol_id in (1, 2):
+        from triaje_ia.serializers import tabla_triaje_disponible
+
+        if tabla_triaje_disponible():
+            qs = qs.select_related(
+                'triaje_ia',
+                'triaje_ia__veterinario_recomendado',
+                'triaje_ia__veterinario_recomendado__id_sede',
+            )
 
     duplicadas_subq = PeticionPosibleDuplicado.objects.filter(
         estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
@@ -1207,7 +1216,7 @@ _orig_detalle_peticion_get_qs = DetallePeticionView.get_queryset
 
 
 def _juridico_detalle_peticion_get_queryset(self):
-    return (
+    qs = (
         _orig_detalle_peticion_get_qs(self)
         .select_related('asignado_por')
         .prefetch_related(
@@ -1220,6 +1229,17 @@ def _juridico_detalle_peticion_get_queryset(self):
             'historial_cambios__id_usuario_accion__id_rol',
         )
     )
+    rol_id = getattr(getattr(self.request, 'user', None), 'id_rol_id', None)
+    if rol_id in (1, 2):
+        from triaje_ia.serializers import tabla_triaje_disponible
+
+        if tabla_triaje_disponible():
+            qs = qs.select_related(
+                'triaje_ia',
+                'triaje_ia__veterinario_recomendado',
+                'triaje_ia__veterinario_recomendado__id_sede',
+            )
+    return qs
 
 
 DetallePeticionView.get_queryset = _juridico_detalle_peticion_get_queryset
