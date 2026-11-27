@@ -1312,6 +1312,23 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
 
         transaction.on_commit(_ejecutar_deteccion_post_commit)
 
+    # 6. Encolar triaje inteligente hacia n8n post-commit (apagado por defecto: TRIAJE_N8N_ACTIVO=False)
+    from django.conf import settings as django_settings
+    if getattr(django_settings, 'TRIAJE_N8N_ACTIVO', False) and _debe_ejecutar_deteccion_automatica(peticion):
+        peticion_para_triaje = peticion
+
+        def _ejecutar_triaje_n8n_post_commit():
+            try:
+                from triaje_ia.services import encolar_y_despachar_triaje_peticion
+                encolar_y_despachar_triaje_peticion(peticion_para_triaje)
+            except Exception:
+                logger.exception(
+                    "Error no bloqueante al encolar triaje n8n para petición #%s.",
+                    getattr(peticion_para_triaje, 'id_peticion', None),
+                )
+
+        transaction.on_commit(_ejecutar_triaje_n8n_post_commit)
+
     evidencias_urls = list(peticion.evidenciapeticiones_set.values_list('ruta_archivo', flat=True))
     return Response({
         "mensaje": "Petición iniciada con éxito",

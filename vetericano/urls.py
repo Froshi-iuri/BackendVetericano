@@ -76,4 +76,7 @@ urlpatterns = [
     # Endpoints de Apoyo Diagnóstico IA Local (scikit-learn)
     path('api/diagnostico-ia/', include('diagnostico_ia.urls')),
     path('api/clinica/diagnostico-ia/', include('diagnostico_ia.urls')),
+
+    # Endpoints de Triaje Inteligente IA (n8n)
+    path('api/triaje-ia/', include('triaje_ia.urls')),
 ]

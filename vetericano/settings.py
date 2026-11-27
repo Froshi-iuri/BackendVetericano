@@ -70,6 +70,7 @@ INSTALLED_APPS = [
     'dashboard',
     'realtime',
     'diagnostico_ia',
+    'triaje_ia',
 ]
 
 MIDDLEWARE = [
@@ -588,5 +589,30 @@ GOOGLE_OAUTH_ALLOWED_LINK_ROLES = _leer_env_roles_csv(
 GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS = tuple(
     d.lower() for d in _leer_env_lista_csv('GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS')
 )
+
+
+# ─── Triaje Inteligente IA (orquestación con n8n) ────────────────────────────────────────
+# Apagado por defecto hasta completar pruebas, migración y despliegue centralizado de n8n.
+TRIAJE_N8N_ACTIVO = _leer_env_bool('TRIAJE_N8N_ACTIVO', default=False)
+TRIAJE_N8N_WEBHOOK_URL = os.environ.get('TRIAJE_N8N_WEBHOOK_URL', '').strip()
+TRIAJE_N8N_WEBHOOK_SECRET = os.environ.get('TRIAJE_N8N_WEBHOOK_SECRET', '').strip()
+TRIAJE_SERVICE_TOKEN = os.environ.get('TRIAJE_SERVICE_TOKEN', '').strip()
+TRIAJE_N8N_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_TIMEOUT_SEGUNDOS',
+    default=5.0,
+    min_val=0.5,
+    max_val=30.0,
+)
+try:
+    TRIAJE_N8N_MAX_REINTENTOS = max(1, min(10, int(os.environ.get('TRIAJE_N8N_MAX_REINTENTOS', '3'))))
+except (TypeError, ValueError):
+    TRIAJE_N8N_MAX_REINTENTOS = 3
+TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS',
+    default=60.0,
+    min_val=5.0,
+    max_val=3600.0,
+)
+TRIAJE_N8N_ASYNC_THREAD = _leer_env_bool('TRIAJE_N8N_ASYNC_THREAD', default=True)
 
 
