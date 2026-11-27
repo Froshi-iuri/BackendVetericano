@@ -1163,6 +1163,15 @@ def _juridico_listar_peticiones_get_queryset(self):
     qs = _orig_listar_peticiones_get_qs(self).select_related('asignado_por').prefetch_related('historial_cambios')
     params = self.request.query_params
     rol_id = getattr(self.request.user, 'id_rol_id', None)
+    if rol_id in (1, 2):
+        from triaje_ia.serializers import tabla_triaje_disponible
+
+        if tabla_triaje_disponible():
+            qs = qs.select_related(
+                'triaje_ia',
+                'triaje_ia__veterinario_recomendado',
+                'triaje_ia__veterinario_recomendado__id_sede',
+            )
 
     duplicadas_subq = PeticionPosibleDuplicado.objects.filter(
         estado_revision=PeticionPosibleDuplicado.ESTADO_CONFIRMADO,
@@ -1207,7 +1216,7 @@ _orig_detalle_peticion_get_qs = DetallePeticionView.get_queryset
 
 
 def _juridico_detalle_peticion_get_queryset(self):
-    return (
+    qs = (
         _orig_detalle_peticion_get_qs(self)
         .select_related('asignado_por')
         .prefetch_related(
@@ -1220,6 +1229,17 @@ def _juridico_detalle_peticion_get_queryset(self):
             'historial_cambios__id_usuario_accion__id_rol',
         )
     )
+    rol_id = getattr(getattr(self.request, 'user', None), 'id_rol_id', None)
+    if rol_id in (1, 2):
+        from triaje_ia.serializers import tabla_triaje_disponible
+
+        if tabla_triaje_disponible():
+            qs = qs.select_related(
+                'triaje_ia',
+                'triaje_ia__veterinario_recomendado',
+                'triaje_ia__veterinario_recomendado__id_sede',
+            )
+    return qs
 
 
 DetallePeticionView.get_queryset = _juridico_detalle_peticion_get_queryset
@@ -1344,6 +1364,23 @@ def _juridico_iniciar_peticion_create(self, request, *args, **kwargs):
                 )
 
         transaction.on_commit(_ejecutar_deteccion_post_commit)
+
+    # 6. Encolar triaje inteligente hacia n8n post-commit (apagado por defecto: TRIAJE_N8N_ACTIVO=False)
+    from django.conf import settings as django_settings
+    if getattr(django_settings, 'TRIAJE_N8N_ACTIVO', False) and _debe_ejecutar_deteccion_automatica(peticion):
+        peticion_para_triaje = peticion
+
+        def _ejecutar_triaje_n8n_post_commit():
+            try:
+                from triaje_ia.services import encolar_y_despachar_triaje_peticion
+                encolar_y_despachar_triaje_peticion(peticion_para_triaje)
+            except Exception:
+                logger.exception(
+                    "Error no bloqueante al encolar triaje n8n para petición #%s.",
+                    getattr(peticion_para_triaje, 'id_peticion', None),
+                )
+
+        transaction.on_commit(_ejecutar_triaje_n8n_post_commit)
 
     evidencias_urls = list(peticion.evidenciapeticiones_set.values_list('ruta_archivo', flat=True))
     return Response({

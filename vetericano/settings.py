@@ -100,6 +100,7 @@ INSTALLED_APPS = [
     'dashboard',
     'realtime',
     'diagnostico_ia',
+    'triaje_ia',
 ]
 
 MIDDLEWARE = [
@@ -669,5 +670,64 @@ GOOGLE_OAUTH_ALLOWED_LINK_ROLES = _leer_env_roles_csv(
 GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS = tuple(
     d.lower() for d in _leer_env_lista_csv('GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS')
 )
+
+
+# ─── Triaje Inteligente IA (orquestación con n8n) ────────────────────────────────────────
+# Apagado por defecto hasta completar pruebas, migración y despliegue centralizado de n8n.
+TRIAJE_N8N_ACTIVO = _leer_env_bool('TRIAJE_N8N_ACTIVO', default=False)
+TRIAJE_N8N_WEBHOOK_URL = os.environ.get('TRIAJE_N8N_WEBHOOK_URL', '').strip()
+TRIAJE_N8N_WEBHOOK_SECRET = os.environ.get('TRIAJE_N8N_WEBHOOK_SECRET', '').strip()
+TRIAJE_SERVICE_TOKEN = os.environ.get('TRIAJE_SERVICE_TOKEN', '').strip()
+TRIAJE_N8N_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_TIMEOUT_SEGUNDOS',
+    default=20.0,
+    min_val=0.5,
+    max_val=30.0,
+)
+try:
+    TRIAJE_N8N_MAX_REINTENTOS = max(1, min(10, int(os.environ.get('TRIAJE_N8N_MAX_REINTENTOS', '6'))))
+except (TypeError, ValueError):
+    TRIAJE_N8N_MAX_REINTENTOS = 6
+TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS',
+    default=30.0,
+    min_val=5.0,
+    max_val=3600.0,
+)
+TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS',
+    default=900.0,
+    min_val=30.0,
+    max_val=7200.0,
+)
+TRIAJE_N8N_ASYNC_THREAD = _leer_env_bool('TRIAJE_N8N_ASYNC_THREAD', default=True)
+TRIAJE_ENVIAR_URLS_EXTERNAS_N8N = _leer_env_bool('TRIAJE_ENVIAR_URLS_EXTERNAS_N8N', default=False)
+TRIAJE_LEASE_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_LEASE_TIMEOUT_SEGUNDOS',
+    default=60.0,
+    min_val=10.0,
+    max_val=600.0,
+)
+TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS',
+    default=300.0,
+    min_val=30.0,
+    max_val=3600.0,
+)
+TRIAJE_RECOVERY_INTERVAL_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_RECOVERY_INTERVAL_SEGUNDOS',
+    default=30.0,
+    min_val=5.0,
+    max_val=600.0,
+)
+TRIAJE_RECOVERY_IN_PROCESS = _leer_env_bool('TRIAJE_RECOVERY_IN_PROCESS', default=True)
+TRIAJE_AISLAR_POR_SEDE = _leer_env_bool('TRIAJE_AISLAR_POR_SEDE', default=False)
+try:
+    TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO = max(
+        0,
+        int(os.environ.get('TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO', '0')),
+    )
+except (TypeError, ValueError):
+    TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO = 0
 
 

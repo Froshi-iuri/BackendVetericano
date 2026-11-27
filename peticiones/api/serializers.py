@@ -1500,7 +1500,12 @@ def construir_historial_peticion_lista(peticion) -> list:
     return data
 
 
-def _enriquecer_datos_juridico_peticion(instance, data: dict, incluir_historial: bool = False) -> dict:
+def _enriquecer_datos_juridico_peticion(
+    instance,
+    data: dict,
+    incluir_historial: bool = False,
+    request=None,
+) -> dict:
     """
     Agrega de forma aditiva los campos requeridos por Jurídico (veterinario responsable,
     tiempo transcurrido, días sin avanzar, indicador de reasignación e historial)
@@ -1561,6 +1566,32 @@ def _enriquecer_datos_juridico_peticion(instance, data: dict, incluir_historial:
     if incluir_historial:
         data['historial'] = construir_historial_peticion_lista(instance)
 
+    rol_id = getattr(getattr(request, 'user', None), 'id_rol_id', None) if request else None
+    if rol_id in (1, 2):
+        from triaje_ia.models import TriajePeticion
+        from triaje_ia.serializers import construir_resumen_triaje_tarjeta, tabla_triaje_disponible
+
+        fields_cache = getattr(getattr(instance, '_state', None), 'fields_cache', None)
+        if isinstance(fields_cache, dict) and 'triaje_ia' in fields_cache:
+            triaje_obj = fields_cache['triaje_ia']
+        elif (
+            incluir_historial
+            and getattr(getattr(instance, '_state', None), 'db', None)
+            and getattr(instance, 'pk', None)
+            and tabla_triaje_disponible()
+        ):
+            triaje_obj = (
+                TriajePeticion.objects.select_related(
+                    'veterinario_recomendado',
+                    'veterinario_recomendado__id_sede',
+                )
+                .filter(peticion_id=instance.pk)
+                .first()
+            )
+        else:
+            triaje_obj = None
+        data['triaje_resumen'] = construir_resumen_triaje_tarjeta(triaje_obj)
+
     return data
 
 
@@ -1569,7 +1600,12 @@ _orig_listar_peticiones_to_rep = ListarPeticionesSerializer.to_representation
 
 def _listar_peticiones_to_representation(self, instance):
     data = _orig_listar_peticiones_to_rep(self, instance)
-    return _enriquecer_datos_juridico_peticion(instance, data, incluir_historial=False)
+    return _enriquecer_datos_juridico_peticion(
+        instance,
+        data,
+        incluir_historial=False,
+        request=self.context.get('request'),
+    )
 
 
 ListarPeticionesSerializer.to_representation = _listar_peticiones_to_representation
@@ -1580,7 +1616,12 @@ _orig_detalle_peticion_to_rep = DetallePeticionSerializer.to_representation
 
 def _detalle_peticion_to_representation(self, instance):
     data = _orig_detalle_peticion_to_rep(self, instance)
-    return _enriquecer_datos_juridico_peticion(instance, data, incluir_historial=True)
+    return _enriquecer_datos_juridico_peticion(
+        instance,
+        data,
+        incluir_historial=True,
+        request=self.context.get('request'),
+    )
 
 
 DetallePeticionSerializer.to_representation = _detalle_peticion_to_representation
