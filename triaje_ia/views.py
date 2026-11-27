@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -23,6 +24,7 @@ from triaje_ia.services import (
     construir_payload_peticion_triaje,
     ejecutar_deteccion_duplicados_triaje,
     encolar_y_despachar_triaje_peticion,
+    obtener_foto_sanitizada_para_triaje,
     recuperar_trabajos_interrumpidos,
     registrar_decision_humana_triaje,
     registrar_resultado_triaje,
@@ -44,8 +46,7 @@ def _parse_int_opcional(valor):
 class TriajeInternoContextoPeticionView(_VistaInternaTriajeBase):
     """
     GET /api/triaje-ia/interno/peticiones/<id_peticion>/
-    Retorna el contexto completo de la petición (descripción, fotos Cloudinary y GPS)
-    para el workflow de triaje en n8n.
+    Retorna el contexto minimizado y sanitizado de la petición para el workflow de n8n.
     """
 
     def get(self, request, id_peticion):
@@ -61,6 +62,26 @@ class TriajeInternoContextoPeticionView(_VistaInternaTriajeBase):
                 status=status.HTTP_404_NOT_FOUND,
             )
         return Response(construir_payload_peticion_triaje(peticion), status=status.HTTP_200_OK)
+
+
+class TriajeInternoFotoSeguraView(_VistaInternaTriajeBase):
+    """
+    GET /api/triaje-ia/interno/peticiones/<id_peticion>/foto-segura/
+    Entrega la fotografía principal re-codificada en JPEG limpio sin metadatos EXIF/GPS/XMP
+    ni perfiles de cámara antes de ser enviada a n8n y Gemini Vision.
+    """
+
+    def get(self, request, id_peticion):
+        try:
+            jpeg_bytes = obtener_foto_sanitizada_para_triaje(id_peticion)
+        except (PeticionNoEncontradaError, TriajeNoEncontradoError) as exc:
+            return Response(
+                {'error': str(exc)},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        response = HttpResponse(jpeg_bytes, content_type='image/jpeg')
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 class TriajeInternoDuplicadosView(_VistaInternaTriajeBase):

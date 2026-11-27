@@ -1350,3 +1350,199 @@ class TriajeIntegracionJuridicaYDecisionesTests(_BaseTriajeSqliteTestCase):
             self.assertGreater(len(resp_rol.data), 0)
             for item in resp_rol.data:
                 self.assertNotIn('triaje_resumen', item)
+
+
+class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCase):
+    def test_sanitizacion_pii_y_minimizacion_payload_n8n(self):
+        from triaje_ia.services import (
+            construir_payload_peticion_triaje,
+            construir_url_foto_sin_metadatos_cloudinary,
+            sanitizar_texto_pii_para_ia,
+        )
+
+        texto_con_pii = (
+            'Soy Juan Carlos Perez, tel 3124567890, CC 1.061.789.123, '
+            'correo prueba@correo.co, placa ABC123 en Calle 5 # 10-20 Barrio La Esperanza. '
+            'El perro presenta sangrado activo tras atropellamiento. https://ejemplo.com/x @usuario'
+        )
+        sanitizado = sanitizar_texto_pii_para_ia(texto_con_pii)
+        self.assertNotIn('Juan Carlos Perez', sanitizado)
+        self.assertNotIn('3124567890', sanitizado)
+        self.assertNotIn('1.061.789.123', sanitizado)
+        self.assertNotIn('prueba@correo.co', sanitizado)
+        self.assertNotIn('ABC123', sanitizado)
+        self.assertNotIn('Calle 5 # 10-20', sanitizado)
+        self.assertNotIn('La Esperanza', sanitizado)
+        self.assertNotIn('https://ejemplo.com/x', sanitizado)
+        self.assertNotIn('@usuario', sanitizado)
+        self.assertIn('perro presenta sangrado activo tras atropellamiento', sanitizado)
+
+        pet = self._crear_peticion(descripcion=texto_con_pii)
+        with override_settings(TRIAJE_ENVIAR_URLS_EXTERNAS_N8N=False):
+            payload = construir_payload_peticion_triaje(pet, despacho_token='tok-123')
+
+        self.assertNotIn('ubicacion', payload)
+        self.assertNotIn('numero_radicado', payload)
+        self.assertNotIn('videos', payload)
+        self.assertTrue(payload['tiene_fotos'])
+        self.assertEqual(payload['total_fotos'], 1)
+        self.assertEqual(payload['foto_segura_path'], f'/api/triaje-ia/interno/peticiones/{pet.id_peticion}/foto-segura/')
+        self.assertEqual(payload['fotos'], [])
+        self.assertIsNone(payload['foto'])
+        self.assertNotIn('3124567890', payload['descripcion'])
+        self.assertIn('sangrado activo', payload['descripcion'])
+
+        url_strip = construir_url_foto_sin_metadatos_cloudinary(
+            'https://res.cloudinary.com/demo/image/upload/v123/perro.jpg'
+        )
+        self.assertIn('/image/upload/fl_strip_profile,', url_strip)
+
+    @override_settings(TRIAJE_SERVICE_TOKEN='token-interno-valido-123')
+    def test_endpoint_foto_segura_elimina_metadatos_exif_y_exige_token(self):
+        import io
+        from PIL import Image
+
+        img = Image.new('RGB', (64, 48), color=(180, 40, 40))
+        exif = Image.Exif()
+        exif[271] = 'CamaraSecreta'
+        exif[272] = 'TelefonoCiudadano'
+        exif[306] = '2026:11:27 10:00:00'
+        buf_origen = io.BytesIO()
+        img.save(buf_origen, format='JPEG', exif=exif.tobytes(), icc_profile=b'perfil-icc-fake')
+        bytes_con_exif = buf_origen.getvalue()
+
+        pet = self._crear_peticion()
+        url = f'/api/triaje-ia/interno/peticiones/{pet.id_peticion}/foto-segura/'
+
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        with patch('triaje_ia.services._descargar_bytes_url_validada', return_value=bytes_con_exif):
+            resp = self.client.get(url, HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp['Content-Type'], 'image/jpeg')
+        self.assertEqual(resp['Cache-Control'], 'no-store')
+
+        with Image.open(io.BytesIO(resp.content)) as limpia:
+            self.assertEqual(limpia.format, 'JPEG')
+            self.assertEqual(len(limpia.getexif()), 0)
+            self.assertNotIn('exif', limpia.info)
+            self.assertNotIn('icc_profile', limpia.info)
+            self.assertNotIn('xmp', limpia.info)
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_MAX_REINTENTOS=6,
+        TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS=10.0,
+        TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS=120.0,
+        TRIAJE_N8N_ASYNC_THREAD=False,
+    )
+    def test_recuperacion_automatica_fallo_ia_transitorio_y_tope_backoff(self):
+        from triaje_ia.services import _calcular_espera_backoff
+
+        self.assertEqual(_calcular_espera_backoff(1, backoff_base=60.0, backoff_max=900.0), 60.0)
+        self.assertEqual(_calcular_espera_backoff(5, backoff_base=60.0, backoff_max=900.0), 900.0)
+
+        pet = self._crear_peticion(descripcion='Perro con dificultad respiratoria')
+        with patch('triaje_ia.services.requests.post', return_value=MagicMock(status_code=200, text='ok')):
+            res_envio = encolar_y_despachar_triaje_peticion(pet, async_dispatch=False)
+        self.assertTrue(res_envio['enviado'])
+
+        triaje = TriajePeticion.objects.get(peticion=pet)
+        self.assertEqual(triaje.max_intentos, 6)
+
+        # Callback reporta FALLO/PARCIAL de IA sin prioridad sugerida -> programa reintento automático
+        registrar_resultado_triaje(
+            pet.id_peticion,
+            {
+                'despacho_token': triaje.despacho_token,
+                'estado_analisis': 'PARCIAL',
+                'prioridad_sugerida': None,
+                'justificacion': 'Gemini 429 temporal.',
+            },
+        )
+        triaje.refresh_from_db()
+        self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_PARCIAL)
+        self.assertIsNotNone(triaje.proximo_reintento_en)
+
+        # Antes de vencer backoff no se reencola
+        with patch('triaje_ia.services.requests.post') as mock_skip:
+            res_antes = recuperar_trabajos_interrumpidos(limite=20)
+        self.assertEqual(res_antes['recuperados_fallo_ia'], 0)
+        mock_skip.assert_not_called()
+
+        # Al vencer backoff se reencola y reenvía automáticamente
+        triaje.proximo_reintento_en = _ahora_local() - timedelta(seconds=1)
+        triaje.save(update_fields=['proximo_reintento_en'])
+        with patch('triaje_ia.services.requests.post', return_value=MagicMock(status_code=200, text='ok')) as mock_retry:
+            res_despues = recuperar_trabajos_interrumpidos(limite=20)
+
+        self.assertEqual(res_despues['recuperados_fallo_ia'], 1)
+        self.assertEqual(res_despues['enviados'], 1)
+        mock_retry.assert_called_once()
+        triaje.refresh_from_db()
+        self.assertEqual(triaje.intentos_envio, 2)
+        self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_EN_PROCESO)
+
+    def test_workflow_sanitized_json_privacidad_y_consistencia_valido(self):
+        import json
+        from pathlib import Path
+
+        ruta = Path(__file__).resolve().parent / 'n8n_workflow_triaje_vetericano.sanitized.json'
+        data = json.loads(ruta.read_text(encoding='utf-8'))
+
+        self.assertFalse(data['active'])
+        self.assertEqual(data['settings']['saveDataErrorExecution'], 'none')
+        self.assertEqual(data['settings']['saveDataSuccessExecution'], 'none')
+        self.assertFalse(data['settings']['saveManualExecutions'])
+        self.assertFalse(data['settings']['saveExecutionProgress'])
+
+        nodos = {n['name']: n for n in data['nodes']}
+        self.assertIn('/foto-segura/', nodos['Download Primary Photo']['parameters']['url'])
+        self.assertTrue(nodos['Download Primary Photo'].get('retryOnFail'))
+        self.assertEqual(nodos['Analyze Photos Vision']['parameters']['options']['temperature'], 0)
+        self.assertTrue(nodos['Analyze Photos Vision'].get('retryOnFail'))
+        self.assertEqual(nodos['Analyze Text Triage']['parameters']['options']['temperature'], 0)
+        self.assertTrue(nodos['Analyze Text Triage'].get('retryOnFail'))
+        self.assertTrue(nodos['Detect Duplicates'].get('retryOnFail'))
+        self.assertTrue(nodos['Fetch Vet Workload'].get('retryOnFail'))
+        self.assertTrue(nodos['Save Triage Result'].get('retryOnFail'))
+        assemble_code = nodos['Assemble Triage Result']['parameters']['jsCode']
+        self.assertIn('ia_guardrail_aplicado', assemble_code)
+        self.assertIn('Regla clinica de consistencia', assemble_code)
+        self.assertNotIn('numero_radicado', [a['name'] for a in nodos['Normalize Payload']['parameters']['assignments']['assignments']])
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='https://n8n-ejemplo.up.railway.app/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_ASYNC_THREAD=False,
+    )
+    def test_arranque_en_frio_serverless_recupera_en_segundo_intento(self):
+        from triaje_ia.services import obtener_config_triaje
+
+        cfg = obtener_config_triaje()
+        self.assertEqual(cfg['timeout'], 20.0)
+        self.assertEqual(cfg['backoff_base'], 30.0)
+        self.assertEqual(cfg['max_reintentos'], 6)
+
+        pet = self._crear_peticion(descripcion='Perro herido durante suspension serverless')
+        # Intento 1: Railway devuelve 502 mientras n8n despierta (cold start)
+        with patch('triaje_ia.services.requests.post', return_value=MagicMock(status_code=502, text='Application failed to respond')):
+            r1 = encolar_y_despachar_triaje_peticion(pet, async_dispatch=False)
+        self.assertFalse(r1['enviado'])
+        self.assertEqual(r1['estado_envio'], TriajePeticion.ENVIO_FALLO_TEMPORAL)
+
+        triaje = TriajePeticion.objects.get(peticion=pet)
+        self.assertIsNotNone(triaje.proximo_reintento_en)
+
+        # Intento 2: pasado el backoff de 30s, n8n ya está caliente y responde 200 OK
+        triaje.proximo_reintento_en = _ahora_local() - timedelta(seconds=1)
+        triaje.save(update_fields=['proximo_reintento_en'])
+        with patch('triaje_ia.services.requests.post', return_value=MagicMock(status_code=200, text='{"message":"Workflow was started"}')) as mock_retry:
+            r2 = recuperar_trabajos_interrumpidos(limite=20)
+        self.assertEqual(r2['enviados'], 1)
+        mock_retry.assert_called_once()
+        triaje.refresh_from_db()
+        self.assertEqual(triaje.estado_envio, TriajePeticion.ENVIO_ENVIADO)
+        self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_EN_PROCESO)

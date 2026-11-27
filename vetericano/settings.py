@@ -680,21 +680,28 @@ TRIAJE_N8N_WEBHOOK_SECRET = os.environ.get('TRIAJE_N8N_WEBHOOK_SECRET', '').stri
 TRIAJE_SERVICE_TOKEN = os.environ.get('TRIAJE_SERVICE_TOKEN', '').strip()
 TRIAJE_N8N_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
     'TRIAJE_N8N_TIMEOUT_SEGUNDOS',
-    default=5.0,
+    default=20.0,
     min_val=0.5,
     max_val=30.0,
 )
 try:
-    TRIAJE_N8N_MAX_REINTENTOS = max(1, min(10, int(os.environ.get('TRIAJE_N8N_MAX_REINTENTOS', '3'))))
+    TRIAJE_N8N_MAX_REINTENTOS = max(1, min(10, int(os.environ.get('TRIAJE_N8N_MAX_REINTENTOS', '6'))))
 except (TypeError, ValueError):
-    TRIAJE_N8N_MAX_REINTENTOS = 3
+    TRIAJE_N8N_MAX_REINTENTOS = 6
 TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS = _leer_env_float_rango(
     'TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS',
-    default=60.0,
+    default=30.0,
     min_val=5.0,
     max_val=3600.0,
 )
+TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS = _leer_env_float_rango(
+    'TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS',
+    default=900.0,
+    min_val=30.0,
+    max_val=7200.0,
+)
 TRIAJE_N8N_ASYNC_THREAD = _leer_env_bool('TRIAJE_N8N_ASYNC_THREAD', default=True)
+TRIAJE_ENVIAR_URLS_EXTERNAS_N8N = _leer_env_bool('TRIAJE_ENVIAR_URLS_EXTERNAS_N8N', default=False)
 TRIAJE_LEASE_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
     'TRIAJE_LEASE_TIMEOUT_SEGUNDOS',
     default=60.0,

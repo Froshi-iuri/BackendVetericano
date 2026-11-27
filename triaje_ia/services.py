@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import math
 import re
@@ -14,6 +15,7 @@ from django.conf import settings
 from django.db import IntegrityError, connection, connections, transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from peticiones.models import Peticiones, PeticionPosibleDuplicado
 from peticiones.services.alertas_duplicados_service import (
@@ -24,6 +26,12 @@ from peticiones.services.duplicados_service import (
     PeticionNoEncontradaError,
     detectar_duplicados_desde_solicitud,
     extraer_fotografias_peticion,
+)
+from peticiones.services.imagen_hash_service import (
+    MAX_PIXELES_IMAGEN,
+    _descargar_bytes_url_validada,
+    obtener_config_imagen_hash,
+    validar_url_cloudinary_segura,
 )
 from peticiones.utils import (
     DIAS_PARA_REASIGNAR,
@@ -89,6 +97,53 @@ def _select_for_update_qs(qs):
     return qs.select_for_update()
 
 
+_PATRONES_PII_IA = (
+    (re.compile(r'(?i)\b(?:https?://|www\.)\S+'), '[ENLACE]'),
+    (re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'), '[CORREO]'),
+    (re.compile(r'(?<!\w)@[A-Za-z0-9_.]{2,}'), '[USUARIO]'),
+    (
+        re.compile(
+            r'(?i)\b(?:c\.?\s*c\.?|c[eé]dula|t\.?\s*i\.?|c\.?\s*e\.?|nit|rut|pasaporte|documento|'
+            r'identificaci[oó]n|tel[eé]fono|tel\.?|fijo|cel(?:ular)?|whatsapp|wsp|contacto|'
+            r'ext(?:ensi[oó]n)?)\b\s*[:#.-]?\s*\d[\d.\s-]{3,15}\d'
+        ),
+        '[DATO_CONTACTO]',
+    ),
+    (re.compile(r'(?<!\d)(?:\+?57[\s.-]?)?(?:3\d{2}|60[1-8])[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)'), '[TELEFONO]'),
+    (re.compile(r'\b(?:\d{1,3}(?:\.\d{3}){1,3}|\d{6,12})\b'), '[NUMERO]'),
+    (re.compile(r'(?i)\bplaca\s*[:#-]?\s*[A-Z]{2,3}[\s-]?\d{2,3}[A-Z]?\b'), 'placa [PLACA]'),
+    (re.compile(r'\b(?:[A-Z]{3}-?\d{3}|[A-Z]{3}-?\d{2}[A-Z])\b'), '[PLACA]'),
+    (
+        re.compile(
+            r'(?i)\b(?:calle|cll?|carrera|cra|kr|avenida|av(?:da)?|diagonal|diag|dg|transversal|'
+            r'transv|tv|circular|circ|autopista|manzana|mz|lote|lt|bloque|blq|interior|int|casa|'
+            r'apto|apartamento|torre|piso|local|oficina|km|kil[oó]metro)\s*#?\s*\d+[a-zA-Z]?'
+            r'(?:\s*(?:#|no\.?|n°|num\.?|-)\s*\d+[a-zA-Z]?(?:\s*-\s*\d+)?)?'
+        ),
+        '[DIRECCION]',
+    ),
+    (
+        re.compile(
+            r'\b(?:[Bb]arrio|[Ss]ector|[Uu]rbanizaci[oó]n|[Uu]rb\.?|[Cc]onjunto|[Ee]dificio|'
+            r'[Cc]ondominio|[Vv]ereda|[Cc]orregimiento|[Ff]inca)\s+'
+            r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+(?:de|del|la|las|los|[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)){0,3})'
+        ),
+        '[SECTOR]',
+    ),
+    (
+        re.compile(
+            r'\b(?i:(me\s+llamo|mi\s+nombre\s+es|soy|nombre(?:\s+completo)?|denunciante|'
+            r'reportado\s+por|se[ñn]or(?:a)?|sr\.?|sra\.?|don|do[ñn]a|vecin[oa]|propietari[oa]|'
+            r'due[ñn][oa]|agresor(?:a)?|atentamente|cordialmente))\s*[:,-]?\s+'
+            r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,25}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,25}){0,3})'
+        ),
+        r'\1 [PERSONA]',
+    ),
+)
+
+_MAX_DIM_FOTO_IA = 1280
+
+
 def redactar_secretos(texto: Any, max_len: int = 500) -> str:
     """Elimina posibles tokens o secretos antes de persistir o registrar errores."""
     if texto is None:
@@ -97,6 +152,128 @@ def redactar_secretos(texto: Any, max_len: int = 500) -> str:
     for patron, reemplazo in _PATRONES_REDACCION:
         limpio = patron.sub(reemplazo, limpio)
     return limpio[:max_len]
+
+
+def sanitizar_texto_pii_para_ia(texto: Any, max_len: int = 1500) -> str:
+    """
+    Elimina datos personales e identificadores (correos, teléfonos, cédulas, placas,
+    direcciones, sectores y nombres tras disparadores de identidad) antes de enviar
+    la descripción a n8n o a Gemini, preservando los hechos clínicos del animal.
+    """
+    if texto is None:
+        return ''
+    limpio = str(texto).strip()
+    if not limpio:
+        return ''
+    for patron, reemplazo in _PATRONES_PII_IA:
+        limpio = patron.sub(reemplazo, limpio)
+    limpio = re.sub(r'\s+', ' ', limpio).strip()
+    return limpio[:max_len]
+
+
+def construir_url_foto_sin_metadatos_cloudinary(url: Optional[str]) -> str:
+    """
+    Inserta `fl_strip_profile` y compresión/tamaño acotado en URLs Cloudinary no firmadas
+    para eliminar metadatos EXIF/GPS/XMP desde la entrega CDN sin alterar el original.
+    """
+    url_limpia = str(url or '').strip()
+    marcador = '/image/upload/'
+    if not url_limpia or marcador not in url_limpia:
+        return url_limpia
+
+    prefijo, sufijo = url_limpia.split(marcador, 1)
+    if not sufijo:
+        return url_limpia
+
+    primer_segmento = sufijo.split('/', 1)[0]
+    if primer_segmento.startswith('s--') or 'fl_strip_profile' in primer_segmento:
+        return url_limpia
+
+    if any(tok in primer_segmento for tok in ('w_', 'h_', 'c_', 'f_', 'q_', 'fl_')):
+        return f'{prefijo}{marcador}fl_strip_profile/{sufijo}'
+
+    return f'{prefijo}{marcador}fl_strip_profile,c_limit,w_{_MAX_DIM_FOTO_IA},h_{_MAX_DIM_FOTO_IA},f_jpg,q_auto:good/{sufijo}'
+
+
+def _reemplazar_imagen_sin_metadatos_jpeg(raw_bytes: bytes) -> bytes:
+    """
+    Decodifica la fotografía, aplica orientación EXIF sobre los píxeles y re-codifica
+    un JPEG RGB nuevo sin ningún diccionario EXIF, GPS, XMP, IPTC ni perfil ICC.
+    """
+    with Image.open(io.BytesIO(raw_bytes)) as img:
+        ancho, alto = img.size
+        if ancho <= 0 or alto <= 0 or (ancho * alto) > MAX_PIXELES_IMAGEN:
+            raise ValueError('Dimensiones de imagen inválidas o excedidas.')
+
+        transpuesta = ImageOps.exif_transpose(img)
+        if transpuesta.mode in ('RGBA', 'LA') or (
+            transpuesta.mode == 'P' and 'transparency' in transpuesta.info
+        ):
+            alpha_img = transpuesta.convert('RGBA')
+            fondo = Image.new('RGB', alpha_img.size, (255, 255, 255))
+            fondo.paste(alpha_img, mask=alpha_img.split()[-1])
+            rgb_img = fondo
+        elif transpuesta.mode != 'RGB':
+            rgb_img = transpuesta.convert('RGB')
+        else:
+            rgb_img = transpuesta
+
+        rgb_img.thumbnail((_MAX_DIM_FOTO_IA, _MAX_DIM_FOTO_IA), Image.Resampling.LANCZOS)
+        limpia = Image.frombytes('RGB', rgb_img.size, rgb_img.tobytes())
+        buffer = io.BytesIO()
+        limpia.save(buffer, format='JPEG', quality=88, optimize=True)
+        return buffer.getvalue()
+
+
+def obtener_foto_sanitizada_para_triaje(id_peticion: int) -> bytes:
+    """
+    Descarga de forma segura la fotografía principal de una petición y retorna bytes JPEG
+    completamente libres de metadatos EXIF/GPS/cámara para consumo interno de n8n/Gemini.
+    """
+    peticion = (
+        Peticiones.objects.prefetch_related('evidenciapeticiones_set')
+        .filter(pk=id_peticion)
+        .first()
+    )
+    if not peticion:
+        raise PeticionNoEncontradaError(f'La petición #{id_peticion} no existe.')
+
+    _, todas_evidencias = extraer_fotografias_peticion(peticion)
+    fotos_imagenes = [u for u in todas_evidencias if detectar_tipo_archivo(u) == 'imagen']
+    if not fotos_imagenes:
+        raise TriajeNoEncontradoError(f'La petición #{id_peticion} no tiene fotografías de imagen.')
+
+    cfg_img = obtener_config_imagen_hash()
+    url_validada = validar_url_cloudinary_segura(
+        fotos_imagenes[0],
+        dominios_permitidos=cfg_img['dominios_permitidos'],
+    )
+    if not url_validada:
+        raise TriajeNoEncontradoError('La fotografía principal no proviene de un dominio Cloudinary permitido.')
+
+    url_strip = construir_url_foto_sin_metadatos_cloudinary(url_validada)
+    raw_bytes = _descargar_bytes_url_validada(
+        url_strip,
+        timeout=cfg_img['timeout'],
+        max_bytes=cfg_img['max_bytes'],
+        dominios_permitidos=cfg_img['dominios_permitidos'],
+        validar_dns=True,
+    )
+    if raw_bytes is None and url_strip != url_validada:
+        raw_bytes = _descargar_bytes_url_validada(
+            url_validada,
+            timeout=cfg_img['timeout'],
+            max_bytes=cfg_img['max_bytes'],
+            dominios_permitidos=cfg_img['dominios_permitidos'],
+            validar_dns=True,
+        )
+    if not raw_bytes:
+        raise TriajeNoEncontradoError('No fue posible descargar la fotografía principal de forma segura.')
+
+    try:
+        return _reemplazar_imagen_sin_metadatos_jpeg(raw_bytes)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise TriajeNoEncontradoError('No fue posible procesar o limpiar los metadatos de la fotografía.') from exc
 
 
 def normalizar_prioridad_sugerida(valor: Any) -> Optional[str]:
@@ -111,7 +288,7 @@ def normalizar_prioridad_sugerida(valor: Any) -> Optional[str]:
     if not norm:
         return None
 
-    if any(k in norm for k in ('urgen', 'emergen', 'critic')):
+    if any(k in norm for k in ('urgen', 'emergen', 'critic', 'inmediat', 'muy alta')):
         return TriajePeticion.PRIORIDAD_URGENTE
     if any(k in norm for k in ('alta', 'high')):
         return TriajePeticion.PRIORIDAD_ALTA
@@ -140,19 +317,26 @@ def _leer_int_setting(nombre: str, default: int, minimo: int, maximo: int) -> in
     return max(minimo, min(maximo, val))
 
 
+def _calcular_espera_backoff(intentos: int, *, backoff_base: float, backoff_max: float) -> float:
+    espera = float(backoff_base) * (2 ** max(0, int(intentos or 1) - 1))
+    return min(float(backoff_max), max(1.0, espera))
+
+
 def obtener_config_triaje() -> Dict[str, Any]:
     """Lee la configuración vigente del módulo triaje_ia desde Django settings."""
     return {
         'activo': bool(getattr(settings, 'TRIAJE_N8N_ACTIVO', False)),
         'webhook_url': str(getattr(settings, 'TRIAJE_N8N_WEBHOOK_URL', '') or '').strip(),
         'webhook_secret': str(getattr(settings, 'TRIAJE_N8N_WEBHOOK_SECRET', '') or '').strip(),
-        'timeout': _leer_float_setting('TRIAJE_N8N_TIMEOUT_SEGUNDOS', 5.0, 0.5, 30.0),
-        'max_reintentos': _leer_int_setting('TRIAJE_N8N_MAX_REINTENTOS', 3, 1, 10),
-        'backoff_base': _leer_float_setting('TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS', 60.0, 5.0, 3600.0),
+        'timeout': _leer_float_setting('TRIAJE_N8N_TIMEOUT_SEGUNDOS', 20.0, 0.5, 30.0),
+        'max_reintentos': _leer_int_setting('TRIAJE_N8N_MAX_REINTENTOS', 6, 1, 10),
+        'backoff_base': _leer_float_setting('TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS', 30.0, 5.0, 3600.0),
+        'backoff_max': _leer_float_setting('TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS', 900.0, 30.0, 7200.0),
         'lease_timeout': _leer_float_setting('TRIAJE_LEASE_TIMEOUT_SEGUNDOS', 60.0, 10.0, 600.0),
         'analisis_timeout': _leer_float_setting('TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS', 300.0, 30.0, 3600.0),
         'max_casos_vet': _leer_int_setting('TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO', 0, 0, 1000),
         'async_thread': bool(getattr(settings, 'TRIAJE_N8N_ASYNC_THREAD', True)),
+        'enviar_urls_externas': bool(getattr(settings, 'TRIAJE_ENVIAR_URLS_EXTERNAS_N8N', False)),
     }
 
 
@@ -174,23 +358,36 @@ def construir_payload_peticion_triaje(
     clave_idempotencia: Optional[str] = None,
     despacho_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Construye el payload estándar de denuncia ciudadana para n8n sin secretos ni datos de contacto del ciudadano."""
+    """
+    Construye el payload minimizado de denuncia para n8n:
+    - Redacta PII de la descripción antes de salir del backend.
+    - Omite ubicación exacta, radicado, videos y datos de contacto del ciudadano.
+    - Omite URLs externas de fotografías salvo habilitación explícita; por defecto n8n
+      consume `/api/triaje-ia/interno/peticiones/<id>/foto-segura/` sin metadatos EXIF.
+    """
+    cfg = obtener_config_triaje()
     _, todas_evidencias = extraer_fotografias_peticion(peticion)
     fotos_imagenes = [u for u in todas_evidencias if detectar_tipo_archivo(u) == 'imagen']
-    videos = [u for u in todas_evidencias if detectar_tipo_archivo(u) == 'video']
 
-    ubicacion = getattr(peticion, 'id_ubicacion', None)
-    lat = getattr(ubicacion, 'latitud', None) if ubicacion is not None else None
-    lon = getattr(ubicacion, 'longitud', None) if ubicacion is not None else None
-
-    fecha_val = getattr(peticion, 'fecha', None)
     tipo_obj = getattr(peticion, 'id_tipo', None)
     estado_obj = getattr(peticion, 'id_estado', None)
     responsable = getattr(peticion, 'responsable', None)
 
+    tiene_fotos = bool(fotos_imagenes)
+    foto_segura_path = (
+        f'/api/triaje-ia/interno/peticiones/{peticion.id_peticion}/foto-segura/'
+        if tiene_fotos
+        else ''
+    )
+
+    foto_principal_externa = (
+        construir_url_foto_sin_metadatos_cloudinary(fotos_imagenes[0])
+        if (tiene_fotos and cfg['enviar_urls_externas'])
+        else None
+    )
+
     return {
         'id_peticion': peticion.id_peticion,
-        'numero_radicado': peticion.numero_radicado,
         'clave_idempotencia': clave_idempotencia or f'triaje-pet-{peticion.id_peticion}',
         'despacho_token': despacho_token or '',
         'id_tipo': getattr(peticion, 'id_tipo_id', None),
@@ -198,17 +395,12 @@ def construir_payload_peticion_triaje(
         'id_sede': getattr(responsable, 'id_sede_id', None) if responsable else None,
         'estado_actual': getattr(estado_obj, 'nombre', None) if estado_obj else None,
         'prioridad_actual': peticion.prioridad,
-        'descripcion': peticion.descripcion or '',
-        'fecha': fecha_val.isoformat() if hasattr(fecha_val, 'isoformat') else fecha_val,
-        'ubicacion': {
-            'direccion': getattr(ubicacion, 'direccion', None) if ubicacion else None,
-            'latitud': float(lat) if lat is not None else None,
-            'longitud': float(lon) if lon is not None else None,
-        },
-        'foto': fotos_imagenes[0] if fotos_imagenes else None,
-        'fotos': fotos_imagenes,
+        'descripcion': sanitizar_texto_pii_para_ia(peticion.descripcion or ''),
+        'tiene_fotos': tiene_fotos,
         'total_fotos': len(fotos_imagenes),
-        'videos': videos,
+        'foto_segura_path': foto_segura_path,
+        'foto': foto_principal_externa,
+        'fotos': [foto_principal_externa] if foto_principal_externa else [],
     }
 
 
@@ -485,7 +677,8 @@ def _registrar_fallo_envio(
     *,
     error_msg: str,
     codigo_http: Optional[int] = None,
-    backoff_base: float = 60.0,
+    backoff_base: float = 30.0,
+    backoff_max: float = 900.0,
     incrementar_intento: bool = True,
 ) -> TriajePeticion:
     ahora = _ahora_local()
@@ -496,12 +689,16 @@ def _registrar_fallo_envio(
     triaje.ultimo_codigo_http = codigo_http
     triaje.ultimo_error_envio = redactar_secretos(error_msg)
 
-    if int(triaje.intentos_envio or 0) >= int(triaje.max_intentos or 3):
+    if int(triaje.intentos_envio or 0) >= int(triaje.max_intentos or 6):
         triaje.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
         triaje.proximo_reintento_en = None
     else:
         triaje.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
-        espera_seg = backoff_base * (2 ** max(0, int(triaje.intentos_envio or 1) - 1))
+        espera_seg = _calcular_espera_backoff(
+            int(triaje.intentos_envio or 1),
+            backoff_base=backoff_base,
+            backoff_max=backoff_max,
+        )
         triaje.proximo_reintento_en = ahora + timedelta(seconds=espera_seg)
 
     triaje.save(
@@ -585,7 +782,7 @@ def despachar_triaje_por_id(
             'estado_envio': triaje.estado_envio,
         }
 
-    if not forzar_reenvio and int(triaje.intentos_envio or 0) >= int(triaje.max_intentos or 3):
+    if not forzar_reenvio and int(triaje.intentos_envio or 0) >= int(triaje.max_intentos or 6):
         TriajePeticion.objects.filter(pk=id_triaje).update(
             estado_envio=TriajePeticion.ENVIO_FALLO_DEFINITIVO,
             lease_expira_en=None,
@@ -604,7 +801,12 @@ def despachar_triaje_por_id(
         with transaction.atomic():
             triaje_err = TriajePeticion.objects.select_for_update().filter(pk=id_triaje).first()
             if triaje_err:
-                _registrar_fallo_envio(triaje_err, error_msg=str(exc), backoff_base=cfg['backoff_base'])
+                _registrar_fallo_envio(
+                    triaje_err,
+                    error_msg=str(exc),
+                    backoff_base=cfg['backoff_base'],
+                    backoff_max=cfg['backoff_max'],
+                )
                 return {'enviado': False, 'id_triaje': triaje_err.id_triaje, 'estado_envio': triaje_err.estado_envio}
         return {'enviado': False, 'id_triaje': id_triaje, 'estado_envio': TriajePeticion.ENVIO_FALLO_TEMPORAL}
 
@@ -689,6 +891,7 @@ def despachar_triaje_por_id(
                     triaje_upd,
                     error_msg=f'Error de conexión con n8n: {exc}',
                     backoff_base=cfg['backoff_base'],
+                    backoff_max=cfg['backoff_max'],
                     incrementar_intento=False,
                 )
                 return {
@@ -753,6 +956,7 @@ def despachar_triaje_por_id(
             error_msg=f'n8n respondió HTTP {status_code}: {body_preview}',
             codigo_http=status_code,
             backoff_base=cfg['backoff_base'],
+            backoff_max=cfg['backoff_max'],
             incrementar_intento=False,
         )
         return {
@@ -838,22 +1042,26 @@ def encolar_y_despachar_triaje_peticion(
         or triaje.estado_analisis in (
             TriajePeticion.ANALISIS_FALLIDO,
             TriajePeticion.ANALISIS_PARCIAL,
+            TriajePeticion.ANALISIS_EN_PROCESO,
         )
     ):
         campos_reset = [
             'estado_envio',
             'intentos_envio',
+            'max_intentos',
             'lease_expira_en',
             'proximo_reintento_en',
             'fecha_actualizacion',
         ]
         triaje.estado_envio = TriajePeticion.ENVIO_PENDIENTE
         triaje.intentos_envio = 0
+        triaje.max_intentos = max(int(triaje.max_intentos or 0), cfg['max_reintentos'])
         triaje.lease_expira_en = None
         triaje.proximo_reintento_en = None
         if triaje.estado_analisis in (
             TriajePeticion.ANALISIS_FALLIDO,
             TriajePeticion.ANALISIS_PARCIAL,
+            TriajePeticion.ANALISIS_EN_PROCESO,
         ):
             triaje.estado_analisis = TriajePeticion.ANALISIS_PENDIENTE
             campos_reset.append('estado_analisis')
@@ -935,11 +1143,18 @@ def recuperar_trabajos_interrumpidos(
     Recupera trabajos interrumpidos tras reinicios o caídas:
     1) ENVIANDO con lease expirado (worker cayó en medio de HTTP).
     2) ENVIADO + EN_PROCESO con timeout de análisis vencido (n8n no respondió callback).
-    3) Despacha PENDIENTE y FALLO_TEMPORAL vencidos.
+    3) ENVIADO + PARCIAL/FALLIDO sin prioridad sugerida (fallo transitorio de IA) con backoff vencido.
+    4) Despacha PENDIENTE y FALLO_TEMPORAL vencidos.
     """
     cfg = obtener_config_triaje()
     if not cfg['activo']:
-        return {'activo': False, 'recuperados_lease': 0, 'recuperados_analisis': 0, 'procesados': 0}
+        return {
+            'activo': False,
+            'recuperados_lease': 0,
+            'recuperados_analisis': 0,
+            'recuperados_fallo_ia': 0,
+            'procesados': 0,
+        }
 
     advisory_adquirido = False
     if usar_advisory_lock and connection.vendor == 'postgresql':
@@ -954,6 +1169,7 @@ def recuperar_trabajos_interrumpidos(
         ahora = _ahora_local()
         recuperados_lease = 0
         recuperados_analisis = 0
+        recuperados_fallo_ia = 0
 
         # 1. Leases expirados en ENVIANDO
         with transaction.atomic():
@@ -969,7 +1185,7 @@ def recuperar_trabajos_interrumpidos(
             for item in atascados_envio:
                 item.lease_expira_en = None
                 item.despacho_token = ''
-                if int(item.intentos_envio or 0) >= int(item.max_intentos or 3):
+                if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
                     item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
                     item.proximo_reintento_en = None
                     item.ultimo_error_envio = 'Envío interrumpido (lease expirado; reintentos agotados).'
@@ -1004,7 +1220,7 @@ def recuperar_trabajos_interrumpidos(
             )
             for item in atascados_analisis:
                 item.despacho_token = ''
-                if int(item.intentos_envio or 0) >= int(item.max_intentos or 3):
+                if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
                     item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
                     item.estado_analisis = TriajePeticion.ANALISIS_FALLIDO
                     item.proximo_reintento_en = None
@@ -1026,11 +1242,47 @@ def recuperar_trabajos_interrumpidos(
                 )
                 recuperados_analisis += 1
 
+        # 3. Análisis PARCIAL o FALLIDO sin prioridad sugerida (fallo temporal de IA) con reintentos disponibles
+        with transaction.atomic():
+            fallidos_ia = list(
+                _select_for_update_qs(
+                    TriajePeticion.objects.filter(
+                        estado_envio=TriajePeticion.ENVIO_ENVIADO,
+                        estado_analisis__in=[
+                            TriajePeticion.ANALISIS_FALLIDO,
+                            TriajePeticion.ANALISIS_PARCIAL,
+                        ],
+                        prioridad_sugerida__isnull=True,
+                        proximo_reintento_en__isnull=False,
+                        proximo_reintento_en__lte=ahora,
+                        intentos_envio__lt=F('max_intentos'),
+                    ).order_by('proximo_reintento_en', 'id_triaje')[: max(1, min(100, int(limite)))]
+                )
+            )
+            for item in fallidos_ia:
+                item.despacho_token = ''
+                item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
+                item.estado_analisis = TriajePeticion.ANALISIS_PENDIENTE
+                item.proximo_reintento_en = ahora
+                item.ultimo_error_envio = 'Fallo temporal de análisis IA; reencolado automáticamente.'
+                item.save(
+                    update_fields=[
+                        'estado_envio',
+                        'estado_analisis',
+                        'despacho_token',
+                        'proximo_reintento_en',
+                        'ultimo_error_envio',
+                        'fecha_actualizacion',
+                    ]
+                )
+                recuperados_fallo_ia += 1
+
         res_reintentos = procesar_reintentos_pendientes(limite=limite)
         return {
             **res_reintentos,
             'recuperados_lease': recuperados_lease,
             'recuperados_analisis': recuperados_analisis,
+            'recuperados_fallo_ia': recuperados_fallo_ia,
         }
     finally:
         if advisory_adquirido and connection.vendor == 'postgresql':
@@ -1197,7 +1449,21 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         triaje.estado_analisis = estado_analisis
         triaje.estado_envio = TriajePeticion.ENVIO_ENVIADO
         triaje.lease_expira_en = None
-        triaje.proximo_reintento_en = None
+        if (
+            estado_analisis in (TriajePeticion.ANALISIS_FALLIDO, TriajePeticion.ANALISIS_PARCIAL)
+            and prioridad_norm is None
+            and int(triaje.intentos_envio or 0) > 0
+            and int(triaje.intentos_envio or 0) < int(triaje.max_intentos or 6)
+        ):
+            cfg_rec = obtener_config_triaje()
+            espera_seg = _calcular_espera_backoff(
+                int(triaje.intentos_envio or 1),
+                backoff_base=cfg_rec['backoff_base'],
+                backoff_max=cfg_rec['backoff_max'],
+            )
+            triaje.proximo_reintento_en = ahora + timedelta(seconds=espera_seg)
+        else:
+            triaje.proximo_reintento_en = None
         if prioridad_norm is not None:
             triaje.prioridad_sugerida = prioridad_norm
         if confianza is not None:

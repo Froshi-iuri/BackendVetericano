@@ -6,6 +6,7 @@ from triaje_ia.views import (
     TriajeInternoCargaVeterinariosView,
     TriajeInternoContextoPeticionView,
     TriajeInternoDuplicadosView,
+    TriajeInternoFotoSeguraView,
     TriajeInternoGuardarResultadoView,
     TriajeInternoReintentarPendientesView,
     TriajeReintentarPeticionView,
@@ -17,6 +18,11 @@ urlpatterns = [
         'interno/peticiones/<int:id_peticion>/',
         TriajeInternoContextoPeticionView.as_view(),
         name='triaje-interno-contexto-peticion',
+    ),
+    path(
+        'interno/peticiones/<int:id_peticion>/foto-segura/',
+        TriajeInternoFotoSeguraView.as_view(),
+        name='triaje-interno-foto-segura',
     ),
     path(
         'interno/peticiones/<int:id_peticion>/duplicados/',
