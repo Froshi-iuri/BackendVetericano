@@ -10,11 +10,16 @@ from django.db import IntegrityError
 from users.models import Usuarios, Rol, Sede
 from users.constants import ROL_ADMINISTRADOR, ROL_SUPER_ADMINISTRADOR
 from users.api.permissions import es_super_administrador, NOMBRES_ROL_SUPER_ADMIN
-from users.services.google_oauth_service import (
-    es_formato_google_id_token_valido,
-    resolver_o_crear_usuario_google,
-    verificar_google_id_token,
-)
+try:
+    from users.services.google_oauth_service import (
+        es_formato_google_id_token_valido,
+        resolver_o_crear_usuario_google,
+        verificar_google_id_token,
+    )
+except ImportError:
+    es_formato_google_id_token_valido = None
+    resolver_o_crear_usuario_google = None
+    verificar_google_id_token = None
 from peticiones.utils import subir_o_asegurar_cloudinary
 
 
@@ -27,6 +32,14 @@ def _normalizar_espacios(valor: str) -> str:
 class RegisterCustomSerializer(serializers.ModelSerializer):
     # Ya no declaramos id_rol aquí arriba. 
     # Dejamos que DRF use exclusivamente lo definido en Meta.fields.
+    email = serializers.EmailField(required=True, max_length=150, validators=[])
+    identificacion = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=20,
+        validators=[],
+    )
 
     class Meta:
         model = Usuarios
@@ -45,6 +58,20 @@ class RegisterCustomSerializer(serializers.ModelSerializer):
         return value
     # AnaC
 
+    def validate_email(self, value):
+        email_limpio = (value or '').strip()
+        if Usuarios.objects.filter(email__iexact=email_limpio).exists():
+            raise serializers.ValidationError("Ya existe un usuario registrado con este correo electrónico.")
+        return email_limpio
+
+    def validate_identificacion(self, value):
+        if value is None:
+            return value
+        id_limpio = str(value).strip()
+        if id_limpio and Usuarios.objects.filter(identificacion__iexact=id_limpio).exists():
+            raise serializers.ValidationError("Ya existe un usuario registrado con este número de identificación.")
+        return id_limpio
+
     def create(self, validated_data):
         validated_data['password'] = make_password(validated_data['password'])
         
@@ -55,6 +82,12 @@ class RegisterCustomSerializer(serializers.ModelSerializer):
         validated_data['id_rol'] = rol_peticionario
         
         return super().create(validated_data)
+
+
+class ConfirmarCodigoRegistroSerializer(serializers.Serializer):
+    """Valida el correo y el código OTP de 6 dígitos para confirmar el pre-registro en caché."""
+    email = serializers.EmailField(required=True)
+    codigo = serializers.CharField(required=True, min_length=6, max_length=6, trim_whitespace=True)
 class LoginCustomSerializer(serializers.Serializer):
     """
     Serializador que genera el formulario de Login en Swagger y
