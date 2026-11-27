@@ -649,9 +649,16 @@ def _leer_env_roles_csv(nombre_var: str, default: tuple[int, ...]) -> tuple[int,
     return tuple(dict.fromkeys(roles))
 
 
-GOOGLE_OAUTH_CLIENT_IDS = _leer_env_lista_csv(
-    'GOOGLE_OAUTH_CLIENT_IDS',
-    fallback_var='GOOGLE_CLIENT_ID',
+_DEFAULT_GOOGLE_OAUTH_CLIENT_IDS = (
+    '414064158617-fdj5ffqrrl19i56d51ioeb5g2k8ieak6.apps.googleusercontent.com',
+    '414064158617-vqebf0gb77dtuc27jrq40s6r9ochdbef.apps.googleusercontent.com',
+)
+GOOGLE_OAUTH_CLIENT_IDS = (
+    _leer_env_lista_csv(
+        'GOOGLE_OAUTH_CLIENT_IDS',
+        fallback_var='GOOGLE_CLIENT_ID',
+    )
+    or _DEFAULT_GOOGLE_OAUTH_CLIENT_IDS
 )
 # Por defecto solo vincula automáticamente roles móviles (Veterinario=3, Peticionario=4);
 # Administrador (1), Jurídico (2) y Super Administrador (5) requieren login tradicional.

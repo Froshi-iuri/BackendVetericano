@@ -1,4 +1,9 @@
+import hmac
+import math
+import time
 import unicodedata
+from django.contrib.auth.hashers import make_password
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Count
 from django.db.models.deletion import ProtectedError, RestrictedError
@@ -6,13 +11,17 @@ from django.utils.dateparse import parse_date
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import generics, mixins, serializers, status, viewsets
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+try:
+    from rest_framework_simplejwt.tokens import RefreshToken
+except ImportError:
+    RefreshToken = None
 from .serializers import (
     RegisterCustomSerializer,
+    ConfirmarCodigoRegistroSerializer,
     LoginCustomSerializer,
     GoogleLoginSerializer,
     UsuariosSerializer,
@@ -21,12 +30,33 @@ from .serializers import (
     SedeEstadoSerializer,
     AdministradorSuperAdminSerializer,
 )
-from users.services.google_oauth_service import (
-    GoogleAccountPolicyError,
-    GoogleAuthConfigError,
-    GoogleAuthUnavailableError,
-    GoogleTokenInvalidError,
+from users.services.email_service import (
+    construir_plantilla_otp_vetericano,
+    enviar_correo_transaccional_brevo,
 )
+from users.views import (
+    OTP_COOLDOWN_SEGUNDOS,
+    OTP_MAX_INTENTOS_FALLIDOS,
+    OTP_MAX_SOLICITUDES_HORA,
+    OTP_TIMEOUT_SEGUNDOS,
+    generar_codigo_otp,
+)
+try:
+    from users.services.google_oauth_service import (
+        GoogleAccountPolicyError,
+        GoogleAuthConfigError,
+        GoogleAuthUnavailableError,
+        GoogleTokenInvalidError,
+    )
+except ImportError:
+    class GoogleAccountPolicyError(Exception):
+        pass
+    class GoogleAuthConfigError(Exception):
+        pass
+    class GoogleAuthUnavailableError(Exception):
+        pass
+    class GoogleTokenInvalidError(Exception):
+        pass
 from .permissions import (
     EsAdministradorOReadOnly,
     EsSuperAdministrador,
@@ -50,6 +80,10 @@ from peticiones.api.serializers import ListarPeticionesSerializer
 from vetericano.paginacion import PaginacionOpcional
 from vetericano.ordenamiento import ordenar_peticiones
 
+# Constantes de seguridad para protección anti-fuerza bruta en Login
+LOGIN_MAX_INTENTOS_FALLIDOS = 6
+LOGIN_BLOQUEO_SEGUNDOS = 900          # 15 minutos de bloqueo temporal tras 6 intentos fallidos
+LOGIN_UMBRAL_ADVERTENCIA = 3          # A partir del 3er fallo se advierten los intentos restantes
 
 
 class RegisterView(generics.GenericAPIView):
@@ -76,6 +110,227 @@ class RegisterView(generics.GenericAPIView):
             "mensaje": "Usuario creado exitosamente.",
             "datos": serializer.data
         }, status=status.HTTP_201_CREATED)
+
+
+class SolicitarCodigoRegistroView(generics.GenericAPIView):
+    """
+    POST /api/usuarios/register/solicitar-codigo/
+    Paso 1 del registro con verificación de correo:
+    - Valida que todos los datos del usuario (email, identificación, contraseña, nombre, apellido, teléfono)
+      sean válidos y que ni el correo ni la identificación estén registrados en PostgreSQL.
+    - Guarda temporalmente el pre-registro con la contraseña ya encriptada en caché por 10 minutos
+      junto con un código OTP criptográfico de 6 dígitos (sin ensuciar PostgreSQL con cuentas fantasma).
+    - Envía el código al correo mediante Brevo API (HTTPS 443) con cooldown de 60s y límite de 3 envíos/hora.
+    """
+    serializer_class = RegisterCustomSerializer
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        datos = serializer.validated_data
+        email_limpio = (datos.get('email') or '').strip()
+        email_key = email_limpio.lower()
+        ahora = int(time.time())
+
+        # 1. Verificar cooldown de 60 segundos entre reenvíos al mismo correo
+        cooldown_until = cache.get(f'registro_cooldown_{email_key}')
+        if isinstance(cooldown_until, (int, float)) and cooldown_until > ahora:
+            segundos_restantes = max(1, int(cooldown_until - ahora))
+            return Response(
+                {
+                    'error': f'Por favor espera {segundos_restantes} segundos antes de solicitar un nuevo código.',
+                    'detail': f'Por favor espera {segundos_restantes} segundos antes de solicitar un nuevo código.',
+                    'retry_after': segundos_restantes,
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        # 2. Verificar límite de máximo 3 solicitudes de código por hora
+        solicitudes_hora = int(cache.get(f'registro_rate_{email_key}') or 0)
+        if solicitudes_hora >= OTP_MAX_SOLICITUDES_HORA:
+            msg_limite = (
+                f'Has alcanzado el límite máximo de {OTP_MAX_SOLICITUDES_HORA} envíos de código '
+                'de verificación por hora. Intenta nuevamente más tarde.'
+            )
+            return Response(
+                {'error': msg_limite, 'detail': msg_limite},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        codigo = generar_codigo_otp()
+        nombre_usuario = (datos.get('nombre') or '').strip()
+        apellido_usuario = (datos.get('apellido') or '').strip()
+        identificacion_usuario = (datos.get('identificacion') or '').strip() or None
+        telefono_usuario = (datos.get('telefono') or '').strip() or None
+
+        pre_registro_payload = {
+            'codigo': codigo,
+            'intentos': 0,
+            'creado_en': ahora,
+            'usuario': {
+                'email': email_limpio,
+                'identificacion': identificacion_usuario,
+                'password_hash': make_password(datos['password']),
+                'nombre': nombre_usuario,
+                'apellido': apellido_usuario,
+                'telefono': telefono_usuario,
+            },
+        }
+        cache.set(f'registro_pendiente_{email_key}', pre_registro_payload, timeout=OTP_TIMEOUT_SEGUNDOS)
+
+        asunto = 'Código de verificación de correo - Vetericano'
+        html_content = construir_plantilla_otp_vetericano(
+            nombre=nombre_usuario or 'Usuario',
+            codigo=codigo,
+            proposito='registro',
+        )
+
+        try:
+            resultado = enviar_correo_transaccional_brevo(
+                destinatario_email=email_limpio,
+                destinatario_nombre=f"{nombre_usuario} {apellido_usuario}".strip() or 'Usuario',
+                asunto=asunto,
+                contenido_html=html_content,
+            )
+            if resultado.get('exito'):
+                cache.set(
+                    f'registro_cooldown_{email_key}',
+                    ahora + OTP_COOLDOWN_SEGUNDOS,
+                    timeout=OTP_COOLDOWN_SEGUNDOS,
+                )
+                cache.set(
+                    f'registro_rate_{email_key}',
+                    solicitudes_hora + 1,
+                    timeout=3600,
+                )
+                return Response(
+                    {
+                        'mensaje': 'Te enviamos un código de verificación de 6 dígitos a tu correo electrónico.',
+                        'email': email_limpio,
+                        'cooldown_segundos': OTP_COOLDOWN_SEGUNDOS,
+                        'expira_en_segundos': OTP_TIMEOUT_SEGUNDOS,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            cache.delete(f'registro_pendiente_{email_key}')
+            return Response(
+                {
+                    'error': 'No fue posible enviar el correo de verificación. Verifica que el correo exista.',
+                    'detail': resultado.get('error') or 'Error al enviar correo con Brevo.',
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except Exception as exc:
+            cache.delete(f'registro_pendiente_{email_key}')
+            return Response(
+                {
+                    'error': f'Error técnico al enviar el correo de verificación: {str(exc)}',
+                    'detail': str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class ConfirmarCodigoRegistroView(generics.GenericAPIView):
+    """
+    POST /api/usuarios/register/confirmar-codigo/
+    Paso 2 del registro con verificación de correo:
+    - Valida el código OTP de 6 dígitos enviado al correo (con límite de 5 intentos fallidos).
+    - Si es válido, inserta atómicamente el usuario real en PostgreSQL con rol Peticionario y activo=True,
+      y limpia el pre-registro de la caché.
+    """
+    serializer_class = ConfirmarCodigoRegistroSerializer
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email_limpio = (serializer.validated_data.get('email') or '').strip()
+        email_key = email_limpio.lower()
+        codigo_ingresado = (serializer.validated_data.get('codigo') or '').strip()
+
+        pre_registro = cache.get(f'registro_pendiente_{email_key}')
+        if not isinstance(pre_registro, dict) or 'usuario' not in pre_registro:
+            msg = 'El código de verificación ha expirado o no existe un registro pendiente para este correo.'
+            return Response({'error': msg, 'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        codigo_guardado = str(pre_registro.get('codigo') or '').strip()
+        intentos_actuales = int(pre_registro.get('intentos') or 0)
+
+        if not codigo_guardado or not hmac.compare_digest(codigo_guardado, codigo_ingresado):
+            nuevos_intentos = intentos_actuales + 1
+            if nuevos_intentos >= OTP_MAX_INTENTOS_FALLIDOS:
+                cache.delete(f'registro_pendiente_{email_key}')
+                msg_anulado = (
+                    f'Has superado el límite de {OTP_MAX_INTENTOS_FALLIDOS} intentos fallidos. '
+                    'El código fue anulado por seguridad; solicita uno nuevo.'
+                )
+                return Response(
+                    {'error': msg_anulado, 'detail': msg_anulado, 'intentos_restantes': 0},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            restantes = OTP_MAX_INTENTOS_FALLIDOS - nuevos_intentos
+            pre_registro['intentos'] = nuevos_intentos
+            cache.set(f'registro_pendiente_{email_key}', pre_registro, timeout=OTP_TIMEOUT_SEGUNDOS)
+            msg_invalido = f'El código de verificación es incorrecto. Te quedan {restantes} intento(s).'
+            return Response(
+                {'error': msg_invalido, 'detail': msg_invalido, 'intentos_restantes': restantes},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        datos_usuario = pre_registro['usuario']
+        email_real = datos_usuario['email']
+        identificacion_real = datos_usuario.get('identificacion')
+
+        # Verificar que ni el correo ni la identificación hayan sido ocupados mientras se confirmaba el código
+        if Usuarios.objects.filter(email__iexact=email_real).exists():
+            cache.delete(f'registro_pendiente_{email_key}')
+            msg_dup = 'Ya existe un usuario registrado con este correo electrónico.'
+            return Response({'error': msg_dup, 'detail': msg_dup}, status=status.HTTP_400_BAD_REQUEST)
+
+        if identificacion_real and Usuarios.objects.filter(identificacion__iexact=identificacion_real).exists():
+            cache.delete(f'registro_pendiente_{email_key}')
+            msg_id_dup = 'Ya existe un usuario registrado con este número de identificación.'
+            return Response({'error': msg_id_dup, 'detail': msg_id_dup}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            rol_peticionario, _ = Rol.objects.get_or_create(nombre_rol='Peticionario')
+            nuevo_usuario = Usuarios.objects.create(
+                email=email_real,
+                identificacion=identificacion_real,
+                password=datos_usuario['password_hash'],
+                nombre=datos_usuario.get('nombre') or '',
+                apellido=datos_usuario.get('apellido') or '',
+                telefono=datos_usuario.get('telefono'),
+                id_rol=rol_peticionario,
+                activo=True,
+            )
+
+        cache.delete(f'registro_pendiente_{email_key}')
+        cache.delete(f'registro_cooldown_{email_key}')
+
+        return Response(
+            {
+                'mensaje': 'Correo verificado y cuenta creada exitosamente.',
+                'email': nuevo_usuario.email,
+                'datos': {
+                    'id_usuario': nuevo_usuario.id_usuario,
+                    'email': nuevo_usuario.email,
+                    'identificacion': nuevo_usuario.identificacion,
+                    'nombre': nuevo_usuario.nombre,
+                    'apellido': nuevo_usuario.apellido,
+                    'telefono': nuevo_usuario.telefono,
+                },
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 def _construir_respuesta_login(user, *, es_nuevo_usuario=None):
@@ -117,9 +372,90 @@ class LoginView(generics.GenericAPIView):
     permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
+        email_raw = ''
+        if isinstance(request.data, dict):
+            email_raw = (request.data.get('email') or '').strip()
+        email_key = email_raw.lower()
+        ahora = int(time.time())
+
+        # 1. Verificar si la cuenta tiene un bloqueo temporal activo por superar 6 intentos fallidos
+        if email_key:
+            lock_until = cache.get(f'login_lock_{email_key}')
+            if isinstance(lock_until, (int, float)) and lock_until > ahora:
+                segundos_restantes = max(1, int(lock_until - ahora))
+                minutos_restantes = max(1, math.ceil(segundos_restantes / 60))
+                mensaje_bloqueo = (
+                    f"Cuenta bloqueada temporalmente por demasiados intentos fallidos. "
+                    f"Intenta nuevamente en {minutos_restantes} minuto(s) o restablece tu contraseña."
+                )
+                return Response(
+                    {
+                        "detail": mensaje_bloqueo,
+                        "error": mensaje_bloqueo,
+                        "non_field_errors": [mensaje_bloqueo],
+                        "retry_after": segundos_restantes,
+                        "intentos_restantes": 0,
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
 
         serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except ValidationError as exc:
+            # Solo contabilizamos como intento fallido de contraseña cuando el error es "Credenciales incorrectas."
+            errores = exc.detail if isinstance(exc.detail, dict) else {}
+            non_field = errores.get('non_field_errors', [])
+            texto_error = str(non_field[0]) if non_field else ''
+
+            if email_key and 'Credenciales incorrectas' in texto_error:
+                fallos = int(cache.get(f'login_fail_{email_key}') or 0) + 1
+                if fallos >= LOGIN_MAX_INTENTOS_FALLIDOS:
+                    cache.delete(f'login_fail_{email_key}')
+                    cache.set(
+                        f'login_lock_{email_key}',
+                        ahora + LOGIN_BLOQUEO_SEGUNDOS,
+                        timeout=LOGIN_BLOQUEO_SEGUNDOS,
+                    )
+                    minutos_bloqueo = LOGIN_BLOQUEO_SEGUNDOS // 60
+                    mensaje_bloqueo = (
+                        f"Has alcanzado el límite de {LOGIN_MAX_INTENTOS_FALLIDOS} intentos fallidos. "
+                        f"Por seguridad, el acceso a esta cuenta se ha bloqueado por {minutos_bloqueo} minutos."
+                    )
+                    return Response(
+                        {
+                            "detail": mensaje_bloqueo,
+                            "error": mensaje_bloqueo,
+                            "non_field_errors": [mensaje_bloqueo],
+                            "retry_after": LOGIN_BLOQUEO_SEGUNDOS,
+                            "intentos_restantes": 0,
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                cache.set(f'login_fail_{email_key}', fallos, timeout=LOGIN_BLOQUEO_SEGUNDOS)
+                restantes = LOGIN_MAX_INTENTOS_FALLIDOS - fallos
+                if fallos >= LOGIN_UMBRAL_ADVERTENCIA:
+                    mensaje_adv = (
+                        f"Credenciales incorrectas. Te quedan {restantes} intento(s) "
+                        "antes del bloqueo temporal de 15 minutos."
+                    )
+                    return Response(
+                        {
+                            "detail": mensaje_adv,
+                            "error": mensaje_adv,
+                            "non_field_errors": [mensaje_adv],
+                            "intentos_restantes": restantes,
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            raise
+
+        # Login exitoso: limpiar cualquier contador de intentos fallidos previo
+        if email_key:
+            cache.delete(f'login_fail_{email_key}')
+            cache.delete(f'login_lock_{email_key}')
+
         user = serializer.validated_data
         return Response(_construir_respuesta_login(user), status=status.HTTP_200_OK)
 

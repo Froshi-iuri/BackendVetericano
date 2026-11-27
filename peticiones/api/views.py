@@ -851,6 +851,12 @@ class DashboardJuridicoView(APIView):
                 "estado": estado_diag,
             })
 
+        distribucion_cba = {
+            "En Observación": en_observacion,
+            "En Tratamiento": en_tratamiento,
+            "Apto para Adopción": aptos_adopcion,
+        }
+
         cba_data = {
             "total_ingresados_cba": total_cba,
             "totalIngresadosCBA": total_cba,
@@ -860,6 +866,8 @@ class DashboardJuridicoView(APIView):
             "enTratamiento": en_tratamiento,
             "aptos_adopcion": aptos_adopcion,
             "aptosAdopcion": aptos_adopcion,
+            "distribucion_estados": distribucion_cba,
+            "distribucionEstados": distribucion_cba,
             "ultimos_ingresos": ultimos_ingresos,
             "ultimosIngresos": ultimos_ingresos,
         }
