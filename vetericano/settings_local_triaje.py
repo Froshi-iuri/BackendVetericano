@@ -102,3 +102,24 @@ TRIAJE_N8N_WEBHOOK_URL = (
 TRIAJE_N8N_WEBHOOK_SECRET = os.environ.get('TRIAJE_N8N_WEBHOOK_SECRET', TRIAJE_N8N_WEBHOOK_SECRET)
 TRIAJE_SERVICE_TOKEN = os.environ.get('TRIAJE_SERVICE_TOKEN', TRIAJE_SERVICE_TOKEN)
 TRIAJE_N8N_ACTIVO = os.environ.get('TRIAJE_N8N_ACTIVO', 'False').strip().lower() in ('1', 'true', 'yes', 'on')
+
+# Integración local con VetericanoIA (DINOv2) en 127.0.0.1:8001
+DUPLICADOS_IA_DINOV2_ACTIVA = (
+    os.environ.get('DUPLICADOS_IA_DINOV2_ACTIVA', 'True').strip().lower() in ('1', 'true', 'yes', 'on')
+)
+DUPLICADOS_DINOV2_BACKEND = (
+    os.environ.get('DUPLICADOS_DINOV2_BACKEND', 'microservicio').strip().lower() or 'microservicio'
+)
+DUPLICADOS_DINOV2_MICROSERVICIO_URL = os.environ.get(
+    'DUPLICADOS_DINOV2_MICROSERVICIO_URL',
+    'http://127.0.0.1:8001',
+)
+DUPLICADOS_DINOV2_MICROSERVICIO_SECRET = os.environ.get(
+    'DUPLICADOS_DINOV2_MICROSERVICIO_SECRET',
+    'vetericano-ia-local-e2e-secret-2026',
+)
+DUPLICADOS_DINOV2_CACHE_BD_ACTIVA = (
+    os.environ.get('DUPLICADOS_DINOV2_CACHE_BD_ACTIVA', 'True').strip().lower() in ('1', 'true', 'yes', 'on')
+)
+DUPLICADOS_UMBRAL_DINOV2 = 0.45
+DUPLICADOS_RADIO_GPS_METROS = 200.0
