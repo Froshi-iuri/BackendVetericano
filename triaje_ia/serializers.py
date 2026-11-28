@@ -231,6 +231,7 @@ class TriajePeticionSerializer(serializers.ModelSerializer):
     posibles_duplicados_detalle = serializers.SerializerMethodField()
     automatizacion_activa = serializers.SerializerMethodField()
     tiene_fotografias = serializers.SerializerMethodField()
+    imagen_sintetica_demo = serializers.SerializerMethodField()
     puede_reintentar = serializers.SerializerMethodField()
     decision_prioridad_por_id = serializers.IntegerField(read_only=True, allow_null=True)
     decision_prioridad_por_nombre = serializers.SerializerMethodField()
@@ -246,6 +247,7 @@ class TriajePeticionSerializer(serializers.ModelSerializer):
             'clave_idempotencia',
             'automatizacion_activa',
             'tiene_fotografias',
+            'imagen_sintetica_demo',
             'puede_reintentar',
             'estado_envio',
             'estado_analisis',
@@ -316,6 +318,9 @@ class TriajePeticionSerializer(serializers.ModelSerializer):
             return False
         _, todas = extraer_fotografias_peticion(peticion)
         return any(detectar_tipo_archivo(u) == 'imagen' for u in todas)
+
+    def get_imagen_sintetica_demo(self, obj):
+        return isinstance(obj.resultado_raw, dict) and obj.resultado_raw.get('imagen_sintetica_demo') is True
 
     def get_puede_reintentar(self, obj):
         return calcular_puede_reintentar_triaje(obj)

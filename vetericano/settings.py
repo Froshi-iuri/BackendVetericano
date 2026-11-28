@@ -702,6 +702,21 @@ TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS = _leer_env_float_rango(
 )
 TRIAJE_N8N_ASYNC_THREAD = _leer_env_bool('TRIAJE_N8N_ASYNC_THREAD', default=True)
 TRIAJE_ENVIAR_URLS_EXTERNAS_N8N = _leer_env_bool('TRIAJE_ENVIAR_URLS_EXTERNAS_N8N', default=False)
+# Fail-closed: no enviar fotografías originales/binarias a Gemini (pueden contener rostros o placas) salvo habilitación explícita.
+TRIAJE_GEMINI_ENVIAR_FOTOS = _leer_env_bool('TRIAJE_GEMINI_ENVIAR_FOTOS', default=False)
+# Fail-closed: mientras se use Gemini gratuito (Unpaid Tier), solo enviar peticiones ficticias
+# marcadas con [PRUEBA-TRIAJE]. Todas las denuncias reales usan triaje local con revisión humana
+# hasta activar explícitamente Paid Tier / Cloud Billing (TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True).
+TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES = _leer_env_bool(
+    'TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES',
+    default=False,
+)
+# Lista blanca opcional de IDs de petición ficticios autorizados internamente en servidor para pruebas de Gemini.
+TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS = tuple(
+    int(tok)
+    for tok in _leer_env_lista_csv('TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS')
+    if tok.isdigit() and int(tok) > 0
+)
 TRIAJE_LEASE_TIMEOUT_SEGUNDOS = _leer_env_float_rango(
     'TRIAJE_LEASE_TIMEOUT_SEGUNDOS',
     default=60.0,

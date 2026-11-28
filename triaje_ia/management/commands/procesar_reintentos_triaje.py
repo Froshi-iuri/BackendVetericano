@@ -15,12 +15,12 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         limite = options['limite']
         if not options['continuo']:
-            resultado = recuperar_trabajos_interrumpidos(limite=limite, usar_advisory_lock=True)
+            resultado = recuperar_trabajos_interrumpidos(limite=limite)
             self.stdout.write(str(resultado))
             return
 
         intervalo = max(5.0, float(options['intervalo']))
         while True:
-            resultado = recuperar_trabajos_interrumpidos(limite=limite, usar_advisory_lock=True)
+            resultado = recuperar_trabajos_interrumpidos(limite=limite)
             self.stdout.write(str(resultado))
             time.sleep(intervalo)

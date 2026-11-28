@@ -7,7 +7,7 @@ import re
 import threading
 import uuid
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -15,6 +15,7 @@ from django.conf import settings
 from django.db import IntegrityError, connection, connections, transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from peticiones.models import Peticiones, PeticionPosibleDuplicado
@@ -26,6 +27,7 @@ from peticiones.services.duplicados_service import (
     PeticionNoEncontradaError,
     detectar_duplicados_desde_solicitud,
     extraer_fotografias_peticion,
+    normalizar_coordenadas,
 )
 from peticiones.services.imagen_hash_service import (
     MAX_PIXELES_IMAGEN,
@@ -42,6 +44,7 @@ from peticiones.utils import (
     registrar_historial_peticion,
 )
 from realtime import notificar as rt_notificar
+from triaje_ia.escenarios_demo import ESCENARIO_CON_IMAGEN, ESCENARIOS_DEMO, dibujar_imagen_demo
 from triaje_ia.models import TriajePeticion
 from users.constants import ROL_VETERINARIO
 from users.models import Usuarios
@@ -51,7 +54,6 @@ logger = logging.getLogger(__name__)
 HEADER_TRIAJE_WEBHOOK_SECRET = 'X-Vetericano-Triaje-Secret'
 HEADER_IDEMPOTENCY_KEY = 'X-Idempotency-Key'
 HEADER_DISPATCH_TOKEN = 'X-Triaje-Dispatch-Token'
-_PG_ADVISORY_LOCK_KEY = 72491001
 
 _PATRONES_REDACCION = (
     (re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'), '[JWT-REDACTADO]'),
@@ -110,6 +112,7 @@ _PATRONES_PII_IA = (
         '[DATO_CONTACTO]',
     ),
     (re.compile(r'(?<!\d)(?:\+?57[\s.-]?)?(?:3\d{2}|60[1-8])[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)'), '[TELEFONO]'),
+    (re.compile(r'(?<!\d)-?\d{1,2}\.\d{4,}\s*[,;\s]\s*-?\d{1,3}\.\d{4,}(?!\d)'), '[COORDENADAS]'),
     (re.compile(r'\b(?:\d{1,3}(?:\.\d{3}){1,3}|\d{6,12})\b'), '[NUMERO]'),
     (re.compile(r'(?i)\bplaca\s*[:#-]?\s*[A-Z]{2,3}[\s-]?\d{2,3}[A-Z]?\b'), 'placa [PLACA]'),
     (re.compile(r'\b(?:[A-Z]{3}-?\d{3}|[A-Z]{3}-?\d{2}[A-Z])\b'), '[PLACA]'),
@@ -143,6 +146,49 @@ _PATRONES_PII_IA = (
 
 _MAX_DIM_FOTO_IA = 1280
 
+_PALABRAS_COMUNES_NO_NOMBRE = frozenset({
+    'perro', 'perra', 'gato', 'gata', 'animal', 'cachorro', 'cachorra', 'caballo', 'yegua',
+    'peticion', 'denuncia', 'urgente', 'alta', 'media', 'baja', 'vetericano', 'colombia',
+    'parque', 'avenida', 'calle', 'carrera', 'no', 'sin', 'con', 'el', 'la', 'los', 'las',
+    'un', 'una', 'unos', 'unas', 'se', 'hay', 'presenta', 'tiene', 'estado', 'herida',
+    'herido', 'sangrado', 'maltrato', 'abandono', 'sector', 'barrio', 'foto', 'imagen',
+    'video', 'reporte', 'persona', 'direccion', 'placa', 'numero', 'telefono', 'correo',
+    'enlace', 'usuario', 'dato', 'coordenadas', 'atencion', 'emergencia', 'clinica',
+    'ciudadano', 'ciudadana', 'mascota', 'felino', 'canino', 'equino', 'bovino', 'ave',
+    'del', 'de', 'al', 'en', 'por', 'para', 'sobre', 'entre', 'desde', 'hacia',
+    'prueba', 'triaje', 'central', 'principal', 'norte', 'sur', 'este', 'oeste',
+})
+
+_PATRON_NOMBRE_SUELTO = re.compile(
+    r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,25}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{1,25}){1,3})\b'
+)
+
+_PATRONES_CONTENIDO_CONFIDENCIAL = (
+    ('menor_de_edad', re.compile(r'(?i)\b(?:menor\s+de\s+edad|menores\s+de\s+edad|ni[ñn][oa]s?|adolescente(?:s)?|infante(?:s)?)\b')),
+    ('violencia_intrafamiliar', re.compile(r'(?i)\b(?:violencia\s+intrafamiliar|abuso\s+sexual|maltrato\s+infantil)\b')),
+    ('amenaza_o_extorsion', re.compile(r'(?i)\b(?:amenaza\s+de\s+muerte|extorsi[oó]n|secuestro|sicario|arma\s+de\s+fuego)\b')),
+    ('datos_medicos_humanos', re.compile(r'(?i)\b(?:historia\s+cl[ií]nica\s+humana|datos\s+m[eé]dicos\s+personales|eps|incapacidad\s+m[eé]dica)\b')),
+    (
+        'proceso_penal_identificado',
+        re.compile(r'(?i)\b(?:fiscal[ií]a|demanda\s+penal|denuncia\s+penal)\b.*\b(?:c\.?\s*c\.?|c[eé]dula|identificaci[oó]n|\[PERSONA\]|\[NUMERO\])\b'),
+    ),
+)
+
+
+def _redactar_nombres_propios_sueltos(texto: str) -> str:
+    def _reemplazar(match: re.Match[str]) -> str:
+        fragmento = match.group(1)
+        tokens = fragmento.split()
+        no_comunes = [
+            t for t in tokens
+            if normalizar_texto_juridico(t) not in _PALABRAS_COMUNES_NO_NOMBRE
+        ]
+        if len(no_comunes) >= 2:
+            return '[PERSONA]'
+        return fragmento
+
+    return _PATRON_NOMBRE_SUELTO.sub(_reemplazar, texto)
+
 
 def redactar_secretos(texto: Any, max_len: int = 500) -> str:
     """Elimina posibles tokens o secretos antes de persistir o registrar errores."""
@@ -157,7 +203,7 @@ def redactar_secretos(texto: Any, max_len: int = 500) -> str:
 def sanitizar_texto_pii_para_ia(texto: Any, max_len: int = 1500) -> str:
     """
     Elimina datos personales e identificadores (correos, teléfonos, cédulas, placas,
-    direcciones, sectores y nombres tras disparadores de identidad) antes de enviar
+    direcciones, coordenadas, sectores y nombres propios) antes de enviar
     la descripción a n8n o a Gemini, preservando los hechos clínicos del animal.
     """
     if texto is None:
@@ -167,8 +213,120 @@ def sanitizar_texto_pii_para_ia(texto: Any, max_len: int = 1500) -> str:
         return ''
     for patron, reemplazo in _PATRONES_PII_IA:
         limpio = patron.sub(reemplazo, limpio)
+    limpio = _redactar_nombres_propios_sueltos(limpio)
     limpio = re.sub(r'\s+', ' ', limpio).strip()
     return limpio[:max_len]
+
+
+def coincide_con_escenario_demo(
+    peticion: Peticiones, escenario: str, *, foto_duplicados: str = '',
+) -> bool:
+    ids = obtener_config_triaje()['ids_prueba_permitidos_gemini']
+    if (
+        escenario not in ESCENARIOS_DEMO
+        or (ids and peticion.pk not in ids)
+        or str(peticion.descripcion or '').strip() != ESCENARIOS_DEMO[escenario]
+        or peticion.asignado_a_id is not None
+    ):
+        return False
+
+    _, evidencias = extraer_fotografias_peticion(peticion)
+    if not foto_duplicados:
+        return not evidencias
+
+    # Este adjunto se usa únicamente en el detector habitual de duplicados.
+    # Gemini recibe la ilustración generada por Django, sin descargar esta URL.
+    ubicacion = peticion.id_ubicacion
+    return bool(
+        escenario == ESCENARIO_CON_IMAGEN
+        and evidencias == [foto_duplicados]
+        and detectar_tipo_archivo(foto_duplicados) == 'imagen'
+        and validar_url_cloudinary_segura(
+            foto_duplicados, dominios_permitidos=obtener_config_imagen_hash()['dominios_permitidos'],
+        )
+        and ubicacion
+        and normalizar_coordenadas(ubicacion.latitud, ubicacion.longitud) is not None
+    )
+
+
+def escenario_demo_autorizado(peticion: Peticiones, triaje: TriajePeticion) -> str:
+    raw = triaje.resultado_raw
+    escenario = raw.get('escenario_demo') if isinstance(raw, dict) else None
+    foto_duplicados = raw.get('foto_duplicados_demo', '') if isinstance(raw, dict) else ''
+    if isinstance(escenario, str) and isinstance(foto_duplicados, str) and coincide_con_escenario_demo(
+        peticion, escenario, foto_duplicados=foto_duplicados,
+    ):
+        return escenario
+    return ''
+
+
+def obtener_triaje_despacho_demo(id_peticion: int, despacho_token: str) -> TriajePeticion:
+    triaje = (
+        TriajePeticion.objects.select_related('peticion', 'peticion__id_ubicacion')
+        .prefetch_related('peticion__evidenciapeticiones_set')
+        .filter(peticion_id=id_peticion, estado_envio__in=(
+            TriajePeticion.ENVIO_ENVIANDO, TriajePeticion.ENVIO_ENVIADO,
+        ))
+        .first()
+    )
+    if not despacho_token or not triaje or not constant_time_compare(triaje.despacho_token, despacho_token):
+        raise PermissionError('Se requiere el token del despacho vigente.')
+    return triaje
+
+
+def obtener_contexto_gemini_demo(id_peticion: int, despacho_token: str) -> Dict[str, Any]:
+    triaje = obtener_triaje_despacho_demo(id_peticion, despacho_token)
+    escenario = escenario_demo_autorizado(triaje.peticion, triaje)
+    if not escenario or triaje.estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
+        return {'gemini_autorizado': False}
+    descripcion = sanitizar_texto_pii_para_ia(ESCENARIOS_DEMO[escenario])
+    return {
+        'gemini_autorizado': True,
+        'descripcion': descripcion,
+        'foto_autorizada': escenario == ESCENARIO_CON_IMAGEN and obtener_config_triaje()['enviar_fotos_gemini'],
+    }
+
+
+def evaluar_privacidad_para_gemini(
+    descripcion_original: str,
+    descripcion_sanitizada: str,
+    *,
+    permitir_denuncias_reales: Optional[bool] = None,
+    prueba_ficticia_autorizada: bool = False,
+) -> Tuple[bool, List[str]]:
+    """
+    Evalúa si el texto puede enviarse a Gemini de forma segura tras la anonimización.
+    Por defecto (TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=False), limita Gemini exclusivamente
+    a peticiones ficticias con autorización interna controlada; cualquier denuncia real
+    (incluso si inicia con `[PRUEBA-TRIAJE]`), contenido confidencial o PII residual omite
+    Gemini y usa el mecanismo local con revisión humana.
+    """
+    motivos: List[str] = []
+    orig = str(descripcion_original or '').strip()
+    san = str(descripcion_sanitizada or '').strip()
+
+    permitir_reales = (
+        obtener_config_triaje()['permitir_denuncias_reales_gemini']
+        if permitir_denuncias_reales is None
+        else bool(permitir_denuncias_reales)
+    )
+    if not permitir_reales and not prueba_ficticia_autorizada:
+        motivos.append('gemini_limitado_a_pruebas_ficticias_autorizadas')
+
+    for codigo, patron in _PATRONES_CONTENIDO_CONFIDENCIAL:
+        if patron.search(orig) or patron.search(san):
+            motivos.append(codigo)
+
+    if re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', san):
+        motivos.append('correo_residual')
+    if re.search(r'\b\d{7,}\b', san):
+        motivos.append('documento_o_numero_largo_residual')
+    if re.search(r'(?<!\d)-?\d{1,2}\.\d{4,}\s*[,;\s]\s*-?\d{1,3}\.\d{4,}(?!\d)', san):
+        motivos.append('coordenadas_residuales')
+    if re.search(r'\b(?:[A-Z]{3}-?\d{3}|[A-Z]{3}-?\d{2}[A-Z])\b', san):
+        motivos.append('placa_residual')
+
+    return (len(motivos) == 0, motivos)
 
 
 def construir_url_foto_sin_metadatos_cloudinary(url: Optional[str]) -> str:
@@ -225,11 +383,29 @@ def _reemplazar_imagen_sin_metadatos_jpeg(raw_bytes: bytes) -> bytes:
         return buffer.getvalue()
 
 
-def obtener_foto_sanitizada_para_triaje(id_peticion: int) -> bytes:
+def obtener_foto_sanitizada_para_triaje(id_peticion: int, despacho_token: str = '') -> bytes:
     """
     Descarga de forma segura la fotografía principal de una petición y retorna bytes JPEG
     completamente libres de metadatos EXIF/GPS/cámara para consumo interno de n8n/Gemini.
+    Si TRIAJE_GEMINI_ENVIAR_FOTOS=False (por defecto), bloquea la salida de imágenes (fail-closed).
     """
+    cfg = obtener_config_triaje()
+    if not cfg['enviar_fotos_gemini']:
+        raise PermissionError(
+            'El envío de fotografías a Gemini está desactivado por política de privacidad (TRIAJE_GEMINI_ENVIAR_FOTOS=False).'
+        )
+
+    if despacho_token:
+        contexto = obtener_contexto_gemini_demo(id_peticion, despacho_token)
+        if not contexto.get('foto_autorizada'):
+            raise PermissionError('El despacho no tiene una imagen sintética autorizada.')
+        return _reemplazar_imagen_sin_metadatos_jpeg(dibujar_imagen_demo())
+
+    # Compatibilidad con el uso expresamente habilitado de un proveedor de pago.
+    # El workflow gratuito siempre usa la rama autenticada con el token de despacho.
+    if not cfg['permitir_denuncias_reales_gemini']:
+        raise PermissionError('Se requiere el token del despacho de prueba.')
+
     peticion = (
         Peticiones.objects.prefetch_related('evidenciapeticiones_set')
         .filter(pk=id_peticion)
@@ -337,6 +513,15 @@ def obtener_config_triaje() -> Dict[str, Any]:
         'max_casos_vet': _leer_int_setting('TRIAJE_MAX_CASOS_ACTIVOS_VETERINARIO', 0, 0, 1000),
         'async_thread': bool(getattr(settings, 'TRIAJE_N8N_ASYNC_THREAD', True)),
         'enviar_urls_externas': bool(getattr(settings, 'TRIAJE_ENVIAR_URLS_EXTERNAS_N8N', False)),
+        'enviar_fotos_gemini': bool(getattr(settings, 'TRIAJE_GEMINI_ENVIAR_FOTOS', False)),
+        'permitir_denuncias_reales_gemini': bool(
+            getattr(settings, 'TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES', False)
+        ),
+        'ids_prueba_permitidos_gemini': frozenset(
+            int(x)
+            for x in (getattr(settings, 'TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS', ()) or ())
+            if str(x).isdigit() and int(x) > 0
+        ),
     }
 
 
@@ -374,15 +559,16 @@ def construir_payload_peticion_triaje(
     responsable = getattr(peticion, 'responsable', None)
 
     tiene_fotos = bool(fotos_imagenes)
+    enviar_fotos_ia = tiene_fotos and cfg['enviar_fotos_gemini'] and cfg['permitir_denuncias_reales_gemini']
     foto_segura_path = (
         f'/api/triaje-ia/interno/peticiones/{peticion.id_peticion}/foto-segura/'
-        if tiene_fotos
+        if enviar_fotos_ia
         else ''
     )
 
     foto_principal_externa = (
         construir_url_foto_sin_metadatos_cloudinary(fotos_imagenes[0])
-        if (tiene_fotos and cfg['enviar_urls_externas'])
+        if (enviar_fotos_ia and cfg['enviar_urls_externas'])
         else None
     )
 
@@ -398,6 +584,7 @@ def construir_payload_peticion_triaje(
         'descripcion': sanitizar_texto_pii_para_ia(peticion.descripcion or ''),
         'tiene_fotos': tiene_fotos,
         'total_fotos': len(fotos_imagenes),
+        'enviar_fotos_gemini': enviar_fotos_ia,
         'foto_segura_path': foto_segura_path,
         'foto': foto_principal_externa,
         'fotos': [foto_principal_externa] if foto_principal_externa else [],
@@ -716,6 +903,126 @@ def _registrar_fallo_envio(
     return triaje
 
 
+def _clasificar_prioridad_local_reglas(texto_sanitizado: str) -> Tuple[str, str]:
+    norm = normalizar_texto_juridico(texto_sanitizado)
+    if any(
+        k in norm
+        for k in (
+            'atropell', 'hemorragia', 'sangrado', 'envenen', 'intoxic', 'convulsion',
+            'no respira', 'dificultad respiratoria', 'asfixi', 'inconsciente', 'agoniz',
+            'fractura expuesta', 'electrocut', 'mutila',
+        )
+    ):
+        return (
+            TriajePeticion.PRIORIDAD_URGENTE,
+            'Prioridad URGENTE sugerida por reglas locales determinísticas ante signos críticos.',
+        )
+    if any(
+        k in norm
+        for k in (
+            'fractura', 'herida abierta', 'desnutricion severa', 'deshidratacion severa',
+            'miasis', 'quemadura grave', 'cojera severa', 'neonato',
+        )
+    ):
+        return (
+            TriajePeticion.PRIORIDAD_ALTA,
+            'Prioridad ALTA sugerida por reglas locales determinísticas ante lesión seria.',
+        )
+    if any(k in norm for k in ('sano', 'rutina', 'preventiv', 'consulta general', 'sin lesiones')):
+        return (
+            TriajePeticion.PRIORIDAD_BAJA,
+            'Prioridad BAJA sugerida por reglas locales determinísticas.',
+        )
+    return (
+        TriajePeticion.PRIORIDAD_MEDIA,
+        'Prioridad MEDIA conservadora sugerida por reglas locales determinísticas para revisión humana.',
+    )
+
+
+def ejecutar_triaje_local_privado(
+    peticion: Peticiones,
+    triaje: TriajePeticion,
+    *,
+    motivos_privacidad: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    Mecanismo alternativo 100% local (sin llamadas a n8n/Gemini) para peticiones con contenido
+    confidencial o sin anonimización garantizada. Mantiene revisión humana obligatoria.
+    """
+    texto_sanitizado = sanitizar_texto_pii_para_ia(peticion.descripcion or '')
+    prioridad_local, base_justificacion = _clasificar_prioridad_local_reglas(texto_sanitizado)
+
+    posibles_dup: List[Dict[str, Any]] = []
+    try:
+        res_dup = ejecutar_deteccion_duplicados_triaje(
+            peticion.id_peticion,
+            usar_dinov2=True,
+            registrar_alertas=True,
+        )
+        posibles_dup = list(res_dup.get('posibles_duplicados') or [])
+    except Exception:
+        posibles_dup = []
+
+    vet_rec_obj = None
+    justificacion_rec = ''
+    carga_lista: List[Dict[str, Any]] = []
+    try:
+        res_carga = calcular_carga_veterinarios(id_peticion=peticion.id_peticion)
+        carga_lista = list(res_carga.get('veterinarios') or [])
+        justificacion_rec = str(res_carga.get('justificacion_recomendacion') or '')
+        vet_rec = res_carga.get('veterinario_recomendado')
+        if isinstance(vet_rec, dict) and vet_rec.get('id_veterinario'):
+            vet_rec_obj = Usuarios.objects.filter(pk=vet_rec['id_veterinario']).first()
+    except Exception:
+        pass
+
+    motivos_txt = ', '.join(str(m) for m in motivos_privacidad) or 'politica_privacidad'
+    justificacion_final = (
+        f'{base_justificacion} Envío a Gemini omitido por política de privacidad ({motivos_txt}); '
+        'requiere revisión humana directa.'
+    )
+
+    ahora = _ahora_local()
+    with transaction.atomic():
+        triaje_upd = TriajePeticion.objects.select_for_update().get(pk=triaje.pk)
+        triaje_upd.estado_envio = TriajePeticion.ENVIO_OMITIDO
+        triaje_upd.estado_analisis = TriajePeticion.ANALISIS_PARCIAL
+        triaje_upd.lease_expira_en = None
+        triaje_upd.proximo_reintento_en = None
+        triaje_upd.despacho_token = ''
+        triaje_upd.ultimo_error_envio = ''
+        triaje_upd.prioridad_sugerida = prioridad_local
+        triaje_upd.nivel_confianza = 0.5
+        triaje_upd.justificacion = justificacion_final[:3000]
+        triaje_upd.resumen_texto = texto_sanitizado[:2000]
+        triaje_upd.resumen_vision = 'Análisis visual externo omitido por política de privacidad.'
+        triaje_upd.posibles_duplicados = posibles_dup[:20]
+        triaje_upd.total_duplicados_detectados = len(posibles_dup)
+        triaje_upd.veterinario_recomendado = vet_rec_obj
+        triaje_upd.justificacion_recomendacion = justificacion_rec
+        triaje_upd.carga_veterinarios_snapshot = carga_lista[:50]
+        triaje_upd.modelo_texto_usado = 'reglas_locales_privacidad'
+        triaje_upd.modelo_vision_usado = ''
+        triaje_upd.version_resultado = int(triaje_upd.version_resultado or 0) + 1
+        triaje_upd.completado_en = ahora
+        triaje_upd.resultado_raw = {
+            'modo': 'fallback_local_privacidad',
+            'motivos_privacidad': list(motivos_privacidad),
+            'revision_humana_requerida': True,
+        }
+        triaje_upd.save()
+
+    return {
+        'enviado': False,
+        'omitido_privacidad': True,
+        'fallback_local': True,
+        'id_triaje': triaje_upd.id_triaje,
+        'estado_envio': triaje_upd.estado_envio,
+        'estado_analisis': triaje_upd.estado_analisis,
+        'motivos_privacidad': list(motivos_privacidad),
+    }
+
+
 def despachar_triaje_por_id(
     id_triaje: int,
     *,
@@ -794,6 +1101,21 @@ def despachar_triaje_por_id(
             'id_triaje': triaje.id_triaje,
             'estado_envio': TriajePeticion.ENVIO_FALLO_DEFINITIVO,
         }
+
+    desc_original = str(getattr(triaje.peticion, 'descripcion', '') or '')
+    desc_sanitizada = sanitizar_texto_pii_para_ia(desc_original)
+    prueba_autorizada = bool(escenario_demo_autorizado(triaje.peticion, triaje))
+    es_seguro_ia, motivos_priv = evaluar_privacidad_para_gemini(
+        desc_original,
+        desc_sanitizada,
+        prueba_ficticia_autorizada=prueba_autorizada,
+    )
+    if not es_seguro_ia:
+        return ejecutar_triaje_local_privado(
+            triaje.peticion,
+            triaje,
+            motivos_privacidad=motivos_priv,
+        )
 
     try:
         webhook_url = _validar_webhook_url(cfg['webhook_url'])
@@ -1140,12 +1462,16 @@ def recuperar_trabajos_interrumpidos(
     usar_advisory_lock: bool = False,
 ) -> Dict[str, Any]:
     """
-    Recupera trabajos interrumpidos tras reinicios o caídas:
+    Recupera trabajos interrumpidos tras reinicios o caídas mediante transacciones cortas
+    por lote (`select_for_update(skip_locked=True)`) y reclamo atómico con `despacho_token`:
     1) ENVIANDO con lease expirado (worker cayó en medio de HTTP).
     2) ENVIADO + EN_PROCESO con timeout de análisis vencido (n8n no respondió callback).
     3) ENVIADO + PARCIAL/FALLIDO sin prioridad sugerida (fallo transitorio de IA) con backoff vencido.
-    4) Despacha PENDIENTE y FALLO_TEMPORAL vencidos.
+    4) Despacha PENDIENTE y FALLO_TEMPORAL vencidos sin mantener locks durante HTTP.
+    Nota: `usar_advisory_lock` se conserva solo por compatibilidad de firma y se ignora para
+    garantizar compatibilidad total con Supabase Transaction Pooler (puerto 6543).
     """
+    _ = usar_advisory_lock
     cfg = obtener_config_triaje()
     if not cfg['activo']:
         return {
@@ -1156,141 +1482,124 @@ def recuperar_trabajos_interrumpidos(
             'procesados': 0,
         }
 
-    advisory_adquirido = False
-    if usar_advisory_lock and connection.vendor == 'postgresql':
-        with connection.cursor() as cursor:
-            cursor.execute('SELECT pg_try_advisory_lock(%s)', [_PG_ADVISORY_LOCK_KEY])
-            fila = cursor.fetchone()
-            advisory_adquirido = bool(fila and fila[0])
-        if not advisory_adquirido:
-            return {'activo': True, 'omitido_por_lock': True, 'procesados': 0}
+    ahora = _ahora_local()
+    recuperados_lease = 0
+    recuperados_analisis = 0
+    recuperados_fallo_ia = 0
 
-    try:
-        ahora = _ahora_local()
-        recuperados_lease = 0
-        recuperados_analisis = 0
-        recuperados_fallo_ia = 0
-
-        # 1. Leases expirados en ENVIANDO
-        with transaction.atomic():
-            atascados_envio = list(
-                _select_for_update_qs(
-                    TriajePeticion.objects.filter(
-                        estado_envio=TriajePeticion.ENVIO_ENVIANDO,
-                        lease_expira_en__isnull=False,
-                        lease_expira_en__lte=ahora,
-                    ).order_by('lease_expira_en', 'id_triaje')[: max(1, min(100, int(limite)))]
-                )
+    # 1. Leases expirados en ENVIANDO
+    with transaction.atomic():
+        atascados_envio = list(
+            _select_for_update_qs(
+                TriajePeticion.objects.filter(
+                    estado_envio=TriajePeticion.ENVIO_ENVIANDO,
+                    lease_expira_en__isnull=False,
+                    lease_expira_en__lte=ahora,
+                ).order_by('lease_expira_en', 'id_triaje')[: max(1, min(100, int(limite)))]
             )
-            for item in atascados_envio:
-                item.lease_expira_en = None
-                item.despacho_token = ''
-                if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
-                    item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
-                    item.proximo_reintento_en = None
-                    item.ultimo_error_envio = 'Envío interrumpido (lease expirado; reintentos agotados).'
-                else:
-                    item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
-                    item.proximo_reintento_en = ahora
-                    item.ultimo_error_envio = 'Envío interrumpido por reinicio o caída; reencolado automáticamente.'
-                item.save(
-                    update_fields=[
-                        'estado_envio',
-                        'lease_expira_en',
-                        'despacho_token',
-                        'proximo_reintento_en',
-                        'ultimo_error_envio',
-                        'fecha_actualizacion',
-                    ]
-                )
-                recuperados_lease += 1
-
-        # 2. Análisis EN_PROCESO sin callback más allá de TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS
-        corte_analisis = ahora - timedelta(seconds=cfg['analisis_timeout'])
-        with transaction.atomic():
-            atascados_analisis = list(
-                _select_for_update_qs(
-                    TriajePeticion.objects.filter(
-                        estado_envio=TriajePeticion.ENVIO_ENVIADO,
-                        estado_analisis=TriajePeticion.ANALISIS_EN_PROCESO,
-                        enviado_en__isnull=False,
-                        enviado_en__lte=corte_analisis,
-                    ).order_by('enviado_en', 'id_triaje')[: max(1, min(100, int(limite)))]
-                )
+        )
+        for item in atascados_envio:
+            item.lease_expira_en = None
+            item.despacho_token = ''
+            if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
+                item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
+                item.proximo_reintento_en = None
+                item.ultimo_error_envio = 'Envío interrumpido (lease expirado; reintentos agotados).'
+            else:
+                item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
+                item.proximo_reintento_en = ahora
+                item.ultimo_error_envio = 'Envío interrumpido por reinicio o caída; reencolado automáticamente.'
+            item.save(
+                update_fields=[
+                    'estado_envio',
+                    'lease_expira_en',
+                    'despacho_token',
+                    'proximo_reintento_en',
+                    'ultimo_error_envio',
+                    'fecha_actualizacion',
+                ]
             )
-            for item in atascados_analisis:
-                item.despacho_token = ''
-                if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
-                    item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
-                    item.estado_analisis = TriajePeticion.ANALISIS_FALLIDO
-                    item.proximo_reintento_en = None
-                    item.ultimo_error_envio = 'Timeout esperando callback de n8n (reintentos agotados).'
-                else:
-                    item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
-                    item.estado_analisis = TriajePeticion.ANALISIS_PENDIENTE
-                    item.proximo_reintento_en = ahora
-                    item.ultimo_error_envio = 'Timeout esperando callback de n8n; reencolado automáticamente.'
-                item.save(
-                    update_fields=[
-                        'estado_envio',
-                        'estado_analisis',
-                        'despacho_token',
-                        'proximo_reintento_en',
-                        'ultimo_error_envio',
-                        'fecha_actualizacion',
-                    ]
-                )
-                recuperados_analisis += 1
+            recuperados_lease += 1
 
-        # 3. Análisis PARCIAL o FALLIDO sin prioridad sugerida (fallo temporal de IA) con reintentos disponibles
-        with transaction.atomic():
-            fallidos_ia = list(
-                _select_for_update_qs(
-                    TriajePeticion.objects.filter(
-                        estado_envio=TriajePeticion.ENVIO_ENVIADO,
-                        estado_analisis__in=[
-                            TriajePeticion.ANALISIS_FALLIDO,
-                            TriajePeticion.ANALISIS_PARCIAL,
-                        ],
-                        prioridad_sugerida__isnull=True,
-                        proximo_reintento_en__isnull=False,
-                        proximo_reintento_en__lte=ahora,
-                        intentos_envio__lt=F('max_intentos'),
-                    ).order_by('proximo_reintento_en', 'id_triaje')[: max(1, min(100, int(limite)))]
-                )
+    # 2. Análisis EN_PROCESO sin callback más allá de TRIAJE_ANALISIS_TIMEOUT_SEGUNDOS
+    corte_analisis = ahora - timedelta(seconds=cfg['analisis_timeout'])
+    with transaction.atomic():
+        atascados_analisis = list(
+            _select_for_update_qs(
+                TriajePeticion.objects.filter(
+                    estado_envio=TriajePeticion.ENVIO_ENVIADO,
+                    estado_analisis=TriajePeticion.ANALISIS_EN_PROCESO,
+                    enviado_en__isnull=False,
+                    enviado_en__lte=corte_analisis,
+                ).order_by('enviado_en', 'id_triaje')[: max(1, min(100, int(limite)))]
             )
-            for item in fallidos_ia:
-                item.despacho_token = ''
+        )
+        for item in atascados_analisis:
+            item.despacho_token = ''
+            if int(item.intentos_envio or 0) >= int(item.max_intentos or 6):
+                item.estado_envio = TriajePeticion.ENVIO_FALLO_DEFINITIVO
+                item.estado_analisis = TriajePeticion.ANALISIS_FALLIDO
+                item.proximo_reintento_en = None
+                item.ultimo_error_envio = 'Timeout esperando callback de n8n (reintentos agotados).'
+            else:
                 item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
                 item.estado_analisis = TriajePeticion.ANALISIS_PENDIENTE
                 item.proximo_reintento_en = ahora
-                item.ultimo_error_envio = 'Fallo temporal de análisis IA; reencolado automáticamente.'
-                item.save(
-                    update_fields=[
-                        'estado_envio',
-                        'estado_analisis',
-                        'despacho_token',
-                        'proximo_reintento_en',
-                        'ultimo_error_envio',
-                        'fecha_actualizacion',
-                    ]
-                )
-                recuperados_fallo_ia += 1
+                item.ultimo_error_envio = 'Timeout esperando callback de n8n; reencolado automáticamente.'
+            item.save(
+                update_fields=[
+                    'estado_envio',
+                    'estado_analisis',
+                    'despacho_token',
+                    'proximo_reintento_en',
+                    'ultimo_error_envio',
+                    'fecha_actualizacion',
+                ]
+            )
+            recuperados_analisis += 1
 
-        res_reintentos = procesar_reintentos_pendientes(limite=limite)
-        return {
-            **res_reintentos,
-            'recuperados_lease': recuperados_lease,
-            'recuperados_analisis': recuperados_analisis,
-            'recuperados_fallo_ia': recuperados_fallo_ia,
-        }
-    finally:
-        if advisory_adquirido and connection.vendor == 'postgresql':
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute('SELECT pg_advisory_unlock(%s)', [_PG_ADVISORY_LOCK_KEY])
-            except Exception:
-                pass
+    # 3. Análisis PARCIAL o FALLIDO sin prioridad sugerida (fallo temporal de IA) con reintentos disponibles
+    with transaction.atomic():
+        fallidos_ia = list(
+            _select_for_update_qs(
+                TriajePeticion.objects.filter(
+                    estado_envio=TriajePeticion.ENVIO_ENVIADO,
+                    estado_analisis__in=[
+                        TriajePeticion.ANALISIS_FALLIDO,
+                        TriajePeticion.ANALISIS_PARCIAL,
+                    ],
+                    prioridad_sugerida__isnull=True,
+                    proximo_reintento_en__isnull=False,
+                    proximo_reintento_en__lte=ahora,
+                    intentos_envio__lt=F('max_intentos'),
+                ).order_by('proximo_reintento_en', 'id_triaje')[: max(1, min(100, int(limite)))]
+            )
+        )
+        for item in fallidos_ia:
+            item.despacho_token = ''
+            item.estado_envio = TriajePeticion.ENVIO_FALLO_TEMPORAL
+            item.estado_analisis = TriajePeticion.ANALISIS_PENDIENTE
+            item.proximo_reintento_en = ahora
+            item.ultimo_error_envio = 'Fallo temporal de análisis IA; reencolado automáticamente.'
+            item.save(
+                update_fields=[
+                    'estado_envio',
+                    'estado_analisis',
+                    'despacho_token',
+                    'proximo_reintento_en',
+                    'ultimo_error_envio',
+                    'fecha_actualizacion',
+                ]
+            )
+            recuperados_fallo_ia += 1
+
+    res_reintentos = procesar_reintentos_pendientes(limite=limite)
+    return {
+        **res_reintentos,
+        'recuperados_lease': recuperados_lease,
+        'recuperados_analisis': recuperados_analisis,
+        'recuperados_fallo_ia': recuperados_fallo_ia,
+    }
 
 
 def _normalizar_lista_textos(valor: Any, *, max_items: int = 20, max_len: int = 120) -> List[str]:
@@ -1326,6 +1635,47 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     )
     if not peticion:
         raise PeticionNoEncontradaError(f'La petición #{id_peticion} no existe.')
+
+    resultado_raw = datos.get('resultado_raw')
+    foto_demo = False
+    es_callback_demo = isinstance(resultado_raw, dict) and resultado_raw.get('gemini_demo') is True
+    if es_callback_demo:
+        token = str(datos.get('despacho_token') or '')
+        try:
+            despacho = obtener_triaje_despacho_demo(id_peticion, token)
+        except PermissionError as exc:
+            raise StaleTriajeCallbackError(str(exc)) from exc
+        if datos.get('clave_idempotencia') != despacho.clave_idempotencia:
+            raise StaleTriajeCallbackError('La clave de idempotencia no coincide con el despacho.')
+        escenario = escenario_demo_autorizado(despacho.peticion, despacho)
+        foto_demo = escenario == ESCENARIO_CON_IMAGEN and obtener_config_triaje()['enviar_fotos_gemini']
+        if despacho.estado_analisis != TriajePeticion.ANALISIS_COMPLETADO and (
+            not escenario
+            or datos.get('estado_analisis') != TriajePeticion.ANALISIS_COMPLETADO
+            or not datos.get('prioridad_sugerida')
+            or not datos.get('justificacion', '').strip()
+            or (foto_demo and not datos.get('modelo_vision_usado'))
+        ):
+            texto = sanitizar_texto_pii_para_ia(despacho.peticion.descripcion or '')
+            prioridad, justificacion = _clasificar_prioridad_local_reglas(texto)
+            datos = {
+                **{campo: datos.get(campo) for campo in (
+                    'despacho_token', 'clave_idempotencia', 'n8n_execution_id',
+                    'posibles_duplicados', 'veterinario_recomendado_id',
+                    'justificacion_recomendacion', 'carga_veterinarios_snapshot',
+                )},
+                'estado_analisis': TriajePeticion.ANALISIS_PARCIAL,
+                'prioridad_sugerida': prioridad,
+                'nivel_confianza': 0.5,
+                'justificacion': f'{justificacion} Se requiere revisión humana.',
+                'resumen_texto': texto,
+                'modelo_texto_usado': 'reglas_locales_privacidad',
+                'resultado_raw': {
+                    'modo': 'fallback_local_privacidad',
+                    'motivo': 'gemini_no_disponible' if escenario else 'gemini_no_autorizado',
+                    'revision_humana_requerida': True,
+                },
+            }
 
     prioridad_norm = normalizar_prioridad_sugerida(datos.get('prioridad_sugerida'))
 
@@ -1365,6 +1715,11 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     resultado_raw = datos.get('resultado_raw')
     if not isinstance(resultado_raw, dict):
         resultado_raw = {}
+    else:
+        resultado_raw = {
+            k: v for k, v in resultado_raw.items()
+            if k not in ('escenario_demo', 'foto_duplicados_demo', 'imagen_sintetica_demo')
+        }
     ia_raw = resultado_raw.get('ia') if isinstance(resultado_raw.get('ia'), dict) else {}
 
     signos = _normalizar_lista_textos(datos.get('signos_detectados'), max_items=15, max_len=80)
@@ -1375,7 +1730,7 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     )
 
     _, todas_evidencias = extraer_fotografias_peticion(peticion)
-    tiene_fotos = any(detectar_tipo_archivo(u) == 'imagen' for u in todas_evidencias)
+    tiene_fotos = foto_demo or any(detectar_tipo_archivo(u) == 'imagen' for u in todas_evidencias)
     if tiene_fotos:
         signos_fotografia = _normalizar_lista_textos(
             datos.get('signos_fotografia') or ia_raw.get('signos_fotografia'),
@@ -1429,10 +1784,13 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         )
 
         # Protección contra callbacks de intentos obsoletos (fencing token)
-        if token_entrante and triaje.despacho_token and token_entrante != triaje.despacho_token:
+        if token_entrante and (es_callback_demo or triaje.despacho_token) and token_entrante != triaje.despacho_token:
             raise StaleTriajeCallbackError(
                 'Callback rechazado: despacho_token obsoleto respecto al intento vigente.'
             )
+
+        if es_callback_demo and exec_id_entrante and exec_id_entrante == triaje.n8n_execution_id:
+            return triaje
 
         # Protección idempotente / anti-regresión cuando ya está COMPLETADO
         if triaje.estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
@@ -1484,6 +1842,8 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         triaje.modelo_texto_usado = str(datos.get('modelo_texto_usado') or '')[:100]
         triaje.modelo_vision_usado = str(datos.get('modelo_vision_usado') or '')[:100]
         triaje.n8n_execution_id = exec_id_entrante
+        if foto_demo and triaje.modelo_vision_usado and estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
+            resultado_raw['imagen_sintetica_demo'] = True
         triaje.resultado_raw = resultado_raw
         triaje.version_resultado = int(triaje.version_resultado or 0) + 1
         if estado_analisis in (TriajePeticion.ANALISIS_COMPLETADO, TriajePeticion.ANALISIS_PARCIAL):

@@ -47,7 +47,7 @@ def _ejecutar_ciclo_recuperacion() -> None:
     from triaje_ia.services import recuperar_trabajos_interrumpidos
 
     try:
-        recuperar_trabajos_interrumpidos(limite=20, usar_advisory_lock=True)
+        recuperar_trabajos_interrumpidos(limite=20)
     except Exception:
         logger.exception('Error controlado en ciclo automático de recuperación de triaje.')
     finally:
