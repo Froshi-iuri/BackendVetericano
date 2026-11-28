@@ -1526,6 +1526,10 @@ def gestionar_decision_alerta(
                 estado_nuevo_por_id=estado_nuevo_por_id,
             )
 
+        if nuevo_estado in (PeticionPosibleDuplicado.ESTADO_DESCARTADO, PeticionPosibleDuplicado.ESTADO_CONFIRMADO):
+            from triaje_ia.services import reanudar_asignacion_tras_revision
+            transaction.on_commit(lambda: reanudar_asignacion_tras_revision(id_menor_ref, id_mayor_ref))
+
         return ResultadoDecisionAlerta(
             alerta=alerta,
             cambiada=True,

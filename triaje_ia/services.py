@@ -13,12 +13,12 @@ from urllib.parse import urlparse
 import requests
 from django.conf import settings
 from django.db import IntegrityError, connection, connections, transaction
-from django.db.models import Count, F, Q
+from django.db.models import Count, F, Max, Q
 from django.utils import timezone
 from django.utils.crypto import constant_time_compare
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from peticiones.models import Peticiones, PeticionPosibleDuplicado
+from peticiones.models import EstadoPeticiones, HistorialAsignacionPeticion, NotificacionPeticion, Peticiones, PeticionPosibleDuplicado
 from peticiones.services.alertas_duplicados_service import (
     es_peticion_duplicada,
     registrar_alertas_desde_deteccion,
@@ -39,6 +39,8 @@ from peticiones.utils import (
     DIAS_PARA_REASIGNAR,
     ESTADOS_TERMINALES_NORM,
     calcular_tiempos_peticion,
+    crear_notificacion_asignacion,
+    crear_notificaciones_peticion_usuarios,
     detectar_tipo_archivo,
     normalizar_texto_juridico,
     registrar_historial_peticion,
@@ -46,7 +48,7 @@ from peticiones.utils import (
 from realtime import notificar as rt_notificar
 from triaje_ia.escenarios_demo import ESCENARIO_CON_IMAGEN, ESCENARIOS_DEMO, dibujar_imagen_demo
 from triaje_ia.models import TriajePeticion
-from users.constants import ROL_VETERINARIO
+from users.constants import ROL_JURIDICO, ROL_VETERINARIO
 from users.models import Usuarios
 
 logger = logging.getLogger(__name__)
@@ -787,6 +789,92 @@ def calcular_carga_veterinarios(
     }
 
 
+def _asignar_al_terminar(triaje, *, duplicados_comprobados):
+    """Se ejecuta dentro de la transacción que bloqueó el triaje."""
+    if not settings.TRIAJE_ASIGNACION_AUTOMATICA or not duplicados_comprobados:
+        return
+    if triaje.decision_veterinario != triaje.DECISION_PENDIENTE:
+        return
+    peticion = Peticiones.objects.select_for_update(no_key=True).get(pk=triaje.peticion_id)
+    if peticion.asignado_a_id or not _evaluar_elegibilidad_asignacion(peticion)[0]:
+        return
+    pares = PeticionPosibleDuplicado.objects.filter(Q(peticion_menor=peticion) | Q(peticion_mayor=peticion))
+    revisados = set()
+    for menor, mayor in pares.filter(
+        Q(estado_revision='DESCARTADO') | Q(estado_revision='CONFIRMADO', peticion_principal=peticion)
+    ).values_list('peticion_menor_id', 'peticion_mayor_id'):
+        revisados.add(mayor if menor == peticion.pk else menor)
+    if pares.filter(estado_revision='PENDIENTE').exists() or any(
+        candidato.get('id_peticion') not in revisados for candidato in triaje.posibles_duplicados
+    ):
+        triaje.resultado_raw['asignacion_espera_revision'] = True
+        triaje.save(update_fields=['resultado_raw'])
+        return
+
+    sede = peticion.responsable.id_sede_id if peticion.responsable_id else None
+    candidatos = Usuarios.objects.filter(id_rol_id=ROL_VETERINARIO, activo=True)
+    if sede is not None:
+        candidatos = candidatos.filter(id_sede_id=sede)
+    # Orden estable entre workers. NO KEY UPDATE permite las referencias FK del callback.
+    bloqueados = set(candidatos.order_by('pk').select_for_update(no_key=True).values_list('pk', flat=True))
+    carga = calcular_carga_veterinarios(id_peticion=peticion.pk, solo_sede=True)
+    elegibles = [v for v in carga['veterinarios'] if not v['saturado'] and v['id_veterinario'] in bloqueados]
+    if not elegibles:
+        tipo = 'SIN_VETERINARIO'
+        if not NotificacionPeticion.objects.filter(id_peticion=peticion, tipo=tipo).exists():
+            avisos = crear_notificaciones_peticion_usuarios(
+                peticion, Usuarios.objects.filter(id_rol_id=ROL_JURIDICO, activo=True),
+                tipo, 'Petición pendiente de asignación',
+                f'No hay veterinarios disponibles para {peticion.numero_radicado}.', raise_on_error=True,
+            )
+            rt_notificar.entregar_notificaciones_peticion(avisos)
+        return
+
+    # A igual carga, dar turno a quien lleva más tiempo sin recibir una asignación.
+    ultimas = dict(HistorialAsignacionPeticion.objects.filter(
+        veterinario_nuevo_id__in=bloqueados,
+    ).values('veterinario_nuevo_id').annotate(ultima=Max('fecha')).values_list('veterinario_nuevo_id', 'ultima'))
+    def turno(vet):
+        uid = vet['id_veterinario']
+        return vet['carga_activa'], uid in ultimas, ultimas.get(uid), uid
+
+    elegido = min(elegibles, key=turno)
+    vet = Usuarios.objects.get(pk=elegido['id_veterinario'])
+    estado_anterior = peticion.id_estado
+    estado = EstadoPeticiones.objects.filter(nombre__iexact='Asignada').first()
+    peticion.asignado_a = vet
+    peticion.fecha_asignacion = timezone.now()
+    peticion.id_estado = estado or estado_anterior
+    peticion.save(update_fields=['asignado_a', 'fecha_asignacion', 'id_estado'])
+    motivo = 'Asignación automática al finalizar el triaje por disponibilidad y carga laboral.'
+    HistorialAsignacionPeticion.objects.create(id_peticion=peticion, veterinario_nuevo=vet, motivo=motivo)
+    registrar_historial_peticion(
+        peticion=peticion, tipo_cambio='ASIGNACION', estado_anterior=estado_anterior,
+        estado_nuevo=peticion.id_estado, veterinario_nuevo=vet, observacion=motivo, raise_on_error=True,
+    )
+    aviso = crear_notificacion_asignacion(peticion, vet, raise_on_error=True)
+    rt_notificar.entregar_notificaciones_peticion([aviso])
+    rt_notificar.actualizacion_silenciosa('peticion.asignacion_actualizada', roles=(1, 2),
+                                         accion='asignada', referencia={'id_peticion': peticion.pk})
+    triaje.veterinario_recomendado = vet
+    triaje.justificacion_recomendacion = motivo
+    triaje.decision_veterinario = triaje.DECISION_NO_APLICA
+    triaje.decision_veterinario_observacion = motivo
+    triaje.veterinario_asignado_decision_id = vet.pk
+    triaje.save(update_fields=['veterinario_recomendado', 'justificacion_recomendacion', 'decision_veterinario',
+                               'decision_veterinario_observacion', 'veterinario_asignado_decision_id'])
+
+
+def reanudar_asignacion_tras_revision(*peticiones):
+    if not settings.TRIAJE_ASIGNACION_AUTOMATICA:
+        return
+    for pk in sorted(peticiones):
+        with transaction.atomic():
+            triaje = TriajePeticion.objects.select_for_update().filter(peticion_id=pk).first()
+            if triaje and triaje.resultado_raw.get('asignacion_espera_revision'):
+                _asignar_al_terminar(triaje, duplicados_comprobados=True)
+
+
 def ejecutar_deteccion_duplicados_triaje(
     id_peticion: int,
     *,
@@ -952,6 +1040,7 @@ def ejecutar_triaje_local_privado(
     texto_sanitizado = sanitizar_texto_pii_para_ia(peticion.descripcion or '')
     prioridad_local, base_justificacion = _clasificar_prioridad_local_reglas(texto_sanitizado)
 
+    duplicados_comprobados = False
     posibles_dup: List[Dict[str, Any]] = []
     try:
         res_dup = ejecutar_deteccion_duplicados_triaje(
@@ -959,6 +1048,7 @@ def ejecutar_triaje_local_privado(
             usar_dinov2=True,
             registrar_alertas=True,
         )
+        duplicados_comprobados = isinstance(res_dup.get('posibles_duplicados'), list)
         posibles_dup = list(res_dup.get('posibles_duplicados') or [])
     except Exception:
         posibles_dup = []
@@ -1011,6 +1101,7 @@ def ejecutar_triaje_local_privado(
             'revision_humana_requerida': True,
         }
         triaje_upd.save()
+        _asignar_al_terminar(triaje_upd, duplicados_comprobados=duplicados_comprobados)
 
     return {
         'enviado': False,
@@ -1625,7 +1716,7 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     """
     Persiste de forma idempotente y protegida contra concurrencia/callbacks obsoletos
     el resultado del análisis recibido desde n8n.
-    Nunca modifica Peticiones.prioridad ni asigna Peticiones.asignado_a.
+    Conserva la confirmación humana de prioridad y aplica la política de asignación.
     """
     peticion = (
         Peticiones.objects.select_related('id_estado', 'asignado_a')
@@ -1637,6 +1728,8 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         raise PeticionNoEncontradaError(f'La petición #{id_peticion} no existe.')
 
     resultado_raw = datos.get('resultado_raw')
+    duplicados_comprobados = (isinstance(datos.get('posibles_duplicados'), list)
+                             and isinstance(resultado_raw, dict) and bool(resultado_raw.get('duplicados_meta')))
     foto_demo = False
     es_callback_demo = isinstance(resultado_raw, dict) and resultado_raw.get('gemini_demo') is True
     if es_callback_demo:
@@ -1849,6 +1942,8 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         if estado_analisis in (TriajePeticion.ANALISIS_COMPLETADO, TriajePeticion.ANALISIS_PARCIAL):
             triaje.completado_en = ahora
         triaje.save()
+        if prioridad_norm and estado_analisis in (triaje.ANALISIS_COMPLETADO, triaje.ANALISIS_PARCIAL):
+            _asignar_al_terminar(triaje, duplicados_comprobados=duplicados_comprobados)
 
         rt_notificar.actualizacion_silenciosa(
             'peticion.estado_actualizado',
@@ -1915,6 +2010,12 @@ def registrar_decision_humana_triaje(
         peticion = Peticiones.objects.select_for_update().get(pk=triaje.peticion_id)
         estado_nombre = getattr(getattr(peticion, 'id_estado', None), 'nombre', '') or ''
         estado_norm = normalizar_texto_juridico(estado_nombre)
+
+        if tipo_rec == 'VETERINARIO' and triaje.decision_veterinario == triaje.DECISION_NO_APLICA:
+            raise TriajeDecisionInvalidaError(
+                'El veterinario ya fue asignado automáticamente. Utilice Reasignar.',
+                status_code=409, codigo='ASIGNACION_AUTOMATICA',
+            )
 
         # Idempotencia estricta: evitar duplicar historial, asignaciones o notificaciones en reintentos
         if tipo_rec == 'PRIORIDAD' and triaje.decision_prioridad == decision:

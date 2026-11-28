@@ -391,10 +391,17 @@ def calcular_tiempos_peticion(peticion, ahora=None) -> dict:
     es_terminal = estado_norm in ESTADOS_TERMINALES_NORM
     tiene_veterinario = bool(getattr(peticion, 'asignado_a_id', None))
 
+    asignacion_automatica = False
+    if tiene_veterinario and not es_terminal and getattr(peticion, 'asignado_por_id', None) is None:
+        triaje = getattr(peticion, 'triaje_ia', None)
+        asignacion_automatica = (
+            getattr(triaje, 'decision_veterinario', None) == 'NO_APLICA'
+            and triaje.veterinario_asignado_decision_id == peticion.asignado_a_id
+        )
     puede_reasignar = bool(
         tiene_veterinario
         and not es_terminal
-        and dias_sin_avanzar >= DIAS_PARA_REASIGNAR
+        and (asignacion_automatica or dias_sin_avanzar >= DIAS_PARA_REASIGNAR)
     )
 
     return {
