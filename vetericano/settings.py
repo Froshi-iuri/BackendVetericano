@@ -674,6 +674,7 @@ GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS = tuple(
 
 # ─── Triaje Inteligente IA (orquestación con n8n) ────────────────────────────────────────
 # Apagado por defecto hasta completar pruebas, migración y despliegue centralizado de n8n.
+TRIAJE_ASIGNACION_AUTOMATICA = _leer_env_bool('TRIAJE_ASIGNACION_AUTOMATICA', default=False)
 TRIAJE_N8N_ACTIVO = _leer_env_bool('TRIAJE_N8N_ACTIVO', default=False)
 TRIAJE_N8N_WEBHOOK_URL = os.environ.get('TRIAJE_N8N_WEBHOOK_URL', '').strip()
 TRIAJE_N8N_WEBHOOK_SECRET = os.environ.get('TRIAJE_N8N_WEBHOOK_SECRET', '').strip()

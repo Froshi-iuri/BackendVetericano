@@ -152,6 +152,9 @@ class _BaseTriajeSqliteTestCase(SimpleTestCase):
             for modelo in _MODELOS_AISLADOS:
                 editor.create_model(modelo)
 
+        self._crear_datos_base()
+
+    def _crear_datos_base(self):
         self.rol_admin = Rol.objects.create(id_rol=ROL_ADMINISTRADOR, nombre_rol='Administrador')
         self.rol_juridico = Rol.objects.create(id_rol=ROL_JURIDICO, nombre_rol='Jurídico')
         self.rol_vet = Rol.objects.create(id_rol=ROL_VETERINARIO, nombre_rol='Veterinario')

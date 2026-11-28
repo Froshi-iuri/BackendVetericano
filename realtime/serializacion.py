@@ -5,6 +5,7 @@
 MAPA_TIPO_PETICION = {
     'NUEVA_PETICION': 'peticion.creada',
     'PETICION_URGENTE': 'peticion.urgente',
+    'SIN_VETERINARIO': 'peticion.estado_actualizado',
     'ASIGNACION': 'peticion.asignada',
     'REASIGNACION': 'peticion.reasignada',
     'DESASIGNACION': 'peticion.desasignada',
