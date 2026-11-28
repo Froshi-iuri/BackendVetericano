@@ -577,7 +577,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         url_foto = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/animal_test.jpg'
         url_miniatura_esperada = (
             'https://res.cloudinary.com/vet-test/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000000/animal_test.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700000000/animal_test.jpg'
         )
         url_video = 'https://res.cloudinary.com/vet-test/video/upload/v1700000000/clip.mp4'
 
@@ -663,7 +663,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         url_video = 'https://res.cloudinary.com/vet-test/video/upload/v1700000000/clip.mp4'
         url_miniatura_esperada = (
             'https://res.cloudinary.com/vet-test/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000000/animal_a.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700000000/animal_a.jpg'
         )
         ciudadano_b = self._crear_usuario(
             self.rol_ciudadano,
@@ -750,7 +750,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         url_img_con_aut = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/orden_con_aut.jpg'
         url_miniatura_orden = (
             'https://res.cloudinary.com/vet-test/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000000/orden_con_aut.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700000000/orden_con_aut.jpg'
         )
         desc_consulta_orden = (
             'Felino atrapado en alcantarilla profunda del barrio universitario caso_orden_sin_foto'
@@ -990,7 +990,7 @@ class PostgresDetectarDuplicadosCiudadanoTests(VetericanoTransactionTestCase):
         url_si_aut = 'https://res.cloudinary.com/vet-test/image/upload/v1700000000/si_autorizada.jpg'
         miniatura_si = (
             'https://res.cloudinary.com/vet-test/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700000000/si_autorizada.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700000000/si_autorizada.jpg'
         )
 
         pet = self._crear_peticion(

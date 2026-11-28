@@ -433,7 +433,7 @@ class DetectarDuplicadosCiudadanoFotoTestCase(SimpleTestCase):
         ultimo = resp_valida.data['posibles_duplicados'][0]
         esperada = (
             'https://res.cloudinary.com/vet/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700/perro_valido.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700/perro_valido.jpg'
         )
         self.assertEqual(ultimo['foto'], esperada)
         self.assertTrue(ultimo['tiene_fotografia'])
@@ -505,7 +505,7 @@ class DetectarDuplicadosCiudadanoFotoTestCase(SimpleTestCase):
         url_no_aut_4 = 'https://res.cloudinary.com/vet/image/upload/v1700/sin_aut_4.jpg'
         esperada_3 = (
             'https://res.cloudinary.com/vet/image/upload/'
-            'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto/v1700/con_aut_3.jpg'
+            'c_limit,w_1280,h_1280,q_auto,f_auto/v1700/con_aut_3.jpg'
         )
         mock_auth.return_value = {103: {url_aut_3}}
 
