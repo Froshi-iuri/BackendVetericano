@@ -74,6 +74,11 @@ class TriajeInternoFotoSeguraView(_VistaInternaTriajeBase):
     def get(self, request, id_peticion):
         try:
             jpeg_bytes = obtener_foto_sanitizada_para_triaje(id_peticion)
+        except PermissionError as exc:
+            return Response(
+                {'error': str(exc), 'codigo': 'FOTOS_IA_DESACTIVADAS'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         except (PeticionNoEncontradaError, TriajeNoEncontradoError) as exc:
             return Response(
                 {'error': str(exc)},
@@ -171,7 +176,7 @@ class TriajeInternoReintentarPendientesView(_VistaInternaTriajeBase):
         except (TypeError, ValueError):
             limite_int = 20
         return Response(
-            recuperar_trabajos_interrumpidos(limite=limite_int, usar_advisory_lock=True),
+            recuperar_trabajos_interrumpidos(limite=limite_int),
             status=status.HTTP_200_OK,
         )
 

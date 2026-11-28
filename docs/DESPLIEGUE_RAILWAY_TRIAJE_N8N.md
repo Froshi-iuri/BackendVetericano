@@ -79,17 +79,35 @@ Antes de autorizar cualquier merge `andres -> dev`:
    - `TRIAJE_N8N_WEBHOOK_URL=https://<tu-dominio-n8n>.up.railway.app/webhook/vetericano-triaje-peticion` (recomendado con Serverless ON para que el Edge Proxy despierte `n8n` de forma fiable).
    - `TRIAJE_N8N_TIMEOUT_SEGUNDOS=20.0` (en hilo asíncrono de fondo; si `n8n` arranca en <20 s entra al primer intento).
    - `TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS=30.0` y `TRIAJE_N8N_MAX_REINTENTOS=6` (si el primer intento recibe `502`/timeout mientras despierta `n8n`, el segundo intento corre a los ~30–60 s con `n8n` ya caliente dentro de su ventana activa de 5–10 min).
-   - El resto de variables documentadas en [`.env.railway.example`](../.env.railway.example), manteniendo `TRIAJE_N8N_ACTIVO=False` hasta migrar Supabase.
-2. Verificar que `DATABASE_URL` de `BackendVetericano` permita locks de sesión (`:5432`) si se usa `TRIAJE_RECOVERY_IN_PROCESS=True`, o ejecutar `python manage.py procesar_reintentos_triaje --continuo` en un worker aislado con `TRIAJE_RECOVERY_IN_PROCESS=False`.
-3. Tras autorización, respaldar Supabase y aplicar únicamente las migraciones de `triaje_ia`:
+   - `TRIAJE_GEMINI_ENVIAR_FOTOS=False` (fail-closed: evita enviar fotografías con posibles rostros o placas en píxeles a Gemini; cuando un caso contiene datos confidenciales o PII residual, se omite Gemini y se usa triaje local determinístico con revisión humana).
+   - `TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=False` (fail-closed: mientras se use Gemini gratuito, solo peticiones ficticias autorizadas internamente en servidor mediante `TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS` o el comando `preparar_prueba_webhook_triaje` salen a Gemini; el texto `[PRUEBA-TRIAJE]` escrito por un ciudadano jamás autoriza Gemini y todas las denuncias reales usan triaje local determinístico con revisión humana hasta activar Paid Tier / Cloud Billing).
+   - El resto de variables documentadas en [`.env.railway.example`](../.env.railway.example), manteniendo `TRIAJE_N8N_ACTIVO=False` hasta autorizar activación global.
+2. **Compatibilidad con Supabase Pooler (`6543`):** `recuperar_trabajos_interrumpidos` ya no usa `pg_try_advisory_lock` a nivel de sesión; utiliza transacciones cortas por lote con `select_for_update(skip_locked=True)` y reclamo atómico con `despacho_token`, seguro para los 2 workers de Gunicorn sobre Supavisor/PgBouncer (`6543`).
+3. Tras autorización, respaldar Supabase si hace falta y verificar migraciones de `triaje_ia`:
    ```bash
    python manage.py migrate triaje_ia
    ```
-4. Cambiar `TRIAJE_N8N_ACTIVO=True` en `BackendVetericano` en Railway y validar una denuncia de prueba con `n8n` previamente dormido.
+4. Cambiar `TRIAJE_N8N_ACTIVO=True` en `BackendVetericano` en Railway únicamente cuando se autorice la activación global.
 
 ---
 
-## 6. Frontend Angular (`adminVetericano`) y entorno `localhost:4200`
+## 6. Procedimiento seguro de prueba integral en Railway (con `TRIAJE_N8N_ACTIVO=False`)
+
+1. Crear una petición **ficticia de prueba** cuya descripción incluya el marcador literal `[PRUEBA-TRIAJE]` (sin datos reales ni fotos de terceros).
+2. En Railway (`BackendVetericano`), ejecutar el comando seguro que genera un `despacho_token` válido y deja esa única petición ficticia en estado `ENVIADO` / `EN_PROCESO` sin tocar peticiones reales:
+   ```bash
+   python manage.py preparar_prueba_webhook_triaje --id-peticion <ID_FICTICIO>
+   ```
+   *(El comando aborta automáticamente si la descripción no contiene `[PRUEBA-TRIAJE]` o si el triaje ya está `COMPLETADO`.)*
+3. Enviar por `POST` (desde consola/Postman) el `payload_webhook` impreso por el comando hacia `TRIAJE_N8N_WEBHOOK_URL` con la cabecera `X-Vetericano-Triaje-Secret`.
+4. Verificar que:
+   - `n8n` despierta en frío (Serverless ON), ejecuta el flujo y envía el callback a `/api/triaje-ia/interno/peticiones/<ID_FICTICIO>/resultado/`.
+   - Django acepta el callback gracias al `despacho_token` válido y persiste `TriajePeticion` (`COMPLETADO`) sin modificar `Peticiones.prioridad` ni `Peticiones.asignado_a`.
+   - El panel en `localhost:4200` (rama `jhorman`) muestra el triaje y permite aceptar/rechazar recomendaciones.
+
+---
+
+## 7. Frontend Angular (`adminVetericano`) y entorno `localhost:4200`
 
 - **Rama real de integración de Angular:** `Developers`.
 - **`localhost:4200` habitual:** `ng serve` sigue usando por defecto `development` (`environment.development.ts` → `https://backendvetericano-production.up.railway.app`) y `-c local` (`127.0.0.1:8000`).

@@ -305,6 +305,7 @@ class TriajeDespachoYResilienciaTests(_BaseTriajeSqliteTestCase):
         TRIAJE_N8N_WEBHOOK_SECRET='secreto-webhook-test',
         TRIAJE_SERVICE_TOKEN='token-servicio-super-secreto',
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_iniciar_peticion_despacha_idempotente_con_dispatch_token_sin_exponer_secretos(self):
         factory = APIRequestFactory()
@@ -355,6 +356,7 @@ class TriajeDespachoYResilienciaTests(_BaseTriajeSqliteTestCase):
         TRIAJE_N8N_MAX_REINTENTOS=3,
         TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS=10.0,
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_recuperacion_trabajos_interrumpidos_lease_y_timeout_analisis(self):
         # 1. Trabajo interrumpido en ENVIANDO (lease expirado tras reinicio de worker)
@@ -414,6 +416,7 @@ class TriajeDespachoYResilienciaTests(_BaseTriajeSqliteTestCase):
         TRIAJE_N8N_MAX_REINTENTOS=2,
         TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS=10.0,
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_backoff_y_fallo_definitivo_tras_agotar_reintentos(self):
         pet = self._crear_peticion()
@@ -449,6 +452,7 @@ class TriajeDespachoYResilienciaTests(_BaseTriajeSqliteTestCase):
         TRIAJE_N8N_ACTIVO=True,
         TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_concurrencia_en_despacho_solo_envia_una_vez(self):
         import os
@@ -1378,7 +1382,7 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
         self.assertIn('perro presenta sangrado activo tras atropellamiento', sanitizado)
 
         pet = self._crear_peticion(descripcion=texto_con_pii)
-        with override_settings(TRIAJE_ENVIAR_URLS_EXTERNAS_N8N=False):
+        with override_settings(TRIAJE_ENVIAR_URLS_EXTERNAS_N8N=False, TRIAJE_GEMINI_ENVIAR_FOTOS=False):
             payload = construir_payload_peticion_triaje(pet, despacho_token='tok-123')
 
         self.assertNotIn('ubicacion', payload)
@@ -1386,11 +1390,20 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
         self.assertNotIn('videos', payload)
         self.assertTrue(payload['tiene_fotos'])
         self.assertEqual(payload['total_fotos'], 1)
-        self.assertEqual(payload['foto_segura_path'], f'/api/triaje-ia/interno/peticiones/{pet.id_peticion}/foto-segura/')
+        self.assertFalse(payload['enviar_fotos_gemini'])
+        self.assertEqual(payload['foto_segura_path'], '')
         self.assertEqual(payload['fotos'], [])
         self.assertIsNone(payload['foto'])
         self.assertNotIn('3124567890', payload['descripcion'])
         self.assertIn('sangrado activo', payload['descripcion'])
+
+        with override_settings(TRIAJE_ENVIAR_URLS_EXTERNAS_N8N=False, TRIAJE_GEMINI_ENVIAR_FOTOS=True):
+            payload_con_foto = construir_payload_peticion_triaje(pet, despacho_token='tok-123')
+        self.assertTrue(payload_con_foto['enviar_fotos_gemini'])
+        self.assertEqual(
+            payload_con_foto['foto_segura_path'],
+            f'/api/triaje-ia/interno/peticiones/{pet.id_peticion}/foto-segura/',
+        )
 
         url_strip = construir_url_foto_sin_metadatos_cloudinary(
             'https://res.cloudinary.com/demo/image/upload/v123/perro.jpg'
@@ -1416,8 +1429,13 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
 
         self.assertEqual(self.client.get(url).status_code, status.HTTP_401_UNAUTHORIZED)
 
-        with patch('triaje_ia.services._descargar_bytes_url_validada', return_value=bytes_con_exif):
-            resp = self.client.get(url, HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123')
+        with override_settings(TRIAJE_GEMINI_ENVIAR_FOTOS=False):
+            resp_bloqueado = self.client.get(url, HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123')
+            self.assertEqual(resp_bloqueado.status_code, status.HTTP_403_FORBIDDEN)
+
+        with override_settings(TRIAJE_GEMINI_ENVIAR_FOTOS=True):
+            with patch('triaje_ia.services._descargar_bytes_url_validada', return_value=bytes_con_exif):
+                resp = self.client.get(url, HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123')
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp['Content-Type'], 'image/jpeg')
@@ -1437,6 +1455,7 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
         TRIAJE_N8N_BACKOFF_BASE_SEGUNDOS=10.0,
         TRIAJE_N8N_BACKOFF_MAX_SEGUNDOS=120.0,
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_recuperacion_automatica_fallo_ia_transitorio_y_tope_backoff(self):
         from triaje_ia.services import _calcular_espera_backoff
@@ -1511,12 +1530,16 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
         assemble_code = nodos['Assemble Triage Result']['parameters']['jsCode']
         self.assertIn('ia_guardrail_aplicado', assemble_code)
         self.assertIn('Regla clinica de consistencia', assemble_code)
+        self.assertIn('Boolean(norm.foto_segura_path)', assemble_code)
+        self.assertIn('limpiarListaStrings(parsedIa.signos_detectados, 15, 80)', assemble_code)
         self.assertNotIn('numero_radicado', [a['name'] for a in nodos['Normalize Payload']['parameters']['assignments']['assignments']])
+        self.assertEqual(len(nodos['Has Photos']['parameters']['conditions']['conditions']), 2)
 
     @override_settings(
         TRIAJE_N8N_ACTIVO=True,
         TRIAJE_N8N_WEBHOOK_URL='https://n8n-ejemplo.up.railway.app/webhook/vetericano-triaje-peticion',
         TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
     )
     def test_arranque_en_frio_serverless_recupera_en_segundo_intento(self):
         from triaje_ia.services import obtener_config_triaje
@@ -1546,3 +1569,268 @@ class TriajePrivacidadMetadatosYResilienciaAvanzadaTests(_BaseTriajeSqliteTestCa
         triaje.refresh_from_db()
         self.assertEqual(triaje.estado_envio, TriajePeticion.ENVIO_ENVIADO)
         self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_EN_PROCESO)
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=True,
+    )
+    def test_recuperacion_no_usa_pg_try_advisory_lock_y_soporta_concurrencia_workers(self):
+        import inspect
+        import os
+        import tempfile
+        import threading
+        from triaje_ia import services as triaje_services
+
+        fuente = inspect.getsource(triaje_services.recuperar_trabajos_interrumpidos)
+        self.assertNotIn('pg_try_advisory_lock', fuente)
+        self.assertNotIn('pg_advisory_unlock', fuente)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, 'triaje_recovery_conc.sqlite3')
+            conn_main = _crear_conexion_sqlite(file_uri=db_path)
+            conn_prev = getattr(connections._connections, 'default', None)
+            connections._connections.default = conn_main
+            try:
+                with conn_main.schema_editor(atomic=False) as editor:
+                    for modelo in _MODELOS_AISLADOS:
+                        editor.create_model(modelo)
+
+                rol_pet = Rol.objects.create(id_rol=ROL_PETICIONARIO, nombre_rol='Peticionario')
+                sede = Sede.objects.create(
+                    nombre='Sede Rec', direccion='Cra 1', ciudad='Popayán', telefono='300', activo=True,
+                )
+                ciudadano = Usuarios.objects.create(
+                    id_rol=rol_pet, id_sede=sede, nombre='C',
+                    email='c_rec@triaje.test', password='x', activo=True,
+                )
+                tipo = TipoPeticion.objects.create(nombre='Maltrato', activo=True)
+                est = EstadoPeticiones.objects.create(nombre='En revisión', activo=True, orden=1)
+                ubic = Ubicaciones.objects.create(direccion='Calle 1', latitud=2.44, longitud=-76.6)
+                pet = Peticiones.objects.create(
+                    id_tipo=tipo, id_ubicacion=ubic, id_estado=est, responsable=ciudadano,
+                    descripcion='Perro con fractura en extremidad trasera', numero_radicado='PET-2026-99002',
+                )
+                TriajePeticion.objects.create(
+                    peticion=pet,
+                    clave_idempotencia=f'triaje-pet-{pet.id_peticion}',
+                    estado_envio=TriajePeticion.ENVIO_ENVIANDO,
+                    lease_expira_en=_ahora_local() - timedelta(seconds=5),
+                    despacho_token='lease-vencido-tok',
+                    intentos_envio=1,
+                    max_intentos=6,
+                )
+
+                envios = []
+                lock_envios = threading.Lock()
+                barrera = threading.Barrier(2)
+                resultados = []
+
+                def _post_simulado(*args, **kwargs):
+                    with lock_envios:
+                        envios.append(kwargs.get('json', {}).get('id_peticion'))
+                    return MagicMock(status_code=200, text='ok')
+
+                def _worker():
+                    conn_hilo = _crear_conexion_sqlite(file_uri=db_path)
+                    connections._connections.default = conn_hilo
+                    try:
+                        barrera.wait(timeout=5)
+                        res = recuperar_trabajos_interrumpidos(limite=20, usar_advisory_lock=True)
+                        with lock_envios:
+                            resultados.append(res)
+                    finally:
+                        conn_hilo.close()
+
+                with patch('triaje_ia.services.requests.post', side_effect=_post_simulado):
+                    t1 = threading.Thread(target=_worker)
+                    t2 = threading.Thread(target=_worker)
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=5)
+                    t2.join(timeout=5)
+
+                self.assertEqual(len(envios), 1)
+                self.assertEqual(sum(r.get('enviados', 0) for r in resultados), 1)
+            finally:
+                conn_main.close()
+                connections._connections.default = conn_prev
+
+    def test_sanitizacion_redacta_nombres_sueltos_coordenadas_y_documentos(self):
+        from triaje_ia.services import sanitizar_texto_pii_para_ia
+
+        texto = (
+            'Juan Carlos Perez golpeo al perro en 2.444814, -76.614739, '
+            'CC 1061789123, placa XYZ-987, Calle 12 # 4-55. '
+            'Perro con herida abierta y sangrado activo.'
+        )
+        limpio = sanitizar_texto_pii_para_ia(texto)
+        self.assertNotIn('Juan Carlos Perez', limpio)
+        self.assertNotIn('2.444814', limpio)
+        self.assertNotIn('-76.614739', limpio)
+        self.assertNotIn('1061789123', limpio)
+        self.assertNotIn('XYZ-987', limpio)
+        self.assertNotIn('Calle 12 # 4-55', limpio)
+        self.assertIn('[PERSONA]', limpio)
+        self.assertIn('[COORDENADAS]', limpio)
+        self.assertIn('Perro con herida abierta y sangrado activo', limpio)
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_ASYNC_THREAD=False,
+    )
+    def test_contenido_confidencial_omite_gemini_y_ejecuta_triaje_local_con_revision_humana(self):
+        pet = self._crear_peticion(
+            descripcion='Caso con menor de edad testigo de agresion y perro con sangrado activo tras atropellamiento.'
+        )
+        prioridad_original = pet.prioridad
+
+        with patch('triaje_ia.services.requests.post') as mock_post:
+            with patch('triaje_ia.services.ejecutar_deteccion_duplicados_triaje', return_value={'posibles_duplicados': []}):
+                res = encolar_y_despachar_triaje_peticion(pet, async_dispatch=False)
+
+        mock_post.assert_not_called()
+        self.assertFalse(res['enviado'])
+        self.assertTrue(res['omitido_privacidad'])
+        self.assertTrue(res['fallback_local'])
+
+        triaje = TriajePeticion.objects.get(peticion=pet)
+        self.assertEqual(triaje.estado_envio, TriajePeticion.ENVIO_OMITIDO)
+        self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_PARCIAL)
+        self.assertEqual(triaje.prioridad_sugerida, TriajePeticion.PRIORIDAD_URGENTE)
+        self.assertEqual(triaje.modelo_texto_usado, 'reglas_locales_privacidad')
+        self.assertIn('revisión humana', triaje.justificacion.lower())
+
+        pet.refresh_from_db()
+        self.assertEqual(pet.prioridad, prioridad_original)
+        self.assertIsNone(pet.asignado_a)
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=False,
+        TRIAJE_SERVICE_TOKEN='token-interno-valido-123',
+    )
+    def test_comando_preparar_prueba_webhook_protege_peticiones_reales_y_genera_token_valido(self):
+        import io
+        import json
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        pet_real = self._crear_peticion(descripcion='Perro herido real sin marcador')
+        with self.assertRaises(CommandError):
+            call_command('preparar_prueba_webhook_triaje', id_peticion=pet_real.id_peticion)
+
+        pet_marcador_no_prefijo = self._crear_peticion(descripcion='Caso real con [PRUEBA-TRIAJE] en medio')
+        with self.assertRaises(CommandError):
+            call_command('preparar_prueba_webhook_triaje', id_peticion=pet_marcador_no_prefijo.id_peticion)
+
+        pet_asignada = self._crear_peticion(descripcion='[PRUEBA-TRIAJE] Ya asignada', asignado_a=self.vet_1)
+        with self.assertRaises(CommandError):
+            call_command('preparar_prueba_webhook_triaje', id_peticion=pet_asignada.id_peticion)
+
+        pet_confidencial = self._crear_peticion(descripcion='[PRUEBA-TRIAJE] Caso con menor de edad')
+        with self.assertRaises(CommandError):
+            call_command('preparar_prueba_webhook_triaje', id_peticion=pet_confidencial.id_peticion)
+
+        pet_ficticia = self._crear_peticion(
+            descripcion='[PRUEBA-TRIAJE] Perro herido ficticio para validacion controlada'
+        )
+        buf = io.StringIO()
+        call_command('preparar_prueba_webhook_triaje', id_peticion=pet_ficticia.id_peticion, stdout=buf)
+        salida = json.loads(buf.getvalue())
+
+        token = salida['despacho_token']
+        self.assertTrue(token)
+        self.assertEqual(salida['payload_webhook']['despacho_token'], token)
+        self.assertEqual(salida['payload_webhook']['foto_segura_path'], '')
+
+        url_cb = f'/api/triaje-ia/interno/peticiones/{pet_ficticia.id_peticion}/resultado/'
+        resp_bad = self.client.post(
+            url_cb,
+            {
+                'clave_idempotencia': salida['clave_idempotencia'],
+                'despacho_token': 'token-invalido',
+                'estado_analisis': 'COMPLETADO',
+                'prioridad_sugerida': 'ALTA',
+                'justificacion': 'Intento invalido',
+            },
+            format='json',
+            HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123',
+        )
+        self.assertEqual(resp_bad.status_code, status.HTTP_409_CONFLICT)
+
+        resp_ok = self.client.post(
+            url_cb,
+            {
+                'clave_idempotencia': salida['clave_idempotencia'],
+                'despacho_token': token,
+                'estado_analisis': 'COMPLETADO',
+                'prioridad_sugerida': 'ALTA',
+                'justificacion': 'Prueba integral controlada OK',
+            },
+            format='json',
+            HTTP_X_VETERICANO_TRIAJE_TOKEN='token-interno-valido-123',
+        )
+        self.assertEqual(resp_ok.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_ok.data['prioridad_sugerida'], 'ALTA')
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=False,
+    )
+    def test_denuncia_real_por_defecto_omite_gemini_y_solo_envia_pruebas_ficticias(self):
+        pet_real = self._crear_peticion(descripcion='Perro con fractura en pata trasera')
+        prioridad_original = pet_real.prioridad
+
+        with patch('triaje_ia.services.requests.post') as mock_post:
+            with patch('triaje_ia.services.ejecutar_deteccion_duplicados_triaje', return_value={'posibles_duplicados': []}):
+                res_real = encolar_y_despachar_triaje_peticion(pet_real, async_dispatch=False)
+
+        mock_post.assert_not_called()
+        self.assertFalse(res_real['enviado'])
+        self.assertTrue(res_real['omitido_privacidad'])
+        self.assertTrue(res_real['fallback_local'])
+
+        triaje_real = TriajePeticion.objects.get(peticion=pet_real)
+        self.assertEqual(triaje_real.estado_envio, TriajePeticion.ENVIO_OMITIDO)
+        self.assertEqual(triaje_real.estado_analisis, TriajePeticion.ANALISIS_PARCIAL)
+        self.assertEqual(triaje_real.prioridad_sugerida, TriajePeticion.PRIORIDAD_ALTA)
+        self.assertEqual(triaje_real.modelo_texto_usado, 'reglas_locales_privacidad')
+        pet_real.refresh_from_db()
+        self.assertEqual(pet_real.prioridad, prioridad_original)
+
+        pet_prueba = self._crear_peticion(descripcion='[PRUEBA-TRIAJE] Perro con fractura en pata trasera')
+        with override_settings(TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS=(pet_prueba.id_peticion,)):
+            with patch('triaje_ia.services.requests.post', return_value=MagicMock(status_code=200, text='ok')) as mock_post_prueba:
+                res_prueba = encolar_y_despachar_triaje_peticion(pet_prueba, async_dispatch=False)
+
+        mock_post_prueba.assert_called_once()
+        self.assertTrue(res_prueba['enviado'])
+        self.assertEqual(res_prueba['estado_envio'], TriajePeticion.ENVIO_ENVIADO)
+
+    @override_settings(
+        TRIAJE_N8N_ACTIVO=True,
+        TRIAJE_N8N_WEBHOOK_URL='http://n8n.internal:5678/webhook/vetericano-triaje-peticion',
+        TRIAJE_N8N_ASYNC_THREAD=False,
+        TRIAJE_GEMINI_PERMITIR_DENUNCIAS_REALES=False,
+        TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS=(),
+    )
+    def test_denuncia_ciudadana_con_prefijo_prueba_triaje_no_se_envia_a_gemini(self):
+        pet_spoof = self._crear_peticion(
+            descripcion='[PRUEBA-TRIAJE] Perro con fractura en pata trasera reportado por ciudadano'
+        )
+        with patch('triaje_ia.services.requests.post') as mock_post:
+            with patch('triaje_ia.services.ejecutar_deteccion_duplicados_triaje', return_value={'posibles_duplicados': []}):
+                res = encolar_y_despachar_triaje_peticion(pet_spoof, async_dispatch=False)
+
+        mock_post.assert_not_called()
+        self.assertFalse(res['enviado'])
+        self.assertTrue(res['omitido_privacidad'])
+        self.assertTrue(res['fallback_local'])
+        triaje = TriajePeticion.objects.get(peticion=pet_spoof)
+        self.assertEqual(triaje.estado_envio, TriajePeticion.ENVIO_OMITIDO)
+        self.assertEqual(triaje.estado_analisis, TriajePeticion.ANALISIS_PARCIAL)
+        self.assertEqual(triaje.modelo_texto_usado, 'reglas_locales_privacidad')
