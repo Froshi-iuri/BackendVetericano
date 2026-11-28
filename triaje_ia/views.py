@@ -17,6 +17,7 @@ from triaje_ia.serializers import (
     TriajeResultadoInputSerializer,
 )
 from triaje_ia.services import (
+    HEADER_DISPATCH_TOKEN,
     StaleTriajeCallbackError,
     TriajeDecisionInvalidaError,
     TriajeNoEncontradoError,
@@ -24,6 +25,7 @@ from triaje_ia.services import (
     construir_payload_peticion_triaje,
     ejecutar_deteccion_duplicados_triaje,
     encolar_y_despachar_triaje_peticion,
+    obtener_contexto_gemini_demo,
     obtener_foto_sanitizada_para_triaje,
     recuperar_trabajos_interrumpidos,
     registrar_decision_humana_triaje,
@@ -50,6 +52,13 @@ class TriajeInternoContextoPeticionView(_VistaInternaTriajeBase):
     """
 
     def get(self, request, id_peticion):
+        if request.query_params.get('gemini') == 'demo':
+            try:
+                contexto = obtener_contexto_gemini_demo(id_peticion, request.headers.get(HEADER_DISPATCH_TOKEN, ''))
+            except PermissionError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+            return Response(contexto, headers={'Cache-Control': 'no-store'})
+
         peticion = (
             Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable')
             .prefetch_related('evidenciapeticiones_set')
@@ -72,8 +81,11 @@ class TriajeInternoFotoSeguraView(_VistaInternaTriajeBase):
     """
 
     def get(self, request, id_peticion):
+        token = request.headers.get(HEADER_DISPATCH_TOKEN, '')
+        if request.query_params.get('gemini') == 'demo' and not token:
+            return Response({'error': 'Falta el token de despacho.'}, status=status.HTTP_403_FORBIDDEN)
         try:
-            jpeg_bytes = obtener_foto_sanitizada_para_triaje(id_peticion)
+            jpeg_bytes = obtener_foto_sanitizada_para_triaje(id_peticion, token)
         except PermissionError as exc:
             return Response(
                 {'error': str(exc), 'codigo': 'FOTOS_IA_DESACTIVADAS'},

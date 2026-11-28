@@ -2,17 +2,18 @@ import json
 import uuid
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 from django.utils import timezone
 
 from peticiones.models import Peticiones
+from triaje_ia.escenarios_demo import ESCENARIOS_DEMO
 from triaje_ia.models import TriajePeticion
 from triaje_ia.services import (
     HEADER_DISPATCH_TOKEN,
     HEADER_IDEMPOTENCY_KEY,
     HEADER_TRIAJE_WEBHOOK_SECRET,
-    MARCADOR_PRUEBA_TRIAJE,
     _ahora_local,
-    construir_payload_peticion_triaje,
+    coincide_con_escenario_demo,
     evaluar_privacidad_para_gemini,
     sanitizar_texto_pii_para_ia,
 )
@@ -26,11 +27,22 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--id-peticion', type=int, required=True, help='ID de la petición ficticia de prueba.')
+        parser.add_argument(
+            '--escenario', choices=ESCENARIOS_DEMO, required=True,
+            help='Escenario sintético cuya descripción exacta se coteja antes de autorizar el despacho.',
+        )
+        parser.add_argument(
+            '--foto-duplicados-url', default='',
+            help='URL Cloudinary del único adjunto sintético del caso urgente, para la comparación DINOv2.',
+        )
 
+    @transaction.atomic
     def handle(self, *args, **options):
         id_peticion = int(options['id_peticion'])
+        escenario = options['escenario']
+        foto_duplicados = options['foto_duplicados_url'].strip()
         peticion = (
-            Peticiones.objects.select_related('id_tipo', 'id_estado', 'id_ubicacion', 'responsable')
+            Peticiones.objects.select_for_update()
             .prefetch_related('evidenciapeticiones_set')
             .filter(pk=id_peticion)
             .first()
@@ -39,15 +51,11 @@ class Command(BaseCommand):
             raise CommandError(f'La petición #{id_peticion} no existe.')
 
         descripcion = str(peticion.descripcion or '').strip()
-        if not descripcion.upper().startswith(MARCADOR_PRUEBA_TRIAJE):
+        if not coincide_con_escenario_demo(peticion, escenario, foto_duplicados=foto_duplicados):
             raise CommandError(
-                'Seguridad: la descripción de la petición debe iniciar con [PRUEBA-TRIAJE] '
-                'para evitar modificar peticiones ciudadanas reales.'
-            )
-
-        if peticion.asignado_a_id is not None:
-            raise CommandError(
-                'Seguridad: la petición ya tiene veterinario asignado; no se modifica una denuncia operativa.'
+                'La petición debe tener la descripción exacta del escenario, estar sin asignación '
+                'y cumplir la lista de IDs si está configurada. Se permite un único adjunto con '
+                'la URL aprobada para duplicados, solo en el caso urgente y con coordenadas válidas.'
             )
 
         es_seguro, motivos = evaluar_privacidad_para_gemini(
@@ -61,7 +69,7 @@ class Command(BaseCommand):
                 f'Seguridad: la petición contiene datos confidenciales o PII residual ({", ".join(motivos)}).'
             )
 
-        triaje_existente = TriajePeticion.objects.filter(peticion_id=id_peticion).first()
+        triaje_existente = TriajePeticion.objects.select_for_update().filter(peticion_id=id_peticion).first()
         if triaje_existente and (
             triaje_existente.estado_analisis == TriajePeticion.ANALISIS_COMPLETADO
             or triaje_existente.decision_prioridad != TriajePeticion.DECISION_PENDIENTE
@@ -87,16 +95,10 @@ class Command(BaseCommand):
                 'proximo_reintento_en': None,
                 'prioridad_original': peticion.prioridad,
                 'resultado_raw': {
-                    'prueba_ficticia_autorizada': True,
-                    'autorizada_por_comando': 'preparar_prueba_webhook_triaje',
+                    'escenario_demo': escenario,
+                    'foto_duplicados_demo': foto_duplicados,
                 },
             },
-        )
-
-        payload = construir_payload_peticion_triaje(
-            peticion,
-            clave_idempotencia=triaje.clave_idempotencia,
-            despacho_token=token,
         )
 
         salida = {
@@ -110,6 +112,10 @@ class Command(BaseCommand):
                 HEADER_IDEMPOTENCY_KEY: triaje.clave_idempotencia,
                 HEADER_DISPATCH_TOKEN: token,
             },
-            'payload_webhook': payload,
+            'payload_webhook': {
+                'id_peticion': id_peticion,
+                'clave_idempotencia': triaje.clave_idempotencia,
+                'despacho_token': token,
+            },
         }
         self.stdout.write(json.dumps(salida, ensure_ascii=False, indent=2))

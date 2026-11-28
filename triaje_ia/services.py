@@ -15,6 +15,7 @@ from django.conf import settings
 from django.db import IntegrityError, connection, connections, transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from peticiones.models import Peticiones, PeticionPosibleDuplicado
@@ -26,6 +27,7 @@ from peticiones.services.duplicados_service import (
     PeticionNoEncontradaError,
     detectar_duplicados_desde_solicitud,
     extraer_fotografias_peticion,
+    normalizar_coordenadas,
 )
 from peticiones.services.imagen_hash_service import (
     MAX_PIXELES_IMAGEN,
@@ -42,6 +44,7 @@ from peticiones.utils import (
     registrar_historial_peticion,
 )
 from realtime import notificar as rt_notificar
+from triaje_ia.escenarios_demo import ESCENARIO_CON_IMAGEN, ESCENARIOS_DEMO, dibujar_imagen_demo
 from triaje_ia.models import TriajePeticion
 from users.constants import ROL_VETERINARIO
 from users.models import Usuarios
@@ -142,7 +145,6 @@ _PATRONES_PII_IA = (
 )
 
 _MAX_DIM_FOTO_IA = 1280
-MARCADOR_PRUEBA_TRIAJE = '[PRUEBA-TRIAJE]'
 
 _PALABRAS_COMUNES_NO_NOMBRE = frozenset({
     'perro', 'perra', 'gato', 'gata', 'animal', 'cachorro', 'cachorra', 'caballo', 'yegua',
@@ -216,29 +218,73 @@ def sanitizar_texto_pii_para_ia(texto: Any, max_len: int = 1500) -> str:
     return limpio[:max_len]
 
 
-def es_prueba_ficticia_autorizada_internamente(
-    id_peticion: Optional[int],
-    triaje: Optional[TriajePeticion] = None,
+def coincide_con_escenario_demo(
+    peticion: Peticiones, escenario: str, *, foto_duplicados: str = '',
 ) -> bool:
-    """
-    Determina si una petición fue autorizada internamente en el servidor para pruebas
-    de Gemini (vía TRIAJE_GEMINI_IDS_PRUEBA_PERMITIDOS o comando administrativo
-    preparar_prueba_webhook_triaje), sin confiar jamás en texto escrito por un ciudadano.
-    """
-    if id_peticion is not None:
-        try:
-            pid = int(id_peticion)
-        except (TypeError, ValueError):
-            pid = None
-        if pid is not None and pid in obtener_config_triaje()['ids_prueba_permitidos_gemini']:
-            return True
+    ids = obtener_config_triaje()['ids_prueba_permitidos_gemini']
+    if (
+        escenario not in ESCENARIOS_DEMO
+        or (ids and peticion.pk not in ids)
+        or str(peticion.descripcion or '').strip() != ESCENARIOS_DEMO[escenario]
+        or peticion.asignado_a_id is not None
+    ):
+        return False
 
-    if triaje is not None:
-        raw = getattr(triaje, 'resultado_raw', None)
-        if isinstance(raw, dict) and raw.get('prueba_ficticia_autorizada') is True:
-            return True
+    _, evidencias = extraer_fotografias_peticion(peticion)
+    if not foto_duplicados:
+        return not evidencias
 
-    return False
+    # Este adjunto se usa únicamente en el detector habitual de duplicados.
+    # Gemini recibe la ilustración generada por Django, sin descargar esta URL.
+    ubicacion = peticion.id_ubicacion
+    return bool(
+        escenario == ESCENARIO_CON_IMAGEN
+        and evidencias == [foto_duplicados]
+        and detectar_tipo_archivo(foto_duplicados) == 'imagen'
+        and validar_url_cloudinary_segura(
+            foto_duplicados, dominios_permitidos=obtener_config_imagen_hash()['dominios_permitidos'],
+        )
+        and ubicacion
+        and normalizar_coordenadas(ubicacion.latitud, ubicacion.longitud) is not None
+    )
+
+
+def escenario_demo_autorizado(peticion: Peticiones, triaje: TriajePeticion) -> str:
+    raw = triaje.resultado_raw
+    escenario = raw.get('escenario_demo') if isinstance(raw, dict) else None
+    foto_duplicados = raw.get('foto_duplicados_demo', '') if isinstance(raw, dict) else ''
+    if isinstance(escenario, str) and isinstance(foto_duplicados, str) and coincide_con_escenario_demo(
+        peticion, escenario, foto_duplicados=foto_duplicados,
+    ):
+        return escenario
+    return ''
+
+
+def obtener_triaje_despacho_demo(id_peticion: int, despacho_token: str) -> TriajePeticion:
+    triaje = (
+        TriajePeticion.objects.select_related('peticion', 'peticion__id_ubicacion')
+        .prefetch_related('peticion__evidenciapeticiones_set')
+        .filter(peticion_id=id_peticion, estado_envio__in=(
+            TriajePeticion.ENVIO_ENVIANDO, TriajePeticion.ENVIO_ENVIADO,
+        ))
+        .first()
+    )
+    if not despacho_token or not triaje or not constant_time_compare(triaje.despacho_token, despacho_token):
+        raise PermissionError('Se requiere el token del despacho vigente.')
+    return triaje
+
+
+def obtener_contexto_gemini_demo(id_peticion: int, despacho_token: str) -> Dict[str, Any]:
+    triaje = obtener_triaje_despacho_demo(id_peticion, despacho_token)
+    escenario = escenario_demo_autorizado(triaje.peticion, triaje)
+    if not escenario or triaje.estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
+        return {'gemini_autorizado': False}
+    descripcion = sanitizar_texto_pii_para_ia(ESCENARIOS_DEMO[escenario])
+    return {
+        'gemini_autorizado': True,
+        'descripcion': descripcion,
+        'foto_autorizada': escenario == ESCENARIO_CON_IMAGEN and obtener_config_triaje()['enviar_fotos_gemini'],
+    }
 
 
 def evaluar_privacidad_para_gemini(
@@ -337,16 +383,28 @@ def _reemplazar_imagen_sin_metadatos_jpeg(raw_bytes: bytes) -> bytes:
         return buffer.getvalue()
 
 
-def obtener_foto_sanitizada_para_triaje(id_peticion: int) -> bytes:
+def obtener_foto_sanitizada_para_triaje(id_peticion: int, despacho_token: str = '') -> bytes:
     """
     Descarga de forma segura la fotografía principal de una petición y retorna bytes JPEG
     completamente libres de metadatos EXIF/GPS/cámara para consumo interno de n8n/Gemini.
     Si TRIAJE_GEMINI_ENVIAR_FOTOS=False (por defecto), bloquea la salida de imágenes (fail-closed).
     """
-    if not obtener_config_triaje()['enviar_fotos_gemini']:
+    cfg = obtener_config_triaje()
+    if not cfg['enviar_fotos_gemini']:
         raise PermissionError(
             'El envío de fotografías a Gemini está desactivado por política de privacidad (TRIAJE_GEMINI_ENVIAR_FOTOS=False).'
         )
+
+    if despacho_token:
+        contexto = obtener_contexto_gemini_demo(id_peticion, despacho_token)
+        if not contexto.get('foto_autorizada'):
+            raise PermissionError('El despacho no tiene una imagen sintética autorizada.')
+        return _reemplazar_imagen_sin_metadatos_jpeg(dibujar_imagen_demo())
+
+    # Compatibilidad con el uso expresamente habilitado de un proveedor de pago.
+    # El workflow gratuito siempre usa la rama autenticada con el token de despacho.
+    if not cfg['permitir_denuncias_reales_gemini']:
+        raise PermissionError('Se requiere el token del despacho de prueba.')
 
     peticion = (
         Peticiones.objects.prefetch_related('evidenciapeticiones_set')
@@ -501,7 +559,7 @@ def construir_payload_peticion_triaje(
     responsable = getattr(peticion, 'responsable', None)
 
     tiene_fotos = bool(fotos_imagenes)
-    enviar_fotos_ia = tiene_fotos and cfg['enviar_fotos_gemini']
+    enviar_fotos_ia = tiene_fotos and cfg['enviar_fotos_gemini'] and cfg['permitir_denuncias_reales_gemini']
     foto_segura_path = (
         f'/api/triaje-ia/interno/peticiones/{peticion.id_peticion}/foto-segura/'
         if enviar_fotos_ia
@@ -526,7 +584,7 @@ def construir_payload_peticion_triaje(
         'descripcion': sanitizar_texto_pii_para_ia(peticion.descripcion or ''),
         'tiene_fotos': tiene_fotos,
         'total_fotos': len(fotos_imagenes),
-        'enviar_fotos_gemini': cfg['enviar_fotos_gemini'],
+        'enviar_fotos_gemini': enviar_fotos_ia,
         'foto_segura_path': foto_segura_path,
         'foto': foto_principal_externa,
         'fotos': [foto_principal_externa] if foto_principal_externa else [],
@@ -1046,7 +1104,7 @@ def despachar_triaje_por_id(
 
     desc_original = str(getattr(triaje.peticion, 'descripcion', '') or '')
     desc_sanitizada = sanitizar_texto_pii_para_ia(desc_original)
-    prueba_autorizada = es_prueba_ficticia_autorizada_internamente(triaje.peticion_id, triaje)
+    prueba_autorizada = bool(escenario_demo_autorizado(triaje.peticion, triaje))
     es_seguro_ia, motivos_priv = evaluar_privacidad_para_gemini(
         desc_original,
         desc_sanitizada,
@@ -1578,6 +1636,47 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     if not peticion:
         raise PeticionNoEncontradaError(f'La petición #{id_peticion} no existe.')
 
+    resultado_raw = datos.get('resultado_raw')
+    foto_demo = False
+    es_callback_demo = isinstance(resultado_raw, dict) and resultado_raw.get('gemini_demo') is True
+    if es_callback_demo:
+        token = str(datos.get('despacho_token') or '')
+        try:
+            despacho = obtener_triaje_despacho_demo(id_peticion, token)
+        except PermissionError as exc:
+            raise StaleTriajeCallbackError(str(exc)) from exc
+        if datos.get('clave_idempotencia') != despacho.clave_idempotencia:
+            raise StaleTriajeCallbackError('La clave de idempotencia no coincide con el despacho.')
+        escenario = escenario_demo_autorizado(despacho.peticion, despacho)
+        foto_demo = escenario == ESCENARIO_CON_IMAGEN and obtener_config_triaje()['enviar_fotos_gemini']
+        if despacho.estado_analisis != TriajePeticion.ANALISIS_COMPLETADO and (
+            not escenario
+            or datos.get('estado_analisis') != TriajePeticion.ANALISIS_COMPLETADO
+            or not datos.get('prioridad_sugerida')
+            or not datos.get('justificacion', '').strip()
+            or (foto_demo and not datos.get('modelo_vision_usado'))
+        ):
+            texto = sanitizar_texto_pii_para_ia(despacho.peticion.descripcion or '')
+            prioridad, justificacion = _clasificar_prioridad_local_reglas(texto)
+            datos = {
+                **{campo: datos.get(campo) for campo in (
+                    'despacho_token', 'clave_idempotencia', 'n8n_execution_id',
+                    'posibles_duplicados', 'veterinario_recomendado_id',
+                    'justificacion_recomendacion', 'carga_veterinarios_snapshot',
+                )},
+                'estado_analisis': TriajePeticion.ANALISIS_PARCIAL,
+                'prioridad_sugerida': prioridad,
+                'nivel_confianza': 0.5,
+                'justificacion': f'{justificacion} Se requiere revisión humana.',
+                'resumen_texto': texto,
+                'modelo_texto_usado': 'reglas_locales_privacidad',
+                'resultado_raw': {
+                    'modo': 'fallback_local_privacidad',
+                    'motivo': 'gemini_no_disponible' if escenario else 'gemini_no_autorizado',
+                    'revision_humana_requerida': True,
+                },
+            }
+
     prioridad_norm = normalizar_prioridad_sugerida(datos.get('prioridad_sugerida'))
 
     asignacion_ok, motivo_no_asig = _evaluar_elegibilidad_asignacion(peticion)
@@ -1616,6 +1715,11 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     resultado_raw = datos.get('resultado_raw')
     if not isinstance(resultado_raw, dict):
         resultado_raw = {}
+    else:
+        resultado_raw = {
+            k: v for k, v in resultado_raw.items()
+            if k not in ('escenario_demo', 'foto_duplicados_demo', 'imagen_sintetica_demo')
+        }
     ia_raw = resultado_raw.get('ia') if isinstance(resultado_raw.get('ia'), dict) else {}
 
     signos = _normalizar_lista_textos(datos.get('signos_detectados'), max_items=15, max_len=80)
@@ -1626,7 +1730,7 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
     )
 
     _, todas_evidencias = extraer_fotografias_peticion(peticion)
-    tiene_fotos = any(detectar_tipo_archivo(u) == 'imagen' for u in todas_evidencias)
+    tiene_fotos = foto_demo or any(detectar_tipo_archivo(u) == 'imagen' for u in todas_evidencias)
     if tiene_fotos:
         signos_fotografia = _normalizar_lista_textos(
             datos.get('signos_fotografia') or ia_raw.get('signos_fotografia'),
@@ -1680,10 +1784,13 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         )
 
         # Protección contra callbacks de intentos obsoletos (fencing token)
-        if token_entrante and triaje.despacho_token and token_entrante != triaje.despacho_token:
+        if token_entrante and (es_callback_demo or triaje.despacho_token) and token_entrante != triaje.despacho_token:
             raise StaleTriajeCallbackError(
                 'Callback rechazado: despacho_token obsoleto respecto al intento vigente.'
             )
+
+        if es_callback_demo and exec_id_entrante and exec_id_entrante == triaje.n8n_execution_id:
+            return triaje
 
         # Protección idempotente / anti-regresión cuando ya está COMPLETADO
         if triaje.estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
@@ -1735,6 +1842,8 @@ def registrar_resultado_triaje(id_peticion: int, datos: Dict[str, Any]) -> Triaj
         triaje.modelo_texto_usado = str(datos.get('modelo_texto_usado') or '')[:100]
         triaje.modelo_vision_usado = str(datos.get('modelo_vision_usado') or '')[:100]
         triaje.n8n_execution_id = exec_id_entrante
+        if foto_demo and triaje.modelo_vision_usado and estado_analisis == TriajePeticion.ANALISIS_COMPLETADO:
+            resultado_raw['imagen_sintetica_demo'] = True
         triaje.resultado_raw = resultado_raw
         triaje.version_resultado = int(triaje.version_resultado or 0) + 1
         if estado_analisis in (TriajePeticion.ANALISIS_COMPLETADO, TriajePeticion.ANALISIS_PARCIAL):
