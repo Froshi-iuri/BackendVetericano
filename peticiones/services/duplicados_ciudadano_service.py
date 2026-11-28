@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_CANDIDATOS_CIUDADANO = 5
 UMBRAL_CERCANIA_MUY_CERCA_METROS = 50.0
 UMBRAL_SIMILITUD_ALTA = 0.60
-TRANSFORMACION_MINIATURA_CIUDADANO = 'e_blur_faces/c_fill,g_auto,w_480,h_360,q_auto,f_auto'
+TRANSFORMACION_MINIATURA_CIUDADANO = 'c_limit,w_1280,h_1280,q_auto,f_auto'
 MENSAJE_CON_DUPLICADOS = 'Se encontraron reportes similares.'
 MENSAJE_SIN_DUPLICADOS = 'No se encontraron reportes similares.'
 
